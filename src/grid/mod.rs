@@ -192,6 +192,11 @@ pub struct Term {
     /// DECSC/DECRC용 saved state. main / alt 별도.
     decsc_main: Option<SavedCursorState>,
     decsc_alt: Option<SavedCursorState>,
+    /// DECCKM (M8-4). false = normal cursor keys (CSI), true = application (SS3).
+    cursor_keys_application: bool,
+    /// M8-7: 창 타이틀 (OSC 0/2). PTY가 보낼 때마다 갱신.
+    title: String,
+    title_dirty: bool,
 }
 
 impl Term {
@@ -212,7 +217,37 @@ impl Term {
             view_offset: 0,
             decsc_main: None,
             decsc_alt: None,
+            cursor_keys_application: false,
+            title: String::new(),
+            title_dirty: false,
         }
+    }
+
+    // M8-7: title API.
+    pub fn set_title(&mut self, t: String) {
+        if self.title != t {
+            self.title = t;
+            self.title_dirty = true;
+        }
+    }
+    pub fn take_title_if_changed(&mut self) -> Option<String> {
+        if self.title_dirty {
+            self.title_dirty = false;
+            Some(self.title.clone())
+        } else {
+            None
+        }
+    }
+
+    // M8-4 / M8-5 노출.
+    pub fn cursor_keys_application(&self) -> bool {
+        self.cursor_keys_application
+    }
+    pub fn set_cursor_keys_application(&mut self, on: bool) {
+        self.cursor_keys_application = on;
+    }
+    pub fn is_alt_screen(&self) -> bool {
+        self.use_alt
     }
 
     // M7-4: DECSC `ESC 7` — cursor 위치 + SGR + shape/blinking/visible 저장.

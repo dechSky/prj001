@@ -94,7 +94,18 @@ impl<'a> Perform for TermPerform<'a> {
             _ => {}
         }
     }
-    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // M8-7: OSC 0 / OSC 2 → 창 타이틀 갱신. (OSC 1 = icon title only, 미처리)
+        if params.len() < 2 {
+            return;
+        }
+        let code = params[0];
+        if code == b"0" || code == b"2" {
+            if let Ok(title) = std::str::from_utf8(params[1]) {
+                self.term.set_title(title.to_string());
+            }
+        }
+    }
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
     fn unhook(&mut self) {}
@@ -113,6 +124,9 @@ impl<'a> TermPerform<'a> {
                 // M7-2: DECTCEM cursor visibility
                 (25, 'h') => self.term.set_cursor_visible(true),
                 (25, 'l') => self.term.set_cursor_visible(false),
+                // M8-4: DECCKM cursor keys application mode
+                (1, 'h') => self.term.set_cursor_keys_application(true),
+                (1, 'l') => self.term.set_cursor_keys_application(false),
                 _ => {}
             }
         }
@@ -328,6 +342,32 @@ mod tests {
         run(&mut term, b"\x1b8");
         assert_eq!(term.cursor().row, 3);
         assert_eq!(term.cursor().col, 5);
+    }
+
+    #[test]
+    fn osc_2_sets_window_title() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b]2;hello world\x07"); // OSC 2 ; "hello world" BEL
+        assert_eq!(term.take_title_if_changed(), Some("hello world".to_string()));
+        // 두 번째 호출은 None (dirty 클리어됨)
+        assert_eq!(term.take_title_if_changed(), None);
+    }
+
+    #[test]
+    fn osc_0_sets_window_title() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b]0;abc\x07");
+        assert_eq!(term.take_title_if_changed(), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn decckm_toggle() {
+        let mut term = Term::new(80, 24);
+        assert!(!term.cursor_keys_application());
+        run(&mut term, b"\x1b[?1h");
+        assert!(term.cursor_keys_application());
+        run(&mut term, b"\x1b[?1l");
+        assert!(!term.cursor_keys_application());
     }
 
     #[test]

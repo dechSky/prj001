@@ -62,8 +62,8 @@ DECCKM(application cursor mode) 미지원 — vim/less가 활성화해도 무시
 
 | 키 | byte | DECCKM 의존 |
 |---|---|---|
-| Home | `ESC [ H` (`\x1b[H`) | **무관** (단순화 — xterm 표준은 DECCKM 의존이지만 우리 first cut) |
-| End | `ESC [ F` | 무관 |
+| Home | `ESC O H` (`\x1bOH`, SS3 form) | **무관** — macOS Terminal.app/iTerm2 표준 + zsh default binding 호환 (M8-7 시각 검증 시 `\x1b[H`로는 zsh 인식 안 됨 발견 → SS3로 변경) |
+| End | `ESC O F` (`\x1bOF`) | 무관 |
 | PageUp | `ESC [ 5 ~` (PTY 전송 시. § 5 정책 참고) | 무관 |
 | PageDown | `ESC [ 6 ~` | 무관 |
 | Insert | `ESC [ 2 ~` | 무관 |
@@ -413,6 +413,7 @@ M8에서 `InputMode.modifiers` 인프라는 이미 마련됨. M9에서 `encode_n
 ## 11. 미해결 / 사용자 결정 필요
 
 - **PageUp/Down 정책 (§ 5)**: 권장 옵션 C(자동 분기). 사용자 확정 필요.
+- **OSC 2 자동 송신은 shell 설정 의존**: zsh 기본은 `cd` 시 OSC 2 자동 안 보냄. 사용자가 `.zshrc`에 `precmd() { print -Pn "\e]2;%~\a" }` 같은 hook 추가해야 자동 갱신. M8-7은 OSC 2 byte 처리 자체는 정상(`printf '\033]2;TEST\007'` 직접 송신 시 타이틀 변경 확인).
 - **Numpad 키 (M9 자리 비움)**: 한 번도 안 다룸. text 필드 fallback에 의존. macbook 단독 사용에는 영향 X.
 - **macOS Option(Alt as Meta) 키 (M9 자리 비움)**: xterm 표준은 Alt+a → `ESC a` (ESC prefix). 현재 winit이 macOS native에서 text 필드를 어떻게 채우는지 미검증. 두 가지 정책 가능: (1) Meta=ESC prefix(전통적), (2) Option=unicode/dead key(macOS native). M9에서 결정.
 - **KeyEvent.repeat 처리 (M9 자리 비움)**: 현재 repeat 키도 모두 PTY 송신. shell이 알아서 처리. 정상 동작이지만 빠른 입력 시 PTY 부하 가능. 명시적 정책 미정.

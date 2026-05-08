@@ -8,6 +8,7 @@ use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{MouseScrollDelta, WindowEvent};
+use winit::keyboard::ModifiersState;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{ImePurpose, Window, WindowId};
 
@@ -19,6 +20,17 @@ use event::UserEvent;
 
 const FONT_SIZE: f32 = 14.0;
 const CURSOR_BLINK_MS: u64 = 500;
+
+/// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
+fn log_page_dispatch_once(target: &'static str) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static LOGGED: AtomicU8 = AtomicU8::new(0);
+    let bit: u8 = if target.starts_with("PTY") { 1 } else { 2 };
+    let prev = LOGGED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        log::info!("page-key dispatch: target={target}");
+    }
+}
 
 pub fn run(shell_override: Option<String>) -> Result<()> {
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -57,6 +69,7 @@ struct AppState {
     last_blink: Instant,
     focused: bool,
     cursor_blinking_cache: bool,
+    modifiers: ModifiersState,
 }
 
 impl App {
@@ -104,6 +117,9 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods.state();
+            }
             WindowEvent::Focused(focused) => {
                 state.focused = focused;
                 if focused {
@@ -172,22 +188,48 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 use winit::event::ElementState;
                 use winit::keyboard::{Key, NamedKey};
-                // PageUp/PageDown: scrollback view 스크롤. PTY로 안 보냄.
+                // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, 그 외 swallow.
+                if event.state == ElementState::Pressed && state.modifiers.super_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        let lower = s.to_lowercase();
+                        if lower == "q" || lower == "w" {
+                            log::info!("cmd+{lower}: exit");
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                    // 그 외 Cmd+key: swallow (PTY 안 보냄).
+                    log::debug!("swallowed Cmd+key: {:?}", event.logical_key);
+                    return;
+                }
+                // M8-5: PageUp/Down 분기 — alt screen이면 PTY 전송, main이면 scrollback.
                 if event.state == ElementState::Pressed {
                     if let Key::Named(named @ (NamedKey::PageUp | NamedKey::PageDown)) =
                         &event.logical_key
                     {
-                        if let Ok(mut term) = state.term.lock() {
-                            let page = term.rows().saturating_sub(1).max(1) as isize;
-                            let delta = if matches!(named, NamedKey::PageUp) {
-                                page
-                            } else {
-                                -page
-                            };
-                            term.scroll_view_by(delta);
+                        let alt = state
+                            .term
+                            .lock()
+                            .map(|t| t.is_alt_screen())
+                            .unwrap_or(false);
+                        if alt {
+                            // alt screen: encode_named_key가 byte 반환 → 일반 PTY 송신 흐름.
+                            log_page_dispatch_once("PTY (alt screen)");
+                        } else {
+                            // main screen: scrollback view 스크롤. PTY 안 보냄.
+                            if let Ok(mut term) = state.term.lock() {
+                                let page = term.rows().saturating_sub(1).max(1) as isize;
+                                let delta = if matches!(named, NamedKey::PageUp) {
+                                    page
+                                } else {
+                                    -page
+                                };
+                                term.scroll_view_by(delta);
+                            }
+                            state.window.request_redraw();
+                            log_page_dispatch_once("scrollback (main screen)");
+                            return;
                         }
-                        state.window.request_redraw();
-                        return;
                     }
                 }
                 // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
@@ -199,7 +241,16 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                if let Some(bytes) = input::encode_key(&event) {
+                // single lock snapshot (advisor 가이드).
+                let mode = {
+                    let term = state.term.lock().unwrap();
+                    input::InputMode {
+                        cursor_keys_application: term.cursor_keys_application(),
+                        alt_screen: term.is_alt_screen(),
+                        modifiers: state.modifiers,
+                    }
+                };
+                if let Some(bytes) = input::encode_key(&event, mode) {
                     if let Err(e) = state.pty.write(&bytes) {
                         log::warn!("pty write: {e}");
                     }
@@ -350,6 +401,7 @@ impl AppState {
             last_blink: Instant::now(),
             focused: true,
             cursor_blinking_cache: true,
+            modifiers: ModifiersState::empty(),
         })
     }
 
@@ -388,10 +440,14 @@ impl AppState {
             C::Timeout | C::Occluded | C::Validation => return,
         };
 
-        if let Ok(term) = self.term.lock() {
+        if let Ok(mut term) = self.term.lock() {
             let cur = term.cursor();
             // M7-3: cursor.blinking 캐시 갱신. about_to_wait이 매 tick lock 안 잡도록.
             self.cursor_blinking_cache = cur.blinking;
+            // M8-7: title 변경 있으면 winit window에 반영.
+            if let Some(t) = term.take_title_if_changed() {
+                self.window.set_title(&t);
+            }
             let in_scrollback = term.view_offset() > 0;
             let preedit_arg = self
                 .preedit
