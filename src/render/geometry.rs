@@ -106,7 +106,21 @@ pub fn build_instances(
     // cursor overlay instance — 끝에 push해서 마지막에 그려짐. main instance의 reverse 버전.
     // shader에서 shape 외 영역은 discard로 main이 그대로 보이고, shape 영역만 reverse 적용.
     if let Some(cur) = cursor {
-        let cell = term.cell(cur.row, cur.col);
+        // M9-2: cursor 위치 cell이 WIDE면 cursor도 2 cell 차지. WIDE_CONT(짝 cell) 위에
+        // cursor가 있으면 한 cell 왼쪽으로 보정해서 WIDE 본체 위로 정렬.
+        let (cur_row, cur_col) = if term.cell(cur.row, cur.col).attrs.contains(Attrs::WIDE_CONT)
+            && cur.col > 0
+        {
+            (cur.row, cur.col - 1)
+        } else {
+            (cur.row, cur.col)
+        };
+        let cell = term.cell(cur_row, cur_col);
+        let cur_span = if cell.attrs.contains(Attrs::WIDE) {
+            2.0
+        } else {
+            1.0
+        };
         let (orig_fg, orig_bg) = if cell.attrs.contains(Attrs::REVERSE) {
             (resolve(cell.bg, false), resolve(cell.fg, true))
         } else {
@@ -144,14 +158,14 @@ pub fn build_instances(
             flags |= 0x08;
         }
         out.push(CellInstance {
-            cell_xy: [cur.col as f32, cur.row as f32],
+            cell_xy: [cur_col as f32, cur_row as f32],
             uv_min,
             uv_max,
             glyph_offset,
             glyph_size,
             fg: overlay_fg,
             bg: overlay_bg,
-            cell_span: 1.0,
+            cell_span: cur_span,
             flags,
             _pad: [0.0; 2],
         });

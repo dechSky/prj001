@@ -18,10 +18,10 @@ pub fn encode_key(event: &KeyEvent, mode: InputMode) -> Option<Vec<u8>> {
     if event.state != ElementState::Pressed {
         return None;
     }
-    // 1. NamedKey 매핑 시도
+    // 1. NamedKey 매핑 시도 (modifier 조합 포함).
     if let Key::Named(named) = &event.logical_key {
         if let Some(bytes) = encode_named_key(named, mode) {
-            return Some(bytes.to_vec());
+            return Some(bytes);
         }
     }
     // 2. Ctrl + 글자 명시 매핑 (winit text 의존을 줄임).
@@ -38,47 +38,140 @@ pub fn encode_key(event: &KeyEvent, mode: InputMode) -> Option<Vec<u8>> {
     event.text.as_ref().map(|s| s.as_bytes().to_vec())
 }
 
-/// NamedKey만 처리. Key::Character 등은 호출자가 별도 처리.
-fn encode_named_key(key: &NamedKey, mode: InputMode) -> Option<&'static [u8]> {
+/// xterm modifier 파라미터 (Pm). Shift=1, Alt=2, Ctrl=4 비트 합 + 1.
+/// modifier 없으면 None.
+fn modifier_param(mods: ModifiersState) -> Option<u8> {
+    let mut bits = 0u8;
+    if mods.shift_key() {
+        bits |= 1;
+    }
+    if mods.alt_key() {
+        bits |= 2;
+    }
+    if mods.control_key() {
+        bits |= 4;
+    }
+    if bits == 0 {
+        None
+    } else {
+        Some(1 + bits)
+    }
+}
+
+/// NamedKey 매핑. modifier 조합 시 xterm CSI 1;Pm 형식 적용.
+fn encode_named_key(key: &NamedKey, mode: InputMode) -> Option<Vec<u8>> {
     let app = mode.cursor_keys_application;
     let shift = mode.modifiers.shift_key();
-    match key {
-        NamedKey::Enter => Some(b"\r"),
-        NamedKey::Backspace => Some(&[0x7F]),
-        // Shift+Tab → CSI Z (CBT, back tab). 일반 Tab은 \t.
-        NamedKey::Tab if shift => Some(b"\x1b[Z"),
-        NamedKey::Tab => Some(b"\t"),
-        NamedKey::Escape => Some(b"\x1b"),
-        // 화살표 — DECCKM 분기.
-        NamedKey::ArrowUp => Some(if app { b"\x1bOA" } else { b"\x1b[A" }),
-        NamedKey::ArrowDown => Some(if app { b"\x1bOB" } else { b"\x1b[B" }),
-        NamedKey::ArrowRight => Some(if app { b"\x1bOC" } else { b"\x1b[C" }),
-        NamedKey::ArrowLeft => Some(if app { b"\x1bOD" } else { b"\x1b[D" }),
-        // 위치 키 — Home/End는 SS3 form (macOS Terminal.app/iTerm2 표준, zsh default binding).
-        // 단순화로 DECCKM 무관 SS3 고정. 비호환 앱 발견 시 M9에서 분기 추가.
-        NamedKey::Home => Some(b"\x1bOH"),
-        NamedKey::End => Some(b"\x1bOF"),
-        NamedKey::Insert => Some(b"\x1b[2~"),
-        NamedKey::Delete => Some(b"\x1b[3~"),
-        // PageUp/Down byte 매핑. 분기(scrollback vs PTY)는 M8-5에서 호출자가 결정.
-        NamedKey::PageUp => Some(b"\x1b[5~"),
-        NamedKey::PageDown => Some(b"\x1b[6~"),
-        // F1-F4 — VT100 PF1-PF4 (SS3 prefix). xterm default unconditional.
-        NamedKey::F1 => Some(b"\x1bOP"),
-        NamedKey::F2 => Some(b"\x1bOQ"),
-        NamedKey::F3 => Some(b"\x1bOR"),
-        NamedKey::F4 => Some(b"\x1bOS"),
-        // F5-F12 — CSI ~ form. F6 다음 16, F11 다음 22가 결번 (xterm 표준).
-        NamedKey::F5 => Some(b"\x1b[15~"),
-        NamedKey::F6 => Some(b"\x1b[17~"),
-        NamedKey::F7 => Some(b"\x1b[18~"),
-        NamedKey::F8 => Some(b"\x1b[19~"),
-        NamedKey::F9 => Some(b"\x1b[20~"),
-        NamedKey::F10 => Some(b"\x1b[21~"),
-        NamedKey::F11 => Some(b"\x1b[23~"),
-        NamedKey::F12 => Some(b"\x1b[24~"),
-        _ => None,
+    let pm = modifier_param(mode.modifiers);
+
+    // modifier가 있으면 modified form 우선.
+    if let Some(pm) = pm {
+        if let Some(bytes) = encode_modified(key, pm) {
+            return Some(bytes);
+        }
+        // modifier 적용 안 되는 키(Enter/Backspace/Tab 등)는 unmodified로 진행.
     }
+
+    let unmodified: &'static [u8] = match key {
+        NamedKey::Enter => b"\r",
+        NamedKey::Backspace => &[0x7F],
+        // Shift+Tab → CSI Z (CBT, back tab). 일반 Tab은 \t.
+        NamedKey::Tab if shift => b"\x1b[Z",
+        NamedKey::Tab => b"\t",
+        NamedKey::Escape => b"\x1b",
+        // 화살표 — DECCKM 분기.
+        NamedKey::ArrowUp => {
+            if app {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            }
+        }
+        NamedKey::ArrowDown => {
+            if app {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            }
+        }
+        NamedKey::ArrowRight => {
+            if app {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            }
+        }
+        NamedKey::ArrowLeft => {
+            if app {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            }
+        }
+        // 위치 키 — Home/End는 SS3 form (macOS Terminal.app/iTerm2 표준, zsh default binding).
+        NamedKey::Home => b"\x1bOH",
+        NamedKey::End => b"\x1bOF",
+        NamedKey::Insert => b"\x1b[2~",
+        NamedKey::Delete => b"\x1b[3~",
+        NamedKey::PageUp => b"\x1b[5~",
+        NamedKey::PageDown => b"\x1b[6~",
+        // F1-F4 — VT100 PF1-PF4 (SS3 prefix). xterm default unconditional.
+        NamedKey::F1 => b"\x1bOP",
+        NamedKey::F2 => b"\x1bOQ",
+        NamedKey::F3 => b"\x1bOR",
+        NamedKey::F4 => b"\x1bOS",
+        // F5-F12 — CSI ~ form. F6 다음 16, F11 다음 22가 결번 (xterm 표준).
+        NamedKey::F5 => b"\x1b[15~",
+        NamedKey::F6 => b"\x1b[17~",
+        NamedKey::F7 => b"\x1b[18~",
+        NamedKey::F8 => b"\x1b[19~",
+        NamedKey::F9 => b"\x1b[20~",
+        NamedKey::F10 => b"\x1b[21~",
+        NamedKey::F11 => b"\x1b[23~",
+        NamedKey::F12 => b"\x1b[24~",
+        _ => return None,
+    };
+    Some(unmodified.to_vec())
+}
+
+/// modified form: xterm `CSI 1;Pm <final>` 또는 `CSI N;Pm ~` 형식.
+/// modifier 적용 안 되는 키(Enter, Tab 등)는 None — 호출자가 unmodified로 fallback.
+fn encode_modified(key: &NamedKey, pm: u8) -> Option<Vec<u8>> {
+    // 화살표/Home/End: CSI 1;Pm <final>
+    let final_char: Option<u8> = match key {
+        NamedKey::ArrowUp => Some(b'A'),
+        NamedKey::ArrowDown => Some(b'B'),
+        NamedKey::ArrowRight => Some(b'C'),
+        NamedKey::ArrowLeft => Some(b'D'),
+        NamedKey::Home => Some(b'H'),
+        NamedKey::End => Some(b'F'),
+        // F1-F4: CSI 1;Pm P/Q/R/S (xterm modifyFunctionKeys default)
+        NamedKey::F1 => Some(b'P'),
+        NamedKey::F2 => Some(b'Q'),
+        NamedKey::F3 => Some(b'R'),
+        NamedKey::F4 => Some(b'S'),
+        _ => None,
+    };
+    if let Some(fc) = final_char {
+        return Some(format!("\x1b[1;{pm}{}", fc as char).into_bytes());
+    }
+    // CSI N;Pm ~ 형식 (Insert/Delete/PageUp/Down/F5-F12)
+    let n: Option<u8> = match key {
+        NamedKey::Insert => Some(2),
+        NamedKey::Delete => Some(3),
+        NamedKey::PageUp => Some(5),
+        NamedKey::PageDown => Some(6),
+        NamedKey::F5 => Some(15),
+        NamedKey::F6 => Some(17),
+        NamedKey::F7 => Some(18),
+        NamedKey::F8 => Some(19),
+        NamedKey::F9 => Some(20),
+        NamedKey::F10 => Some(21),
+        NamedKey::F11 => Some(23),
+        NamedKey::F12 => Some(24),
+        _ => None,
+    };
+    n.map(|n| format!("\x1b[{n};{pm}~").into_bytes())
 }
 
 /// Ctrl + char → ASCII 컨트롤 코드 (0x00-0x1F, 0x7F).
@@ -109,31 +202,35 @@ mod tests {
         }
     }
 
+    fn vec(s: &[u8]) -> Option<Vec<u8>> {
+        Some(s.to_vec())
+    }
+
     #[test]
     fn arrow_normal() {
         let m = mode(false);
-        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), Some(&b"\x1b[A"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), Some(&b"\x1b[B"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), Some(&b"\x1b[C"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), Some(&b"\x1b[D"[..]));
+        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), vec(b"\x1b[A"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), vec(b"\x1b[B"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1b[C"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), vec(b"\x1b[D"));
     }
 
     #[test]
     fn arrow_application_mode() {
         let m = mode(true);
-        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), Some(&b"\x1bOA"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), Some(&b"\x1bOB"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), Some(&b"\x1bOC"[..]));
-        assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), Some(&b"\x1bOD"[..]));
+        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), vec(b"\x1bOA"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), vec(b"\x1bOB"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1bOC"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), vec(b"\x1bOD"));
     }
 
     #[test]
     fn enter_backspace_tab_escape() {
         let m = mode(false);
-        assert_eq!(encode_named_key(&NamedKey::Enter, m), Some(&b"\r"[..]));
-        assert_eq!(encode_named_key(&NamedKey::Backspace, m), Some(&[0x7F][..]));
-        assert_eq!(encode_named_key(&NamedKey::Tab, m), Some(&b"\t"[..]));
-        assert_eq!(encode_named_key(&NamedKey::Escape, m), Some(&b"\x1b"[..]));
+        assert_eq!(encode_named_key(&NamedKey::Enter, m), vec(b"\r"));
+        assert_eq!(encode_named_key(&NamedKey::Backspace, m), vec(&[0x7F]));
+        assert_eq!(encode_named_key(&NamedKey::Tab, m), vec(b"\t"));
+        assert_eq!(encode_named_key(&NamedKey::Escape, m), vec(b"\x1b"));
     }
 
     #[test]
@@ -165,40 +262,110 @@ mod tests {
     #[test]
     fn position_keys() {
         let m = mode(false);
-        assert_eq!(encode_named_key(&NamedKey::Home, m), Some(&b"\x1bOH"[..]));
-        assert_eq!(encode_named_key(&NamedKey::End, m), Some(&b"\x1bOF"[..]));
-        assert_eq!(encode_named_key(&NamedKey::Insert, m), Some(&b"\x1b[2~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::Delete, m), Some(&b"\x1b[3~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::PageUp, m), Some(&b"\x1b[5~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::PageDown, m), Some(&b"\x1b[6~"[..]));
+        assert_eq!(encode_named_key(&NamedKey::Home, m), vec(b"\x1bOH"));
+        assert_eq!(encode_named_key(&NamedKey::End, m), vec(b"\x1bOF"));
+        assert_eq!(encode_named_key(&NamedKey::Insert, m), vec(b"\x1b[2~"));
+        assert_eq!(encode_named_key(&NamedKey::Delete, m), vec(b"\x1b[3~"));
+        assert_eq!(encode_named_key(&NamedKey::PageUp, m), vec(b"\x1b[5~"));
+        assert_eq!(encode_named_key(&NamedKey::PageDown, m), vec(b"\x1b[6~"));
     }
 
     #[test]
     fn shift_tab_back() {
         let mut m = mode(false);
         m.modifiers = ModifiersState::SHIFT;
-        assert_eq!(encode_named_key(&NamedKey::Tab, m), Some(&b"\x1b[Z"[..]));
+        assert_eq!(encode_named_key(&NamedKey::Tab, m), vec(b"\x1b[Z"));
     }
 
     #[test]
     fn function_keys_f1_f4() {
         let m = mode(false);
-        assert_eq!(encode_named_key(&NamedKey::F1, m), Some(&b"\x1bOP"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F2, m), Some(&b"\x1bOQ"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F3, m), Some(&b"\x1bOR"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F4, m), Some(&b"\x1bOS"[..]));
+        assert_eq!(encode_named_key(&NamedKey::F1, m), vec(b"\x1bOP"));
+        assert_eq!(encode_named_key(&NamedKey::F2, m), vec(b"\x1bOQ"));
+        assert_eq!(encode_named_key(&NamedKey::F3, m), vec(b"\x1bOR"));
+        assert_eq!(encode_named_key(&NamedKey::F4, m), vec(b"\x1bOS"));
     }
 
     #[test]
     fn function_keys_f5_f12() {
         let m = mode(false);
-        assert_eq!(encode_named_key(&NamedKey::F5, m), Some(&b"\x1b[15~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F6, m), Some(&b"\x1b[17~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F7, m), Some(&b"\x1b[18~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F8, m), Some(&b"\x1b[19~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F9, m), Some(&b"\x1b[20~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F10, m), Some(&b"\x1b[21~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F11, m), Some(&b"\x1b[23~"[..]));
-        assert_eq!(encode_named_key(&NamedKey::F12, m), Some(&b"\x1b[24~"[..]));
+        assert_eq!(encode_named_key(&NamedKey::F5, m), vec(b"\x1b[15~"));
+        assert_eq!(encode_named_key(&NamedKey::F6, m), vec(b"\x1b[17~"));
+        assert_eq!(encode_named_key(&NamedKey::F7, m), vec(b"\x1b[18~"));
+        assert_eq!(encode_named_key(&NamedKey::F8, m), vec(b"\x1b[19~"));
+        assert_eq!(encode_named_key(&NamedKey::F9, m), vec(b"\x1b[20~"));
+        assert_eq!(encode_named_key(&NamedKey::F10, m), vec(b"\x1b[21~"));
+        assert_eq!(encode_named_key(&NamedKey::F11, m), vec(b"\x1b[23~"));
+        assert_eq!(encode_named_key(&NamedKey::F12, m), vec(b"\x1b[24~"));
+    }
+
+    // M9-1: modifier 조합 인코딩 (xterm CSI 1;Pm 형식).
+
+    #[test]
+    fn modifier_param_mapping() {
+        assert_eq!(modifier_param(ModifiersState::empty()), None);
+        assert_eq!(modifier_param(ModifiersState::SHIFT), Some(2));
+        assert_eq!(modifier_param(ModifiersState::ALT), Some(3));
+        assert_eq!(modifier_param(ModifiersState::SHIFT | ModifiersState::ALT), Some(4));
+        assert_eq!(modifier_param(ModifiersState::CONTROL), Some(5));
+        assert_eq!(modifier_param(ModifiersState::SHIFT | ModifiersState::CONTROL), Some(6));
+        assert_eq!(modifier_param(ModifiersState::ALT | ModifiersState::CONTROL), Some(7));
+        assert_eq!(
+            modifier_param(ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn shift_arrow_modifier_form() {
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::SHIFT;
+        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), vec(b"\x1b[1;2A"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), vec(b"\x1b[1;2B"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1b[1;2C"));
+        assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), vec(b"\x1b[1;2D"));
+    }
+
+    #[test]
+    fn ctrl_arrow_modifier_form() {
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::CONTROL;
+        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1b[1;5C"));
+    }
+
+    #[test]
+    fn modified_home_end_use_csi_form() {
+        // unmodified는 SS3 form이지만 modified는 CSI 1;Pm 형식.
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::SHIFT;
+        assert_eq!(encode_named_key(&NamedKey::Home, m), vec(b"\x1b[1;2H"));
+        assert_eq!(encode_named_key(&NamedKey::End, m), vec(b"\x1b[1;2F"));
+    }
+
+    #[test]
+    fn modified_tilde_keys() {
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::CONTROL;
+        assert_eq!(encode_named_key(&NamedKey::Insert, m), vec(b"\x1b[2;5~"));
+        assert_eq!(encode_named_key(&NamedKey::Delete, m), vec(b"\x1b[3;5~"));
+        assert_eq!(encode_named_key(&NamedKey::PageUp, m), vec(b"\x1b[5;5~"));
+        assert_eq!(encode_named_key(&NamedKey::F5, m), vec(b"\x1b[15;5~"));
+        assert_eq!(encode_named_key(&NamedKey::F12, m), vec(b"\x1b[24;5~"));
+    }
+
+    #[test]
+    fn modified_f1_f4() {
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::SHIFT;
+        assert_eq!(encode_named_key(&NamedKey::F1, m), vec(b"\x1b[1;2P"));
+        assert_eq!(encode_named_key(&NamedKey::F4, m), vec(b"\x1b[1;2S"));
+    }
+
+    #[test]
+    fn shift_alt_ctrl_combination() {
+        // Pm = 1 + 1(shift) + 2(alt) + 4(ctrl) = 8
+        let mut m = mode(false);
+        m.modifiers = ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL;
+        assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), vec(b"\x1b[1;8A"));
     }
 }

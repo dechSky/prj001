@@ -375,12 +375,13 @@ shader, render 모듈 변경 없음.
 
 ## 10. 미래 단계 (자리 비움)
 
-### 10.1 M9 — 키 모디파이어 조합 인코딩
+### 10.1 M9 — 완료 (2026-05-08)
 
 xterm 모디파이어 인코딩(파라미터 Pm):
 
 ```
-ESC [ 1 ; Pm A   (modified ArrowUp)
+ESC [ 1 ; Pm A   (modified ArrowUp / arrow / Home / End / F1-F4)
+ESC [ N ; Pm ~   (modified Insert / Delete / PageUp/Down / F5-F12)
 ```
 
 | Pm | 의미 |
@@ -393,11 +394,27 @@ ESC [ 1 ; Pm A   (modified ArrowUp)
 | 7 | Alt + Ctrl |
 | 8 | Shift + Alt + Ctrl |
 
-M8에서 `InputMode.modifiers` 인프라는 이미 마련됨. M9에서 `encode_named_key`가 modifier 분기를 추가 처리. 자리만 비움.
+**구현**: `encode_named_key`가 `modifier_param` 결과로 modified form 우선. modified form은 `encode_modified` 헬퍼가 동적 byte (`Vec<u8>`) 생성. unmodified form은 기존 `&'static [u8]` 후 `to_vec()`. unit test 7개로 매핑 검증.
 
-추가:
-- **PageUp/Down의 Shift 모디파이어 분기**(§ 5 옵션 D — `less -X` 케이스 보강).
-- **DECPAM/DECPNM** keypad mode (`ESC =` / `ESC >`) — numpad 키 영향. M8-4 DECCKM과 비슷한 모드.
+- **DECPAM/DECPNM** keypad mode (`ESC =` / `ESC >`): M9-3에서 처리. esc_dispatch에 `b'='` / `b'>'` 분기. `Term.keypad_application` 필드 추적. 현재 numpad 키 인코딩 미구현이라 시각 영향 X — 향후 numpad 처리 시 이 mode 참조.
+- **Wide cursor (M9-2)**: cursor 위치 cell이 WIDE 속성이면 cursor overlay의 `cell_span=2.0`. WIDE_CONT(짝 cell) 위 cursor면 한 cell 왼쪽으로 보정해서 본체 위로 정렬.
+
+**남은 자리 비움 (M9 미적용)**:
+- **PageUp/Down Shift 분기** (옵션 D — `less -X` 케이스 보강). modifier 인프라는 마련됐지만 PageUp/Down 분기는 alt screen 자동 분기로 충분히 작동 → 보류.
+- **Numpad 키** — macbook 단독 사용에 영향 X. 외장 키보드 사용자가 요청 시 추가.
+
+### 10.2 M9 — Option(Alt) / KeyEvent.repeat 정책 (M9-4/5)
+
+#### Alt as Meta
+- xterm 표준: Alt+a → `ESC a` (ESC prefix).
+- macOS 표준: Option+e → `é` (compose / unicode 변환).
+- **현재 정책**: Alt 단독은 winit `event.text` 의존. macOS native 동작 그대로 (Option+e=é). 다른 modifier(Shift/Ctrl)와 조합 시 modifier_param이 처리.
+- **M9-4 결정**: 명시적 Meta 변환 미구현. 사용자가 `\x1b a` 형식 필요 시 별도 옵션 추가 필요(M9 향후 자리 비움).
+
+#### KeyEvent.repeat
+- winit이 키 누름 유지 시 `KeyEvent.repeat=true`로 반복 이벤트 발생.
+- **현재 정책**: repeat 이벤트도 그대로 PTY 송신. shell이 알아서 처리(자체 repeat rate). 빠른 입력 시 PTY 부하 가능하지만 실측 문제 없음.
+- **M9-5 결정**: 코드 변경 없이 정책 명시만. 향후 PTY 부하 발견 시 throttling 도입.
 
 ### 10.2 M10 — VT shadow modes (키 인코딩과 분리, vt 영역)
 

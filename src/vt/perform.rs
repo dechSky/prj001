@@ -87,10 +87,13 @@ impl<'a> Perform for TermPerform<'a> {
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
-        // M7-4: DECSC `ESC 7`, DECRC `ESC 8`.
         match byte {
+            // M7-4: DECSC `ESC 7`, DECRC `ESC 8`.
             b'7' => self.term.decsc(),
             b'8' => self.term.decrc(),
+            // M9-3: DECPAM (`ESC =`) application keypad, DECPNM (`ESC >`) numeric.
+            b'=' => self.term.set_keypad_application(true),
+            b'>' => self.term.set_keypad_application(false),
             _ => {}
         }
     }
@@ -438,6 +441,16 @@ mod tests {
         assert!(term.cursor_keys_application());
         run(&mut term, b"\x1b[?1l");
         assert!(!term.cursor_keys_application());
+    }
+
+    #[test]
+    fn decpam_decpnm_toggle() {
+        let mut term = Term::new(80, 24);
+        assert!(!term.keypad_application());
+        run(&mut term, b"\x1b="); // DECPAM
+        assert!(term.keypad_application());
+        run(&mut term, b"\x1b>"); // DECPNM
+        assert!(!term.keypad_application());
     }
 
     #[test]

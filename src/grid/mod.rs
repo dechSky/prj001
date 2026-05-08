@@ -194,6 +194,9 @@ pub struct Term {
     decsc_alt: Option<SavedCursorState>,
     /// DECCKM (M8-4). false = normal cursor keys (CSI), true = application (SS3).
     cursor_keys_application: bool,
+    /// DECPAM/DECPNM (M9-3). false = numeric keypad, true = application keypad.
+    /// 현재 numpad 키 자체는 미처리 — mode 추적만 (M9 향후 numpad 처리 시 참조).
+    keypad_application: bool,
     /// M8-7: 창 타이틀 (OSC 0/2). PTY가 보낼 때마다 갱신.
     title: String,
     title_dirty: bool,
@@ -218,6 +221,7 @@ impl Term {
             decsc_main: None,
             decsc_alt: None,
             cursor_keys_application: false,
+            keypad_application: false,
             title: String::new(),
             title_dirty: false,
         }
@@ -248,6 +252,15 @@ impl Term {
     }
     pub fn is_alt_screen(&self) -> bool {
         self.use_alt
+    }
+
+    // M9-3: DECPAM/DECPNM keypad application mode.
+    #[allow(dead_code)]
+    pub fn keypad_application(&self) -> bool {
+        self.keypad_application
+    }
+    pub fn set_keypad_application(&mut self, on: bool) {
+        self.keypad_application = on;
     }
 
     // M7-4: DECSC `ESC 7` — cursor 위치 + SGR + shape/blinking/visible 저장.
