@@ -49,6 +49,17 @@ impl FontStack {
                 .and_then(|r| r.glyphs.first().cloned())
                 .map(|g| g.physical((0.0, 0.0), 1.0))
         }?;
+        // 비-ASCII 글자가 어떤 폰트로 raster되는지 진단(debug 수준).
+        // 한글 입력 많을 때 INFO는 noise라 DEBUG. RUST_LOG=debug로 활성화.
+        if !ch.is_ascii() && log::log_enabled!(log::Level::Debug) {
+            let font_name = self
+                .font_system
+                .db()
+                .face(phys.cache_key.font_id)
+                .map(|f| f.post_script_name.as_str())
+                .unwrap_or("<unknown>");
+            log::debug!("font-fallback ch={:?} font={}", ch, font_name);
+        }
         let img = self
             .swash_cache
             .get_image_uncached(&mut self.font_system, phys.cache_key)?;
@@ -88,15 +99,29 @@ fn measure_cell(font_system: &mut FontSystem, metrics: Metrics) -> CellMetrics {
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_text("M", &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, true);
-    let advance = buffer
-        .layout_runs()
-        .next()
+    // cosmic-text의 LayoutRun이 baseline y(line_y)을 직접 알려줌. line_top은 라인의 위쪽,
+    // line_y는 baseline. 픽셀 align 위해 ceil. line_run 없는 edge case에 0.78 휴리스틱
+    // fallback (M6-1에서 우연히 정확함을 확인했으나 이론적 안전망).
+    let line_run = buffer.layout_runs().next();
+    let advance = line_run
+        .as_ref()
         .and_then(|r| r.glyphs.first().map(|g| g.w))
         .unwrap_or(metrics.font_size * 0.6);
+    let baseline_y = line_run
+        .as_ref()
+        .map(|r| r.line_y)
+        .unwrap_or(metrics.line_height * 0.78);
     let height = metrics.line_height;
+    log::info!(
+        "measure_cell: font_size={} line_height={} advance={} baseline_y={}",
+        metrics.font_size,
+        height,
+        advance,
+        baseline_y,
+    );
     CellMetrics {
         width: advance.ceil().max(1.0) as u32,
         height: height.ceil().max(1.0) as u32,
-        baseline: (height * 0.78).ceil(),
+        baseline: baseline_y.ceil(),
     }
 }
