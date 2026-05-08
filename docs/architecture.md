@@ -773,7 +773,7 @@ pub enum Error {
 | **한글 IME 입력** | `app::input` 모듈에 IME 이벤트 진입점을 *지금은 만들지 않는다*. 자유 함수 `encode_key(KeyEvent)`로 시작 → IME 합성 시점에 `trait InputEncoder { fn encode(&mut self, ev: InputEvent) -> Vec<u8>; }`로 승격. NSTextInputClient 연결은 별도 `app::ime` 모듈을 그때 신설. | **미구현, 인터페이스도 미정** |
 | **마우스 인코딩** | `app::input::encode_mouse(&MouseEvent, &Mode) -> Vec<u8>`. 모드 플래그를 `Term::mouse_mode: MouseMode`로 보유. SGR/X10/Normal 인코딩 분기. | **미구현. `Term`에 `mouse_mode` 자리 비움** |
 | **kitty keyboard protocol** | `encode_key`가 `Term::kbd_protocol_flags`를 참조하여 분기. CSI `?u` 시퀀스 처리는 `vt`에서 `Term`의 플래그를 토글. | **자리 비움** |
-| **Reflow (wrap 재계산)** | `Grid::resize_truncate` 옆에 `Grid::reflow(new_cols, new_rows)` 메서드 자리 비움. wrap line metadata는 `Cell`이 아닌 `Vec<RowMeta>`에 둘 것 (행 단위 wrap flag). | **메서드 시그니처 미생성** |
+| **Reflow (wrap 재계산)** | `Term::resize`가 `reflow_all(new_cols, new_rows)` 호출. wrap metadata는 `Vec<RowFlags>` (행 단위 WRAPPED bit). scrollback row는 `ScrollbackRow { cells, flags }`. logical line 단위 평탄화 + re-wrap. resize coalesce(about_to_wait). 자세한 내용 `docs/reflow-design.md`. | **구현 (M17, 2026-05-08)** |
 | **Sixel / 이미지** | `vte::Perform::hook/put/unhook`이 받음 (DCS 처리). `Term`에 `images: Vec<ImageRef>` 자리 비움. | **빈 default 구현** |
 | **OSC 52 클립보드** | `vte::Perform::osc_dispatch`가 받음. `app::clipboard` 모듈 신설 예정. | **빈 default 구현** |
 | **링크/Hyperlink (OSC 8)** | osc_dispatch에서 분기. Cell에 `link_id: Option<u32>` 추가 시점이 옴. | **자리 비움** |
@@ -846,7 +846,7 @@ pub enum Error {
 - `vim` 진입/이탈 시 main screen 내용 보존.
 - `htop`이 정상 갱신.
 - `echo "안녕 hello"` 한글이 2칸으로 안 깨지고 보인다.
-- 윈도우 크기 변경 시 셸 프롬프트가 새 폭에 맞춰 다음부터 그려진다 (기존 줄 reflow는 X).
+- 윈도우 크기 변경 시 기존 줄도 새 폭에 맞춰 reflow된다 (M17, 2026-05-08).
 
 ---
 
@@ -901,7 +901,7 @@ pub enum Error {
 | Alt screen | 두 Grid 인스턴스 | vim/htop이 main 보존 필요 |
 | Dirty | 행 단위 비트맵 | 셀 단위는 부기 비용 비례 안 함 |
 | 에러 | `thiserror` 도메인 enum + `anyhow` (`From`만 사용) | portable-pty가 anyhow를 반환하므로 anyhow 의존성은 강제 |
-| Reflow | MVP 미지원 (truncate) | Alacritty도 늦게 도입한 영역 — 학습 무리 |
+| Reflow | **M17 지원** (logical line 단위 + scrollback 통합 + cursor anchor partition + resize coalesce) | 좁힘/넓힘 시 wrap 자연 풀림 |
 | 텍스트 렌더 | cosmic-text 0.19 | 한글 fallback "그냥 동작" — 학습 시간 절약 |
 
 ---

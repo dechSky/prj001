@@ -70,6 +70,9 @@ struct AppState {
     focused: bool,
     cursor_blinking_cache: bool,
     modifiers: ModifiersState,
+    /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
+    /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
+    pending_resize: Option<PhysicalSize<u32>>,
 }
 
 impl App {
@@ -128,7 +131,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 state.window.request_redraw();
             }
-            WindowEvent::Resized(size) => state.resize(size),
+            WindowEvent::Resized(size) => {
+                // M17-5 coalesce: 즉시 resize 안 하고 누적. about_to_wait에서 마지막 size 한 번 처리.
+                state.pending_resize = Some(size);
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::MouseWheel { delta, .. } => {
                 // trackpad swipe / 마우스 휠로 scrollback 스크롤.
@@ -262,6 +269,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_mut() else { return };
+        // M17-5: 누적된 resize를 한 번만 처리.
+        if let Some(size) = state.pending_resize.take() {
+            state.resize(size);
+        }
         // 깜빡임 정지 조건:
         // - 창 비활성 (focused=false)
         // - cursor.blinking=false (DECSCUSR steady)
@@ -402,6 +413,7 @@ impl AppState {
             focused: true,
             cursor_blinking_cache: true,
             modifiers: ModifiersState::empty(),
+            pending_resize: None,
         })
     }
 
