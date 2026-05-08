@@ -44,6 +44,15 @@ impl<'a> Perform for TermPerform<'a> {
             }
             return;
         }
+        // M10-5: DA2 (Device Attributes secondary): CSI > c (intermediates=">", action='c')
+        if intermediates == b">" && action == 'c' {
+            let p = arg_at(params, 0, 0);
+            if p == 0 {
+                // xterm Pp=41 표준
+                self.term.push_response(b"\x1b[>41;0;0c".to_vec());
+            }
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
@@ -81,6 +90,25 @@ impl<'a> Perform for TermPerform<'a> {
                 let top = arg1(params, 1).saturating_sub(1);
                 let bottom = arg_at(params, 1, rows);
                 self.term.set_scroll_region(top, bottom);
+            }
+            // M10-4: DSR (Device Status Report)
+            'n' => {
+                let p = arg_at(params, 0, 0);
+                if p == 6 {
+                    // DSR cursor position: \x1b[<row>;<col>R (1-based)
+                    let cur = self.term.cursor();
+                    let resp = format!("\x1b[{};{}R", cur.row + 1, cur.col + 1);
+                    self.term.push_response(resp.into_bytes());
+                }
+                // p == 5 (status report \x1b[0n)는 M11 cleanup
+            }
+            // M10-5: DA1 (Device Attributes primary)
+            'c' => {
+                let p = arg_at(params, 0, 0);
+                if p == 0 {
+                    // DA1 default: xterm-256color terminfo u8 = \x1b[?1;2c
+                    self.term.push_response(b"\x1b[?1;2c".to_vec());
+                }
             }
             _ => {}
         }
@@ -145,6 +173,12 @@ impl<'a> TermPerform<'a> {
                 // M8-4: DECCKM cursor keys application mode
                 (1, 'h') => self.term.set_cursor_keys_application(true),
                 (1, 'l') => self.term.set_cursor_keys_application(false),
+                // M10-3: focus reporting mode (CSI ?1004 h/l)
+                (1004, 'h') => self.term.set_focus_reporting(true),
+                (1004, 'l') => self.term.set_focus_reporting(false),
+                // M10-2: bracketed paste mode (CSI ?2004 h/l)
+                (2004, 'h') => self.term.set_bracketed_paste(true),
+                (2004, 'l') => self.term.set_bracketed_paste(false),
                 _ => {}
             }
         }
@@ -441,6 +475,74 @@ mod tests {
         assert!(term.cursor_keys_application());
         run(&mut term, b"\x1b[?1l");
         assert!(!term.cursor_keys_application());
+    }
+
+    #[test]
+    fn dsr_cursor_position_response() {
+        let mut term = Term::new(80, 24);
+        // cursor (5, 10) — CUP은 1-based이므로 \x1b[6;11H = (row 5, col 10) 0-based
+        run(&mut term, b"\x1b[6;11H");
+        assert_eq!(term.cursor().row, 5);
+        assert_eq!(term.cursor().col, 10);
+        run(&mut term, b"\x1b[6n");
+        let responses = term.drain_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b[6;11R");
+        // 두 번째 drain은 빈
+        let responses2 = term.drain_responses();
+        assert!(responses2.is_empty());
+    }
+
+    #[test]
+    fn dsr_unknown_param_ignored() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[5n"); // status report — M10에서 미처리
+        assert!(term.drain_responses().is_empty());
+    }
+
+    #[test]
+    fn da1_response() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[c");
+        let responses = term.drain_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b[?1;2c");
+    }
+
+    #[test]
+    fn da2_response() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[>c");
+        let responses = term.drain_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b[>41;0;0c");
+    }
+
+    #[test]
+    fn da1_with_nonzero_param_ignored() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[1c"); // 비표준
+        assert!(term.drain_responses().is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_mode_toggle() {
+        let mut term = Term::new(80, 24);
+        assert!(!term.bracketed_paste());
+        run(&mut term, b"\x1b[?2004h");
+        assert!(term.bracketed_paste());
+        run(&mut term, b"\x1b[?2004l");
+        assert!(!term.bracketed_paste());
+    }
+
+    #[test]
+    fn focus_reporting_mode_toggle() {
+        let mut term = Term::new(80, 24);
+        assert!(!term.focus_reporting());
+        run(&mut term, b"\x1b[?1004h");
+        assert!(term.focus_reporting());
+        run(&mut term, b"\x1b[?1004l");
+        assert!(!term.focus_reporting());
     }
 
     #[test]

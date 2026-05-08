@@ -373,6 +373,13 @@ pub struct Term {
     /// M8-7: 창 타이틀 (OSC 0/2). PTY가 보낼 때마다 갱신.
     title: String,
     title_dirty: bool,
+    /// M10-2: bracketed paste mode (CSI ?2004 h/l). app이 paste 시 wrap 여부 판정.
+    bracketed_paste: bool,
+    /// M10-3: focus reporting mode (CSI ?1004 h/l). app이 focus change 시 송신 판정.
+    focus_reporting: bool,
+    /// M10-1: vt가 PTY로 보낼 응답 누적. main이 render에서 drain → pty.write.
+    /// DSR/DA 응답, M11+에서 OSC query 응답 등.
+    pending_responses: Vec<Vec<u8>>,
 }
 
 impl Term {
@@ -397,7 +404,34 @@ impl Term {
             keypad_application: false,
             title: String::new(),
             title_dirty: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            pending_responses: Vec::new(),
         }
+    }
+
+    // M10-2: bracketed paste mode getter/setter.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+    pub fn set_bracketed_paste(&mut self, on: bool) {
+        self.bracketed_paste = on;
+    }
+
+    // M10-3: focus reporting mode getter/setter.
+    pub fn focus_reporting(&self) -> bool {
+        self.focus_reporting
+    }
+    pub fn set_focus_reporting(&mut self, on: bool) {
+        self.focus_reporting = on;
+    }
+
+    // M10-1: PTY 응답 채널.
+    pub fn push_response(&mut self, bytes: Vec<u8>) {
+        self.pending_responses.push(bytes);
+    }
+    pub fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_responses)
     }
 
     // M8-7: title API.

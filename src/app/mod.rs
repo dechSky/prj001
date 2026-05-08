@@ -130,6 +130,20 @@ impl ApplicationHandler<UserEvent> for App {
                     state.cursor_visible = true;
                 }
                 state.window.request_redraw();
+                // M10-3: focus reporting on이면 PTY로 송신. lock drop 후 write.
+                let send: Option<&[u8]> = {
+                    let term = state.term.lock().unwrap();
+                    if term.focus_reporting() {
+                        Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = send {
+                    if let Err(e) = state.pty.write(bytes) {
+                        log::warn!("focus report write: {e}");
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 // M17-5 coalesce: 즉시 resize 안 하고 누적. about_to_wait에서 마지막 size 한 번 처리.
@@ -195,13 +209,18 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 use winit::event::ElementState;
                 use winit::keyboard::{Key, NamedKey};
-                // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, 그 외 swallow.
+                // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
                     if let Key::Character(s) = &event.logical_key {
                         let lower = s.to_lowercase();
                         if lower == "q" || lower == "w" {
                             log::info!("cmd+{lower}: exit");
                             event_loop.exit();
+                            return;
+                        }
+                        if lower == "v" {
+                            // M10-6: clipboard paste. bracketed_paste mode면 \e[200~/\e[201~ 래핑.
+                            state.handle_paste();
                             return;
                         }
                     }
@@ -417,6 +436,41 @@ impl AppState {
         })
     }
 
+    /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
+    fn handle_paste(&mut self) {
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("clipboard read failed: {e}");
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        // scrollback view 활성 시 paste는 bottom으로 snap.
+        if let Ok(mut term) = self.term.lock() {
+            if term.view_offset() > 0 {
+                term.snap_to_bottom();
+                self.window.request_redraw();
+            }
+        }
+        let bracketed = self.term.lock().map(|t| t.bracketed_paste()).unwrap_or(false);
+        log::debug!(
+            "paste: {} bytes, bracketed={}, lines={}",
+            text.len(),
+            bracketed,
+            text.matches('\n').count() + 1
+        );
+        if bracketed {
+            let _ = self.pty.write(b"\x1b[200~");
+            let _ = self.pty.write(text.as_bytes());
+            let _ = self.pty.write(b"\x1b[201~");
+        } else {
+            let _ = self.pty.write(text.as_bytes());
+        }
+    }
+
     fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -442,6 +496,18 @@ impl AppState {
     }
 
     fn render(&mut self) {
+        // M10-1: vt가 누적한 응답(DSR/DA 등)을 PTY로 송신. lock 잡고 drain → drop → write.
+        let responses: Vec<Vec<u8>> = if let Ok(mut term) = self.term.lock() {
+            term.drain_responses()
+        } else {
+            Vec::new()
+        };
+        for resp in responses {
+            if let Err(e) = self.pty.write(&resp) {
+                log::warn!("pty response write: {e}");
+            }
+        }
+
         use wgpu::CurrentSurfaceTexture as C;
         let frame = match self.surface.get_current_texture() {
             C::Success(t) | C::Suboptimal(t) => t,

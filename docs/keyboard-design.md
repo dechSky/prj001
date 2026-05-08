@@ -416,14 +416,17 @@ ESC [ N ; Pm ~   (modified Insert / Delete / PageUp/Down / F5-F12)
 - **현재 정책**: repeat 이벤트도 그대로 PTY 송신. shell이 알아서 처리(자체 repeat rate). 빠른 입력 시 PTY 부하 가능하지만 실측 문제 없음.
 - **M9-5 결정**: 코드 변경 없이 정책 명시만. 향후 PTY 부하 발견 시 throttling 도입.
 
-### 10.2 M10 — VT shadow modes (키 인코딩과 분리, vt 영역)
+### 10.2 M10 — VT shadow modes (구현 완료, 2026-05-08)
 
-키 인코딩이 아닌 **PTY 송신/수신 시점의 시퀀스 처리**. handle_dec_private 영역.
+자세한 설계는 `docs/m10-design.md`. 본 항목은 keyboard-design 차원에서의 cross-cut만.
 
-- **Bracketed paste mode** (`CSI ?2004 h/l`): vim/zsh가 활성화. 활성 시 paste된 텍스트 앞뒤로 `ESC [200~` / `ESC [201~`로 감싸 PTY로 보냄. shell이 paste 인식. 현재 vt가 시퀀스 무시 — 시퀀스 자체는 cell에 안 들어가지만 paste 모드 활성화에 따른 동작 변화 미반영.
-- **Focus reporting mode** (`CSI ?1004 h/l`): vim이 활성화. 활성 시 창 focus/blur에 `ESC [I` / `ESC [O` 송신. M7-3에서 우리는 Focused 상태를 추적 중이라 추가는 작은 작업.
+- **Bracketed paste (`CSI ?2004 h/l`)**: 구현. zsh가 활성화 (line editor 시작 시 `?2004h` 송신 확인). paste 시 `\e[200~` ... `\e[201~`로 wrap.
+- **Focus reporting (`CSI ?1004 h/l`)**: 구현. WindowEvent::Focused에서 `\e[I` / `\e[O` PTY 송신.
+- **DSR `CSI 6n`**: 구현. cursor pos 응답 `\e[<r>;<c>R`.
+- **DA1 `CSI c`**: 구현. `\e[?1;2c` 응답. **vim startup hang(~1초) 사라짐**.
+- **DA2 `CSI > c`**: 구현. `\e[>41;0;0c` 응답.
 
-두 영역은 키 입력보다 **app 상태 → PTY 송신** 패턴. M8 완료 후 별도 task.
+**§13 단축키 정책 갱신**: Cmd+V는 swallow 아닌 **clipboard paste 동작**(arboard 3.6).
 
 ---
 
@@ -448,7 +451,7 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | **Cmd+Q** | 앱 종료 (`event_loop.exit()`) | macOS 표준 |
 | **Cmd+W** | 앱 종료 (single-window 앱이라 같은 의미) | macOS 표준. 추후 multi-window 시 분리 |
 | **Cmd+C** | swallow (PTY 안 보냄). clipboard 미구현 명시 | M11+ clipboard task |
-| **Cmd+V** | swallow. M11+에서 paste 처리 | 동일 |
+| **Cmd+V** | **clipboard paste** (arboard로 읽어 PTY 송신, bracketed paste mode면 `\e[200~`...`\e[201~` wrap). M10-6에서 구현 (2026-05-08) | 일상 사용 필수 |
 | **Cmd+T** | swallow. tab 미구현 | 미지원 |
 | **Cmd+N** | swallow. multi-window 미구현 | 미지원 |
 | **그 외 Cmd+key** | swallow (안전 기본값) | shell이 Cmd modifier 의미 가질 가능성 0에 가까움. PTY 보내면 의도 없는 byte |
