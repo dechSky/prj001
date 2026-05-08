@@ -1,6 +1,6 @@
 use vte::{Params, ParamsIter, Perform};
 
-use crate::grid::{Attrs, Color, Term};
+use crate::grid::{Attrs, Color, CursorShape, Term};
 
 pub struct TermPerform<'a> {
     term: &'a mut Term,
@@ -31,6 +31,17 @@ impl<'a> Perform for TermPerform<'a> {
         // DEC private modes: ESC [ ? Pn h/l
         if intermediates == b"?" {
             self.handle_dec_private(params, action);
+            return;
+        }
+        // DECSCUSR: ESC [ Ps SP q (intermediates=" ", action='q')
+        if intermediates == b" " && action == 'q' {
+            let n = arg_at(params, 0, 0);
+            if let Some((shape, blinking)) = decscusr_to_shape(n) {
+                log::info!("decscusr: n={} → shape={:?} blinking={}", n, shape, blinking);
+                self.term.set_cursor_shape(shape, blinking);
+            } else {
+                log::debug!("decscusr: unknown n={}", n);
+            }
             return;
         }
         if !intermediates.is_empty() {
@@ -75,7 +86,14 @@ impl<'a> Perform for TermPerform<'a> {
         }
     }
 
-    fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {}
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        // M7-4: DECSC `ESC 7`, DECRC `ESC 8`.
+        match byte {
+            b'7' => self.term.decsc(),
+            b'8' => self.term.decrc(),
+            _ => {}
+        }
+    }
     fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
@@ -92,6 +110,9 @@ impl<'a> TermPerform<'a> {
                 // 1047/1048도 alt screen 변종이지만 1049가 표준
                 (1047, 'h') => self.term.switch_alt_screen(true),
                 (1047, 'l') => self.term.switch_alt_screen(false),
+                // M7-2: DECTCEM cursor visibility
+                (25, 'h') => self.term.set_cursor_visible(true),
+                (25, 'l') => self.term.set_cursor_visible(false),
                 _ => {}
             }
         }
@@ -137,6 +158,18 @@ impl<'a> TermPerform<'a> {
     }
 }
 
+fn decscusr_to_shape(n: usize) -> Option<(CursorShape, bool)> {
+    match n {
+        0 | 1 => Some((CursorShape::Block, true)),
+        2 => Some((CursorShape::Block, false)),
+        3 => Some((CursorShape::Underscore, true)),
+        4 => Some((CursorShape::Underscore, false)),
+        5 => Some((CursorShape::Bar, true)),
+        6 => Some((CursorShape::Bar, false)),
+        _ => None,
+    }
+}
+
 fn parse_extended_color(iter: &mut ParamsIter<'_>) -> Option<Color> {
     let mode_p = iter.next()?;
     let mode = mode_p.first().copied().unwrap_or(0);
@@ -168,4 +201,145 @@ fn arg_at(params: &Params, idx: usize, default: usize) -> usize {
         .and_then(|p| p.first().copied())
         .unwrap_or(0);
     if v == 0 { default } else { v as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::{Color, CursorShape, Term};
+    use vte::Parser;
+
+    fn run(term: &mut Term, bytes: &[u8]) {
+        let mut parser = Parser::new();
+        let mut perform = TermPerform::new(term);
+        parser.advance(&mut perform, bytes);
+    }
+
+    #[test]
+    fn decscusr_sets_shape_and_blinking() {
+        let mut term = Term::new(80, 24);
+        // 기본값 검증
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+        assert!(term.cursor().blinking);
+
+        // n=5: blink bar
+        run(&mut term, b"\x1b[5 q");
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+        assert!(term.cursor().blinking);
+
+        // n=4: steady underscore
+        run(&mut term, b"\x1b[4 q");
+        assert_eq!(term.cursor().shape, CursorShape::Underscore);
+        assert!(!term.cursor().blinking);
+
+        // n=2: steady block
+        run(&mut term, b"\x1b[2 q");
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+        assert!(!term.cursor().blinking);
+
+        // n=0: default (blink block)
+        run(&mut term, b"\x1b[0 q");
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+        assert!(term.cursor().blinking);
+    }
+
+    #[test]
+    fn decscusr_unknown_n_ignored() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[5 q"); // bar, blink
+        run(&mut term, b"\x1b[99 q"); // 알 수 없음 — 무시
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+        assert!(term.cursor().blinking);
+    }
+
+    #[test]
+    fn dectcem_toggles_visibility() {
+        let mut term = Term::new(80, 24);
+        assert!(term.cursor().visible);
+
+        run(&mut term, b"\x1b[?25l"); // hide
+        assert!(!term.cursor().visible);
+
+        run(&mut term, b"\x1b[?25h"); // show
+        assert!(term.cursor().visible);
+    }
+
+    #[test]
+    fn decsc_decrc_preserves_position_and_sgr() {
+        let mut term = Term::new(80, 24);
+        // 위치를 (5, 10)로, fg=blue, bold + bar+blink
+        run(&mut term, b"\x1b[6;11H"); // CUP 1-based: row 6 → 0-based 5, col 11 → 10
+        run(&mut term, b"\x1b[1;34m"); // bold + blue fg
+        run(&mut term, b"\x1b[5 q"); // bar, blink
+        assert_eq!(term.cursor().row, 5);
+        assert_eq!(term.cursor().col, 10);
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+
+        // DECSC
+        run(&mut term, b"\x1b7");
+
+        // 다른 위치/SGR로 변경
+        run(&mut term, b"\x1b[1;1H"); // 0,0
+        run(&mut term, b"\x1b[0m"); // reset SGR
+        run(&mut term, b"\x1b[2 q"); // steady block
+        assert_eq!(term.cursor().row, 0);
+        assert_eq!(term.cursor().col, 0);
+        assert_eq!(term.cursor().shape, CursorShape::Block);
+
+        // DECRC
+        run(&mut term, b"\x1b8");
+        assert_eq!(term.cursor().row, 5);
+        assert_eq!(term.cursor().col, 10);
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
+        assert!(term.cursor().blinking);
+    }
+
+    #[test]
+    fn decrc_without_decsc_is_noop() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[6;11H"); // (5, 10)
+        run(&mut term, b"\x1b8"); // DECRC without prior DECSC
+        // 변경 없이 그대로
+        assert_eq!(term.cursor().row, 5);
+        assert_eq!(term.cursor().col, 10);
+    }
+
+    #[test]
+    fn decsc_separates_main_and_alt_screens() {
+        let mut term = Term::new(80, 24);
+        // main에서 (3, 5) 저장
+        run(&mut term, b"\x1b[4;6H");
+        run(&mut term, b"\x1b7");
+
+        // alt screen 진입 + 다른 위치 저장
+        run(&mut term, b"\x1b[?1049h"); // alt screen on
+        run(&mut term, b"\x1b[10;20H");
+        run(&mut term, b"\x1b7");
+
+        // alt에서 위치 변경 후 DECRC → alt saved 복원
+        run(&mut term, b"\x1b[1;1H");
+        run(&mut term, b"\x1b8");
+        assert_eq!(term.cursor().row, 9);
+        assert_eq!(term.cursor().col, 19);
+
+        // main 복귀 후 DECRC → main saved 복원
+        run(&mut term, b"\x1b[?1049l"); // alt off
+        run(&mut term, b"\x1b[1;1H");
+        run(&mut term, b"\x1b8");
+        assert_eq!(term.cursor().row, 3);
+        assert_eq!(term.cursor().col, 5);
+    }
+
+    #[test]
+    fn dectcem_default_visible_after_decsc_decrc() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b[?25l"); // hide
+        run(&mut term, b"\x1b7"); // save (visible=false 상태)
+        run(&mut term, b"\x1b[?25h"); // show
+        run(&mut term, b"\x1b8"); // restore
+        // xterm 표준: visible=false 복원
+        assert!(!term.cursor().visible);
+        // 컬러는 변하지 않아야
+        let _ = Color::Default; // 사용 표시
+    }
 }

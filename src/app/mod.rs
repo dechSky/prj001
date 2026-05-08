@@ -14,7 +14,7 @@ use winit::window::{ImePurpose, Window, WindowId};
 use crate::error::{Error, Result};
 use crate::grid::Term;
 use crate::pty::PtyHandle;
-use crate::render::Renderer;
+use crate::render::{CursorRender, Renderer};
 use event::UserEvent;
 
 const FONT_SIZE: f32 = 14.0;
@@ -55,6 +55,8 @@ struct AppState {
     preedit: Option<String>,
     cursor_visible: bool,
     last_blink: Instant,
+    focused: bool,
+    cursor_blinking_cache: bool,
 }
 
 impl App {
@@ -102,6 +104,14 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                state.focused = focused;
+                if focused {
+                    // 포커스 회복 시 즉시 cursor 보이기 (다음 blink phase 기다리지 않음).
+                    state.cursor_visible = true;
+                }
+                state.window.request_redraw();
+            }
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::MouseWheel { delta, .. } => {
@@ -201,6 +211,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_mut() else { return };
+        // 깜빡임 정지 조건:
+        // - 창 비활성 (focused=false)
+        // - cursor.blinking=false (DECSCUSR steady)
+        // 정지 시 cursor_visible=true 유지 (계속 보임), Wait로 idle.
+        if !state.focused || !state.cursor_blinking_cache {
+            if !state.cursor_visible {
+                state.cursor_visible = true;
+                state.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         let blink = Duration::from_millis(CURSOR_BLINK_MS);
         let now = Instant::now();
         let next = if now.duration_since(state.last_blink) >= blink {
@@ -326,6 +348,8 @@ impl AppState {
             preedit: None,
             cursor_visible: true,
             last_blink: Instant::now(),
+            focused: true,
+            cursor_blinking_cache: true,
         })
     }
 
@@ -366,14 +390,16 @@ impl AppState {
 
         if let Ok(term) = self.term.lock() {
             let cur = term.cursor();
+            // M7-3: cursor.blinking 캐시 갱신. about_to_wait이 매 tick lock 안 잡도록.
+            self.cursor_blinking_cache = cur.blinking;
             let in_scrollback = term.view_offset() > 0;
             let preedit_arg = self
                 .preedit
                 .as_deref()
                 .map(|s| (s, cur.col, cur.row));
             // cursor 위치 = preedit 있으면 preedit 끝, 없으면 term.cursor().
-            // 깜빡임 OFF 또는 scrollback view 중이면 None.
-            let cursor_xy = if self.cursor_visible && !in_scrollback {
+            // 가시성 판정: DECTCEM(cur.visible) + scrollback view + blink phase(cursor_visible).
+            let cursor_render = if cur.visible && self.cursor_visible && !in_scrollback {
                 let (row, col) = if let Some((preedit_str, col, row)) = preedit_arg {
                     let mut c = col;
                     for ch in preedit_str.chars() {
@@ -383,7 +409,12 @@ impl AppState {
                 } else {
                     (cur.row, cur.col)
                 };
-                Some((row, col))
+                Some(CursorRender {
+                    row,
+                    col,
+                    shape: cur.shape,
+                    focused: self.focused,
+                })
             } else {
                 None
             };
@@ -394,7 +425,7 @@ impl AppState {
                 &self.queue,
                 &term,
                 preedit_for_render,
-                cursor_xy,
+                cursor_render,
             );
             // M6-3b: cursor 위치가 바뀌면 IME composition window 위치 갱신.
             // scrollback view 중이면 stale 위치라 skip.

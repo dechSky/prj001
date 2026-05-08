@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use unicode_width::UnicodeWidthChar;
 
-use crate::grid::{Attrs, Color, Term};
+use crate::grid::{Attrs, Color, CursorShape, Term};
 
 use super::atlas::GlyphAtlas;
 
@@ -16,7 +16,20 @@ pub struct CellInstance {
     pub fg: [f32; 4],
     pub bg: [f32; 4],
     pub cell_span: f32,
-    pub _pad: [f32; 3],
+    /// M7-5 flags bitfield:
+    /// - bit 0 (0x01): cursor overlay instance 표시
+    /// - bit 1-2 (0x06): cursor shape (0=Block, 1=Underscore, 2=Bar)
+    /// - bit 3 (0x08): focused (1=focused 일반 shape, 0=outline)
+    pub flags: u32,
+    pub _pad: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+pub struct CursorRender {
+    pub row: usize,
+    pub col: usize,
+    pub shape: CursorShape,
+    pub focused: bool,
 }
 
 const FG_DEFAULT: [f32; 4] = [0.86, 0.86, 0.86, 1.0];
@@ -26,7 +39,7 @@ pub fn build_instances(
     term: &Term,
     atlas: &GlyphAtlas,
     baseline: f32,
-    cursor: Option<(usize, usize)>,
+    cursor: Option<CursorRender>,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     for r in 0..term.rows() {
@@ -36,9 +49,9 @@ pub fn build_instances(
                 continue;
             }
 
-            let is_cursor = cursor == Some((r, c));
-            // cursor는 cell의 REVERSE flag 토글과 동등한 효과.
-            let reversed = cell.attrs.contains(Attrs::REVERSE) ^ is_cursor;
+            // cursor 위치 cell도 다른 cell과 동일하게 main 렌더. cursor overlay instance가
+            // 그 위에 별도로 shape 영역만 덮음 (Model A — cursor-design.md §5.0).
+            let reversed = cell.attrs.contains(Attrs::REVERSE);
             let (fg, bg) = if reversed {
                 (resolve(cell.bg, false), resolve(cell.fg, true))
             } else {
@@ -54,7 +67,7 @@ pub fn build_instances(
             };
 
             let bg_is_default = bg == BG_DEFAULT;
-            if !is_cursor && entry.is_none() && bg_is_default {
+            if entry.is_none() && bg_is_default {
                 continue;
             }
 
@@ -84,10 +97,66 @@ pub fn build_instances(
                 fg,
                 bg,
                 cell_span,
-                _pad: [0.0; 3],
+                flags: 0,
+                _pad: [0.0; 2],
             });
         }
     }
+
+    // cursor overlay instance — 끝에 push해서 마지막에 그려짐. main instance의 reverse 버전.
+    // shader에서 shape 외 영역은 discard로 main이 그대로 보이고, shape 영역만 reverse 적용.
+    if let Some(cur) = cursor {
+        let cell = term.cell(cur.row, cur.col);
+        let (orig_fg, orig_bg) = if cell.attrs.contains(Attrs::REVERSE) {
+            (resolve(cell.bg, false), resolve(cell.fg, true))
+        } else {
+            (resolve(cell.fg, true), resolve(cell.bg, false))
+        };
+        // reverse: overlay에서 fg ↔ bg swap.
+        let overlay_fg = orig_bg;
+        let overlay_bg = orig_fg;
+        // 글리프 정보도 함께 (shape 영역 안에서 글리프가 reversed 색으로 보이도록).
+        let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
+            None
+        } else {
+            atlas
+                .get(cell.ch)
+                .filter(|e| e.width > 0 && e.height > 0)
+        };
+        let (uv_min, uv_max, glyph_offset, glyph_size) = if let Some(e) = entry {
+            (
+                e.uv_min,
+                e.uv_max,
+                [e.placement_left as f32, baseline - e.placement_top as f32],
+                [e.width as f32, e.height as f32],
+            )
+        } else {
+            ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2])
+        };
+        let shape_bits: u32 = match cur.shape {
+            CursorShape::Block => 0,
+            CursorShape::Underscore => 1,
+            CursorShape::Bar => 2,
+        };
+        let mut flags: u32 = 0x01;
+        flags |= shape_bits << 1;
+        if cur.focused {
+            flags |= 0x08;
+        }
+        out.push(CellInstance {
+            cell_xy: [cur.col as f32, cur.row as f32],
+            uv_min,
+            uv_max,
+            glyph_offset,
+            glyph_size,
+            fg: overlay_fg,
+            bg: overlay_bg,
+            cell_span: 1.0,
+            flags,
+            _pad: [0.0; 2],
+        });
+    }
+
     out
 }
 
@@ -137,7 +206,8 @@ pub fn build_preedit_instances(
             fg: dim_fg,
             bg: BG_DEFAULT,
             cell_span,
-            _pad: [0.0; 3],
+            flags: 0,
+            _pad: [0.0; 2],
         });
         col += w;
     }

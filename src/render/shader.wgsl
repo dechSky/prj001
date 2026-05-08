@@ -18,6 +18,7 @@ struct VsIn {
     @location(5) fg: vec4<f32>,
     @location(6) bg: vec4<f32>,
     @location(7) cell_span: f32,
+    @location(8) flags: u32,
 };
 
 struct VsOut {
@@ -29,6 +30,9 @@ struct VsOut {
     @location(4) glyph_size: vec2<f32>,
     @location(5) fg: vec4<f32>,
     @location(6) bg: vec4<f32>,
+    // 정수 type은 fragment로 보낼 때 flat interpolation 필수.
+    @location(7) @interpolate(flat) flags: u32,
+    @location(8) cell_span: f32,
 };
 
 @vertex
@@ -53,11 +57,58 @@ fn vs(input: VsIn) -> VsOut {
     o.glyph_size = input.glyph_size;
     o.fg = input.fg;
     o.bg = input.bg;
+    o.flags = input.flags;
+    o.cell_span = input.cell_span;
     return o;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    // M7-5: cursor overlay 분기 — shape 외 영역은 discard, 영역 안은 reverse(fg/bg swap)된
+    // 일반 cell처럼 글리프 + 배경을 함께 그림.
+    if ((in.flags & 1u) != 0u) {
+        let shape_bits = (in.flags >> 1u) & 3u;
+        let focused = (in.flags & 8u) != 0u;
+        let cell_w = u.cell.x * in.cell_span;
+        let cell_h = u.cell.y;
+        let underscore_thick = max(2.0, cell_h * 0.12);
+        let bar_thick = max(2.0, cell_w * 0.15);
+        let outline_w = max(1.0, cell_w * 0.05);
+        let outline_h = max(1.0, cell_h * 0.05);
+        var in_shape = false;
+        if (focused) {
+            if (shape_bits == 0u) {
+                in_shape = true;
+            } else if (shape_bits == 1u) {
+                in_shape = in.cell_pixel.y >= cell_h - underscore_thick;
+            } else if (shape_bits == 2u) {
+                in_shape = in.cell_pixel.x <= bar_thick;
+            }
+        } else {
+            in_shape = in.cell_pixel.x < outline_w
+                || in.cell_pixel.x > cell_w - outline_w
+                || in.cell_pixel.y < outline_h
+                || in.cell_pixel.y > cell_h - outline_h;
+        }
+        if (!in_shape) {
+            discard;
+        }
+        // shape 영역 안: reversed 색으로 글리프 + bg.
+        var color = in.bg;
+        if (in.glyph_size.x > 0.0 && in.glyph_size.y > 0.0) {
+            let rel = in.cell_pixel - in.glyph_offset;
+            if (rel.x >= 0.0 && rel.x < in.glyph_size.x
+                && rel.y >= 0.0 && rel.y < in.glyph_size.y) {
+                let glyph_uv01 = rel / in.glyph_size;
+                let atlas_uv = mix(in.uv_min, in.uv_max, glyph_uv01);
+                let alpha = textureSample(atlas_tex, atlas_smp, atlas_uv).r;
+                color = mix(in.bg, in.fg, alpha);
+            }
+        }
+        return color;
+    }
+
+    // 일반 cell 렌더 (기존).
     var color = in.bg;
     if (in.glyph_size.x > 0.0 && in.glyph_size.y > 0.0) {
         let rel = in.cell_pixel - in.glyph_offset;

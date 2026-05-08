@@ -47,10 +47,38 @@ impl Default for Cell {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorShape {
+    Block,
+    Underscore,
+    Bar,
+}
+
+impl Default for CursorShape {
+    fn default() -> Self {
+        CursorShape::Block
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Cursor {
     pub row: usize,
     pub col: usize,
+    pub shape: CursorShape,
+    pub blinking: bool,
+    pub visible: bool,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            col: 0,
+            shape: CursorShape::Block,
+            blinking: true,
+            visible: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +160,19 @@ impl Grid {
 /// 정책 B: scrollback hard cap 10,000 rows.
 const SCROLLBACK_CAP: usize = 10_000;
 
+/// M7-4: DECSC/DECRC로 저장되는 cursor 상태. xterm 표준에 따라 visible까지 포함.
+#[derive(Debug, Clone, Copy)]
+pub struct SavedCursorState {
+    pub row: usize,
+    pub col: usize,
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: Attrs,
+    pub shape: CursorShape,
+    pub blinking: bool,
+    pub visible: bool,
+}
+
 pub struct Term {
     main: Grid,
     alt: Grid,
@@ -148,6 +189,9 @@ pub struct Term {
     scrollback: VecDeque<Vec<Cell>>,
     /// scrollback view offset. 0 = 현재(scrollback 안 보임), n = n rows 위.
     view_offset: usize,
+    /// DECSC/DECRC용 saved state. main / alt 별도.
+    decsc_main: Option<SavedCursorState>,
+    decsc_alt: Option<SavedCursorState>,
 }
 
 impl Term {
@@ -166,6 +210,46 @@ impl Term {
             cur_attrs: Attrs::empty(),
             scrollback: VecDeque::new(),
             view_offset: 0,
+            decsc_main: None,
+            decsc_alt: None,
+        }
+    }
+
+    // M7-4: DECSC `ESC 7` — cursor 위치 + SGR + shape/blinking/visible 저장.
+    pub fn decsc(&mut self) {
+        let saved = SavedCursorState {
+            row: self.cursor.row,
+            col: self.cursor.col,
+            fg: self.cur_fg,
+            bg: self.cur_bg,
+            attrs: self.cur_attrs,
+            shape: self.cursor.shape,
+            blinking: self.cursor.blinking,
+            visible: self.cursor.visible,
+        };
+        if self.use_alt {
+            self.decsc_alt = Some(saved);
+        } else {
+            self.decsc_main = Some(saved);
+        }
+    }
+
+    // M7-4: DECRC `ESC 8` — 저장된 상태 복원. 저장된 게 없으면 noop.
+    pub fn decrc(&mut self) {
+        let saved = if self.use_alt {
+            self.decsc_alt
+        } else {
+            self.decsc_main
+        };
+        if let Some(s) = saved {
+            self.cursor.row = s.row.min(self.rows().saturating_sub(1));
+            self.cursor.col = s.col.min(self.cols().saturating_sub(1));
+            self.cur_fg = s.fg;
+            self.cur_bg = s.bg;
+            self.cur_attrs = s.attrs;
+            self.cursor.shape = s.shape;
+            self.cursor.blinking = s.blinking;
+            self.cursor.visible = s.visible;
         }
     }
 
@@ -452,6 +536,17 @@ impl Term {
             self.scroll_bottom = rows;
         }
         self.cursor = Cursor::default();
+    }
+
+    // M7-1: cursor shape/blinking 변경 (DECSCUSR).
+    pub fn set_cursor_shape(&mut self, shape: CursorShape, blinking: bool) {
+        self.cursor.shape = shape;
+        self.cursor.blinking = blinking;
+    }
+
+    // M7-2: cursor 가시성 (DECTCEM).
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor.visible = visible;
     }
 
     // SGR

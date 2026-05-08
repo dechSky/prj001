@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
+pub use geometry::CursorRender;
 
 use atlas::GlyphAtlas;
 use font::FontStack;
@@ -179,6 +180,11 @@ impl Renderer {
                     shader_location: 7,
                     format: wgpu::VertexFormat::Float32,
                 },
+                wgpu::VertexAttribute {
+                    offset: 76,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Uint32,
+                },
             ],
         };
 
@@ -256,7 +262,7 @@ impl Renderer {
         queue: &wgpu::Queue,
         term: &Term,
         preedit: Option<(&str, usize, usize)>,
-        cursor_xy: Option<(usize, usize)>,
+        cursor: Option<geometry::CursorRender>,
     ) {
         // atlas miss 글리프를 동적으로 raster + insert
         for r in 0..term.rows() {
@@ -289,7 +295,7 @@ impl Renderer {
             }
         }
         let mut instances =
-            geometry::build_instances(term, &self.atlas, self.baseline, cursor_xy);
+            geometry::build_instances(term, &self.atlas, self.baseline, cursor);
         if let Some((preedit_str, col, row)) = preedit {
             let mut preedit_inst = geometry::build_preedit_instances(
                 preedit_str,
