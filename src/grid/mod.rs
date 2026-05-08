@@ -10,8 +10,18 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Color(pub u8, pub u8, pub u8);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Color::Default
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
@@ -25,8 +35,8 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             ch: ' ',
-            fg: Color(220, 220, 220),
-            bg: Color(0, 0, 0),
+            fg: Color::Default,
+            bg: Color::Default,
             attrs: Attrs::empty(),
         }
     }
@@ -43,6 +53,9 @@ pub struct Term {
     cols: usize,
     rows: usize,
     cursor: Cursor,
+    cur_fg: Color,
+    cur_bg: Color,
+    cur_attrs: Attrs,
 }
 
 impl Term {
@@ -52,6 +65,9 @@ impl Term {
             cols,
             rows,
             cursor: Cursor::default(),
+            cur_fg: Color::Default,
+            cur_bg: Color::Default,
+            cur_attrs: Attrs::empty(),
         }
     }
 
@@ -61,6 +77,7 @@ impl Term {
     pub fn rows(&self) -> usize {
         self.rows
     }
+    #[allow(dead_code)]
     pub fn cursor(&self) -> Cursor {
         self.cursor
     }
@@ -95,7 +112,9 @@ impl Term {
         let idx = self.cursor.row * self.cols + self.cursor.col;
         self.cells[idx] = Cell {
             ch,
-            ..Cell::default()
+            fg: self.cur_fg,
+            bg: self.cur_bg,
+            attrs: self.cur_attrs,
         };
         self.cursor.col += 1;
     }
@@ -120,7 +139,6 @@ impl Term {
 
     fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.rows);
-        // M3: 가시 grid만 위로 밀어냄. scrollback 보존은 M5.
         for r in 0..(self.rows - n) {
             for c in 0..self.cols {
                 self.cells[r * self.cols + c] = self.cells[(r + n) * self.cols + c];
@@ -133,6 +151,26 @@ impl Term {
         }
     }
 
+    // SGR 상태
+    pub fn reset_sgr(&mut self) {
+        self.cur_fg = Color::Default;
+        self.cur_bg = Color::Default;
+        self.cur_attrs = Attrs::empty();
+    }
+    pub fn set_fg(&mut self, c: Color) {
+        self.cur_fg = c;
+    }
+    pub fn set_bg(&mut self, c: Color) {
+        self.cur_bg = c;
+    }
+    pub fn add_attr(&mut self, a: Attrs) {
+        self.cur_attrs.insert(a);
+    }
+    pub fn remove_attr(&mut self, a: Attrs) {
+        self.cur_attrs.remove(a);
+    }
+
+    #[allow(dead_code)]
     pub fn debug_dump(&self) -> String {
         let mut s = String::with_capacity(self.cells.len() + self.rows);
         for r in 0..self.rows {

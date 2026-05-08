@@ -161,6 +161,16 @@ impl Renderer {
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x2,
                 },
+                wgpu::VertexAttribute {
+                    offset: 40,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 56,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
 
@@ -178,7 +188,7 @@ impl Renderer {
                 entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),

@@ -15,11 +15,19 @@ struct VsIn {
     @location(2) uv_max: vec2<f32>,
     @location(3) glyph_offset: vec2<f32>,
     @location(4) glyph_size: vec2<f32>,
+    @location(5) fg: vec4<f32>,
+    @location(6) bg: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    @location(0) cell_corner: vec2<f32>,
+    @location(1) uv_min: vec2<f32>,
+    @location(2) uv_max: vec2<f32>,
+    @location(3) glyph_offset: vec2<f32>,
+    @location(4) glyph_size: vec2<f32>,
+    @location(5) fg: vec4<f32>,
+    @location(6) bg: vec4<f32>,
 };
 
 @vertex
@@ -28,20 +36,37 @@ fn vs(input: VsIn) -> VsOut {
         f32((input.vid & 1u) != 0u),
         f32((input.vid >> 1u) != 0u),
     );
-    let pixel = input.cell_xy * u.cell + input.glyph_offset + corner * input.glyph_size;
+    let cell_origin = input.cell_xy * u.cell;
+    let pixel = cell_origin + corner * u.cell;
     let ndc = vec2<f32>(
         pixel.x / u.viewport.x * 2.0 - 1.0,
         1.0 - pixel.y / u.viewport.y * 2.0,
     );
-    let uv = mix(input.uv_min, input.uv_max, corner);
     var o: VsOut;
     o.clip = vec4<f32>(ndc, 0.0, 1.0);
-    o.uv = uv;
+    o.cell_corner = corner;
+    o.uv_min = input.uv_min;
+    o.uv_max = input.uv_max;
+    o.glyph_offset = input.glyph_offset;
+    o.glyph_size = input.glyph_size;
+    o.fg = input.fg;
+    o.bg = input.bg;
     return o;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let alpha = textureSample(atlas_tex, atlas_smp, in.uv).r;
-    return vec4<f32>(u.fg.rgb, u.fg.a * alpha);
+    var color = in.bg;
+    if (in.glyph_size.x > 0.0 && in.glyph_size.y > 0.0) {
+        let pix = in.cell_corner * u.cell;
+        let rel = pix - in.glyph_offset;
+        if (rel.x >= 0.0 && rel.x < in.glyph_size.x
+            && rel.y >= 0.0 && rel.y < in.glyph_size.y) {
+            let glyph_uv01 = rel / in.glyph_size;
+            let atlas_uv = mix(in.uv_min, in.uv_max, glyph_uv01);
+            let alpha = textureSample(atlas_tex, atlas_smp, atlas_uv).r;
+            color = mix(in.bg, in.fg, alpha);
+        }
+    }
+    return color;
 }
