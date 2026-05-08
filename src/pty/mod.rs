@@ -27,7 +27,12 @@ impl PtyHandle {
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
-        let cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(shell);
+        // M8-7 보강: TERM_PROGRAM=Apple_Terminal 위장으로 macOS zsh의
+        // /etc/zshrc_Apple_Terminal 이 활성화되어 OSC 7(cwd) 자동 송신.
+        // TERM도 명시 (xterm-256color — 표준 ANSI/256-color 인식).
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("TERM_PROGRAM", "Apple_Terminal");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 

@@ -95,14 +95,29 @@ impl<'a> Perform for TermPerform<'a> {
         }
     }
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // M8-7: OSC 0 / OSC 2 → 창 타이틀 갱신. (OSC 1 = icon title only, 미처리)
         if params.len() < 2 {
             return;
         }
         let code = params[0];
+        // M8-7: OSC 0 / OSC 2 → 창 타이틀 직접 지정.
         if code == b"0" || code == b"2" {
             if let Ok(title) = std::str::from_utf8(params[1]) {
                 self.term.set_title(title.to_string());
+            }
+            return;
+        }
+        // M8-7 보강: OSC 7 → working directory file URL → 타이틀로 변환.
+        // macOS zsh의 update_terminal_cwd hook이 보내는 시퀀스.
+        // 형식: file://hostname/encoded/path
+        if code == b"7" {
+            if let Ok(url) = std::str::from_utf8(params[1]) {
+                if let Some(rest) = url.strip_prefix("file://") {
+                    // hostname/path 분리. hostname은 무시, path만.
+                    let path_encoded = rest.splitn(2, '/').nth(1).unwrap_or("");
+                    let path = url_decode(path_encoded);
+                    let display = home_relative(&path);
+                    self.term.set_title(display);
+                }
             }
         }
     }
@@ -170,6 +185,43 @@ impl<'a> TermPerform<'a> {
             self.term.reset_sgr();
         }
     }
+}
+
+/// percent-encoded URL path → 일반 path. `%20` 등을 단일 byte로.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                out.push((h1 * 16 + h2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// $HOME 접두사면 "~"로 치환, 아니면 절대 path 그대로.
+fn home_relative(abs_path: &str) -> String {
+    let abs = format!("/{}", abs_path.trim_start_matches('/'));
+    if let Ok(home) = std::env::var("HOME") {
+        if abs.starts_with(&home) {
+            let suffix = &abs[home.len()..];
+            return if suffix.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~{suffix}")
+            };
+        }
+    }
+    abs
 }
 
 fn decscusr_to_shape(n: usize) -> Option<(CursorShape, bool)> {
@@ -342,6 +394,24 @@ mod tests {
         run(&mut term, b"\x1b8");
         assert_eq!(term.cursor().row, 3);
         assert_eq!(term.cursor().col, 5);
+    }
+
+    #[test]
+    fn osc_7_sets_title_from_file_url() {
+        let mut term = Term::new(80, 24);
+        // file://hostname/Users/derek/Documents → /Users/derek/Documents
+        run(&mut term, b"\x1b]7;file://Derek-Mac/Users/derek/Documents\x07");
+        let t = term.take_title_if_changed().unwrap();
+        // HOME에 따라 ~/... 또는 /Users/...
+        assert!(t.contains("Documents"), "title was {:?}", t);
+    }
+
+    #[test]
+    fn osc_7_url_decodes_spaces() {
+        let mut term = Term::new(80, 24);
+        run(&mut term, b"\x1b]7;file://h/Users/foo%20bar/baz\x07");
+        let t = term.take_title_if_changed().unwrap();
+        assert!(t.contains("foo bar"), "title was {:?}", t);
     }
 
     #[test]
