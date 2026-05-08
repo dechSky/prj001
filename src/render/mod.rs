@@ -250,7 +250,14 @@ impl Renderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    pub fn update_term(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, term: &Term) {
+    pub fn update_term(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        term: &Term,
+        preedit: Option<(&str, usize, usize)>,
+        cursor_xy: Option<(usize, usize)>,
+    ) {
         // atlas miss 글리프를 동적으로 raster + insert
         for r in 0..term.rows() {
             for c in 0..term.cols() {
@@ -268,7 +275,32 @@ impl Renderer {
                 }
             }
         }
-        let instances = geometry::build_instances(term, &self.atlas, self.baseline);
+        // preedit 글리프도 atlas에 raster (한글 자모 등 ascii 외 글자 대응)
+        if let Some((preedit_str, _, _)) = preedit {
+            for ch in preedit_str.chars() {
+                if ch == ' ' || (ch as u32) < 0x20 {
+                    continue;
+                }
+                if self.atlas.get(ch).is_none() {
+                    if let Some(raster) = self.font_stack.raster_one(ch) {
+                        self.atlas.insert(queue, ch, &raster);
+                    }
+                }
+            }
+        }
+        let mut instances =
+            geometry::build_instances(term, &self.atlas, self.baseline, cursor_xy);
+        if let Some((preedit_str, col, row)) = preedit {
+            let mut preedit_inst = geometry::build_preedit_instances(
+                preedit_str,
+                col,
+                row,
+                term.cols(),
+                &self.atlas,
+                self.baseline,
+            );
+            instances.append(&mut preedit_inst);
+        }
         self.instance_count = instances.len() as u32;
         if instances.is_empty() {
             return;

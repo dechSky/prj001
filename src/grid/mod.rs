@@ -275,6 +275,18 @@ impl Term {
         }
     }
 
+    /// HT — Horizontal Tab. cursor를 다음 tab stop(8칸 단위)으로 이동.
+    /// cells는 변경하지 않음 (vt100 표준).
+    pub fn tab(&mut self) {
+        let cols = self.cols();
+        let max = cols.saturating_sub(1);
+        if self.cursor.col >= max {
+            return;
+        }
+        let next = ((self.cursor.col / 8) + 1) * 8;
+        self.cursor.col = next.min(max);
+    }
+
     // CSI 커서 이동 — 모두 0-based 입력 기대(vt 레이어가 1→0 변환)
     pub fn cursor_up(&mut self, n: usize) {
         self.cursor.row = self.cursor.row.saturating_sub(n);

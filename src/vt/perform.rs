@@ -22,6 +22,7 @@ impl<'a> Perform for TermPerform<'a> {
             0x0A => self.term.newline(),
             0x0D => self.term.carriage_return(),
             0x08 => self.term.backspace(),
+            0x09 => self.term.tab(),
             _ => {}
         }
     }
