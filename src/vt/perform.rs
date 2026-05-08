@@ -26,9 +26,51 @@ impl<'a> Perform for TermPerform<'a> {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _: &[u8], _: bool, action: char) {
-        if action == 'm' {
-            self.handle_sgr(params.iter());
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _: bool, action: char) {
+        // DEC private modes: ESC [ ? Pn h/l
+        if intermediates == b"?" {
+            self.handle_dec_private(params, action);
+            return;
+        }
+        if !intermediates.is_empty() {
+            return;
+        }
+        match action {
+            'm' => self.handle_sgr(params.iter()),
+            'A' => self.term.cursor_up(arg1(params, 1)),
+            'B' | 'e' => self.term.cursor_down(arg1(params, 1)),
+            'C' | 'a' => self.term.cursor_right(arg1(params, 1)),
+            'D' => self.term.cursor_left(arg1(params, 1)),
+            'H' | 'f' => {
+                // CUP: ESC [ Pr ; Pc H — 1-based
+                let row = arg1(params, 1).saturating_sub(1);
+                let col = arg_at(params, 1, 1).saturating_sub(1);
+                self.term.set_cursor(row, col);
+            }
+            'G' | '`' => {
+                // CHA: 절대 column, 1-based
+                let col = arg1(params, 1).saturating_sub(1);
+                let cur_row = self.term.cursor().row;
+                self.term.set_cursor(cur_row, col);
+            }
+            'd' => {
+                // VPA: 절대 row, 1-based
+                let row = arg1(params, 1).saturating_sub(1);
+                let cur_col = self.term.cursor().col;
+                self.term.set_cursor(row, cur_col);
+            }
+            'J' => self.term.erase_display(arg_at(params, 0, 0) as u16),
+            'K' => self.term.erase_line(arg_at(params, 0, 0) as u16),
+            'S' => self.term.scroll_up_n(arg1(params, 1)),
+            'T' => self.term.scroll_down_n(arg1(params, 1)),
+            'r' => {
+                // DECSTBM: ESC [ top ; bottom r — 1-based, default = 전체
+                let rows = self.term.rows();
+                let top = arg1(params, 1).saturating_sub(1);
+                let bottom = arg_at(params, 1, rows);
+                self.term.set_scroll_region(top, bottom);
+            }
+            _ => {}
         }
     }
 
@@ -40,6 +82,20 @@ impl<'a> Perform for TermPerform<'a> {
 }
 
 impl<'a> TermPerform<'a> {
+    fn handle_dec_private(&mut self, params: &Params, action: char) {
+        for p in params.iter() {
+            let code = p.first().copied().unwrap_or(0);
+            match (code, action) {
+                (1049, 'h') => self.term.switch_alt_screen(true),
+                (1049, 'l') => self.term.switch_alt_screen(false),
+                // 1047/1048도 alt screen 변종이지만 1049가 표준
+                (1047, 'h') => self.term.switch_alt_screen(true),
+                (1047, 'l') => self.term.switch_alt_screen(false),
+                _ => {}
+            }
+        }
+    }
+
     fn handle_sgr(&mut self, mut iter: ParamsIter<'_>) {
         let mut saw_any = false;
         while let Some(p) = iter.next() {
@@ -97,4 +153,18 @@ fn parse_extended_color(iter: &mut ParamsIter<'_>) -> Option<Color> {
         }
         _ => None,
     }
+}
+
+/// 첫 번째 param 값. 없거나 0이면 default.
+fn arg1(params: &Params, default: usize) -> usize {
+    arg_at(params, 0, default)
+}
+
+fn arg_at(params: &Params, idx: usize, default: usize) -> usize {
+    let v = params
+        .iter()
+        .nth(idx)
+        .and_then(|p| p.first().copied())
+        .unwrap_or(0);
+    if v == 0 { default } else { v as usize }
 }

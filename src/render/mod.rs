@@ -5,7 +5,7 @@ mod geometry;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::grid::Term;
+use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
 
@@ -31,6 +31,7 @@ pub struct Renderer {
     instance_capacity: usize,
     instance_count: u32,
     atlas: GlyphAtlas,
+    font_stack: FontStack,
     cell: CellMetrics,
     baseline: f32,
     viewport: [f32; 2],
@@ -47,8 +48,10 @@ impl Renderer {
         let mut font_stack = FontStack::new(font_size);
         let cell = font_stack.cell;
         let baseline = cell.baseline;
-        let rasters = font_stack.raster_ascii();
-        let atlas = GlyphAtlas::new(device, queue, &rasters);
+        let mut atlas = GlyphAtlas::new(device);
+        for (ch, raster) in font_stack.raster_ascii() {
+            atlas.insert(queue, ch, &raster);
+        }
 
         let uniforms = Uniforms {
             viewport,
@@ -171,6 +174,11 @@ impl Renderer {
                     shader_location: 6,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: 72,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         };
 
@@ -221,6 +229,7 @@ impl Renderer {
             instance_capacity: initial_capacity,
             instance_count: 0,
             atlas,
+            font_stack,
             cell,
             baseline,
             viewport,
@@ -242,6 +251,23 @@ impl Renderer {
     }
 
     pub fn update_term(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, term: &Term) {
+        // atlas miss 글리프를 동적으로 raster + insert
+        for r in 0..term.rows() {
+            for c in 0..term.cols() {
+                let cell = term.cell(r, c);
+                if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
+                    continue;
+                }
+                if cell.attrs.contains(Attrs::WIDE_CONT) {
+                    continue;
+                }
+                if self.atlas.get(cell.ch).is_none() {
+                    if let Some(raster) = self.font_stack.raster_one(cell.ch) {
+                        self.atlas.insert(queue, cell.ch, &raster);
+                    }
+                }
+            }
+        }
         let instances = geometry::build_instances(term, &self.atlas, self.baseline);
         self.instance_count = instances.len() as u32;
         if instances.is_empty() {

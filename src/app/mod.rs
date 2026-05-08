@@ -140,7 +140,10 @@ impl AppState {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pj001-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: 4096,
+                    ..wgpu::Limits::downlevel_defaults()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 trace: wgpu::Trace::Off,

@@ -36,35 +36,47 @@ impl FontStack {
         }
     }
 
-    pub fn raster_ascii(&mut self) -> Vec<(char, GlyphRaster)> {
+    pub fn raster_one(&mut self, ch: char) -> Option<GlyphRaster> {
         let attrs = Attrs::new().family(Family::Monospace);
+        let phys = {
+            let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
+            let s = ch.to_string();
+            buffer.set_text(&s, &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut self.font_system, true);
+            buffer
+                .layout_runs()
+                .next()
+                .and_then(|r| r.glyphs.first().cloned())
+                .map(|g| g.physical((0.0, 0.0), 1.0))
+        }?;
+        let img = self
+            .swash_cache
+            .get_image_uncached(&mut self.font_system, phys.cache_key)?;
+        Some(GlyphRaster {
+            placement: img.placement,
+            data: img.data,
+            content: img.content,
+        })
+    }
+
+    pub fn raster_ascii(&mut self) -> Vec<(char, GlyphRaster)> {
+        // Phase 0 진단: Korean fallback 작동 여부 확인
+        if let Some(test) = self.raster_one('안') {
+            log::info!(
+                "korean fallback test: '안' placement={}x{} data_len={}",
+                test.placement.width,
+                test.placement.height,
+                test.data.len()
+            );
+        } else {
+            log::error!("korean fallback test: '안' raster FAILED (no glyph)");
+        }
+
         let chars: Vec<char> = (0x20u8..=0x7Eu8).map(|b| b as char).collect();
         let mut out = Vec::with_capacity(chars.len());
         for ch in chars {
-            let phys = {
-                let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
-                let s = ch.to_string();
-                buffer.set_text(&s, &attrs, Shaping::Basic, None);
-                buffer.shape_until_scroll(&mut self.font_system, true);
-                buffer
-                    .layout_runs()
-                    .next()
-                    .and_then(|r| r.glyphs.first().cloned())
-                    .map(|g| g.physical((0.0, 0.0), 1.0))
-            };
-            let Some(phys) = phys else { continue };
-            if let Some(img) = self
-                .swash_cache
-                .get_image_uncached(&mut self.font_system, phys.cache_key)
-            {
-                out.push((
-                    ch,
-                    GlyphRaster {
-                        placement: img.placement,
-                        data: img.data,
-                        content: img.content,
-                    },
-                ));
+            if let Some(r) = self.raster_one(ch) {
+                out.push((ch, r));
             }
         }
         out
@@ -74,7 +86,7 @@ impl FontStack {
 fn measure_cell(font_system: &mut FontSystem, metrics: Metrics) -> CellMetrics {
     let attrs = Attrs::new().family(Family::Monospace);
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_text("M", &attrs, Shaping::Basic, None);
+    buffer.set_text("M", &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, true);
     let advance = buffer
         .layout_runs()

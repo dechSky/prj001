@@ -14,6 +14,8 @@ pub struct CellInstance {
     pub glyph_size: [f32; 2],
     pub fg: [f32; 4],
     pub bg: [f32; 4],
+    pub cell_span: f32,
+    pub _pad: [f32; 3],
 }
 
 const FG_DEFAULT: [f32; 4] = [0.86, 0.86, 0.86, 1.0];
@@ -24,6 +26,9 @@ pub fn build_instances(term: &Term, atlas: &GlyphAtlas, baseline: f32) -> Vec<Ce
     for r in 0..term.rows() {
         for c in 0..term.cols() {
             let cell = term.cell(r, c);
+            if cell.attrs.contains(Attrs::WIDE_CONT) {
+                continue;
+            }
 
             let (fg, bg) = if cell.attrs.contains(Attrs::REVERSE) {
                 (resolve(cell.bg, false), resolve(cell.fg, true))
@@ -44,6 +49,12 @@ pub fn build_instances(term: &Term, atlas: &GlyphAtlas, baseline: f32) -> Vec<Ce
                 continue;
             }
 
+            let cell_span = if cell.attrs.contains(Attrs::WIDE) {
+                2.0
+            } else {
+                1.0
+            };
+
             let (uv_min, uv_max, glyph_offset, glyph_size) = if let Some(e) = entry {
                 (
                     e.uv_min,
@@ -63,6 +74,8 @@ pub fn build_instances(term: &Term, atlas: &GlyphAtlas, baseline: f32) -> Vec<Ce
                 glyph_size,
                 fg,
                 bg,
+                cell_span,
+                _pad: [0.0; 3],
             });
         }
     }
