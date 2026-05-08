@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
 
@@ -127,6 +129,9 @@ impl Grid {
     }
 }
 
+/// 정책 B: scrollback hard cap 10,000 rows.
+const SCROLLBACK_CAP: usize = 10_000;
+
 pub struct Term {
     main: Grid,
     alt: Grid,
@@ -139,6 +144,10 @@ pub struct Term {
     cur_fg: Color,
     cur_bg: Color,
     cur_attrs: Attrs,
+    /// main grid에서 scroll_up으로 밀려난 row를 보관. 가장 오래된 게 front.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// scrollback view offset. 0 = 현재(scrollback 안 보임), n = n rows 위.
+    view_offset: usize,
 }
 
 impl Term {
@@ -155,6 +164,8 @@ impl Term {
             cur_fg: Color::Default,
             cur_bg: Color::Default,
             cur_attrs: Attrs::empty(),
+            scrollback: VecDeque::new(),
+            view_offset: 0,
         }
     }
 
@@ -184,8 +195,47 @@ impl Term {
     pub fn cursor(&self) -> Cursor {
         self.cursor
     }
-    pub fn cell(&self, row: usize, col: usize) -> &Cell {
-        self.grid().cell(row, col)
+    /// view_offset 반영해서 cell을 반환. scrollback row가 col 부족하면 default.
+    /// (resize로 col이 변한 경우의 truncate-on-read; reflow는 안 함.)
+    pub fn cell(&self, row: usize, col: usize) -> Cell {
+        let scrollback_visible = self.view_offset.min(self.scrollback.len());
+        if row < scrollback_visible {
+            let sb_idx = self.scrollback.len() - scrollback_visible + row;
+            return self
+                .scrollback
+                .get(sb_idx)
+                .and_then(|r| r.get(col).copied())
+                .unwrap_or_default();
+        }
+        let main_row = row - scrollback_visible;
+        if main_row >= self.grid().rows {
+            return Cell::default();
+        }
+        *self.grid().cell(main_row, col)
+    }
+
+    #[allow(dead_code)]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// scrollback view 스크롤. delta > 0 = 위로, delta < 0 = 아래로.
+    pub fn scroll_view_by(&mut self, delta: isize) {
+        let max = self.scrollback.len();
+        let new = if delta >= 0 {
+            self.view_offset.saturating_add(delta as usize).min(max)
+        } else {
+            self.view_offset.saturating_sub((-delta) as usize)
+        };
+        self.view_offset = new;
+    }
+
+    pub fn snap_to_bottom(&mut self) {
+        self.view_offset = 0;
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -198,12 +248,16 @@ impl Term {
         self.scroll_bottom = rows;
         self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+        // view_offset clamp + scrollback row의 col mismatch는 truncate-on-read로 처리.
+        self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
     pub fn switch_alt_screen(&mut self, on: bool) {
         if on == self.use_alt {
             return;
         }
+        // alt screen 전환 시 scrollback view는 항상 bottom으로 (alt에서 scrollback 안 봄).
+        self.view_offset = 0;
         if on {
             self.saved_main_cursor = self.cursor;
             self.use_alt = true;
@@ -259,6 +313,16 @@ impl Term {
         if self.cursor.row + 1 >= self.scroll_bottom {
             let top = self.scroll_top;
             let bottom = self.scroll_bottom;
+            // 풀스크린 + main screen 스크롤일 때만 top row를 scrollback에 push.
+            // 부분 스크롤 영역(vim status bar 등)은 scrollback 오염 방지.
+            if !self.use_alt && top == 0 && bottom == self.main.rows {
+                let cols = self.main.cols;
+                let row_cells: Vec<Cell> = self.main.cells[..cols].to_vec();
+                self.scrollback.push_back(row_cells);
+                while self.scrollback.len() > SCROLLBACK_CAP {
+                    self.scrollback.pop_front();
+                }
+            }
             self.grid_mut().scroll_up(top, bottom, 1);
         } else {
             self.cursor.row += 1;

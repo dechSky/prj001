@@ -135,6 +135,35 @@ impl ApplicationHandler<UserEvent> for App {
                     event.logical_key,
                     event.text
                 );
+                use winit::event::ElementState;
+                use winit::keyboard::{Key, NamedKey};
+                // PageUp/PageDown: scrollback view 스크롤. PTY로 안 보냄.
+                if event.state == ElementState::Pressed {
+                    if let Key::Named(named @ (NamedKey::PageUp | NamedKey::PageDown)) =
+                        &event.logical_key
+                    {
+                        if let Ok(mut term) = state.term.lock() {
+                            let page = term.rows().saturating_sub(1).max(1) as isize;
+                            let delta = if matches!(named, NamedKey::PageUp) {
+                                page
+                            } else {
+                                -page
+                            };
+                            term.scroll_view_by(delta);
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+                // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
+                if event.state == ElementState::Pressed {
+                    if let Ok(mut term) = state.term.lock() {
+                        if term.view_offset() > 0 {
+                            term.snap_to_bottom();
+                            state.window.request_redraw();
+                        }
+                    }
+                }
                 if let Some(bytes) = input::encode_key(&event) {
                     if let Err(e) = state.pty.write(&bytes) {
                         log::warn!("pty write: {e}");
@@ -312,13 +341,14 @@ impl AppState {
 
         if let Ok(term) = self.term.lock() {
             let cur = term.cursor();
+            let in_scrollback = term.view_offset() > 0;
             let preedit_arg = self
                 .preedit
                 .as_deref()
                 .map(|s| (s, cur.col, cur.row));
             // cursor 위치 = preedit 있으면 preedit 끝, 없으면 term.cursor().
-            // 깜빡임 OFF 단계면 None.
-            let cursor_xy = if self.cursor_visible {
+            // 깜빡임 OFF 또는 scrollback view 중이면 None.
+            let cursor_xy = if self.cursor_visible && !in_scrollback {
                 let (row, col) = if let Some((preedit_str, col, row)) = preedit_arg {
                     let mut c = col;
                     for ch in preedit_str.chars() {
@@ -332,15 +362,18 @@ impl AppState {
             } else {
                 None
             };
+            // scrollback view 중이면 preedit overlay도 stale 위치라 안 그림.
+            let preedit_for_render = if in_scrollback { None } else { preedit_arg };
             self.renderer.update_term(
                 &self.device,
                 &self.queue,
                 &term,
-                preedit_arg,
+                preedit_for_render,
                 cursor_xy,
             );
             // M6-3b: cursor 위치가 바뀌면 IME composition window 위치 갱신.
-            if self.last_ime_cursor != Some((cur.row, cur.col)) {
+            // scrollback view 중이면 stale 위치라 skip.
+            if !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
                 let cell = self.renderer.cell_metrics();
                 let pos = winit::dpi::PhysicalPosition::<f64>::new(
                     (cur.col as u32 * cell.width) as f64,
