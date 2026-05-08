@@ -112,7 +112,7 @@ fn measure_cell(font_system: &mut FontSystem, metrics: Metrics) -> CellMetrics {
         .map(|r| r.line_y)
         .unwrap_or(metrics.line_height * 0.78);
     let height = metrics.line_height;
-    log::info!(
+    log::debug!(
         "measure_cell: font_size={} line_height={} advance={} baseline_y={}",
         metrics.font_size,
         height,

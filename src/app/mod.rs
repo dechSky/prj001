@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use portable_pty::PtySize;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{ImePurpose, Window, WindowId};
 
@@ -104,15 +104,37 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                // trackpad swipe / 마우스 휠로 scrollback 스크롤.
+                // delta y > 0 = 손가락 위로 = scrollback 위로(view_offset 증가).
+                let cell_h = state.renderer.cell_metrics().height as f32;
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as isize,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        if cell_h > 0.0 {
+                            (pos.y / cell_h as f64) as isize
+                        } else {
+                            0
+                        }
+                    }
+                };
+                if lines != 0 {
+                    if let Ok(mut term) = state.term.lock() {
+                        term.scroll_view_by(lines);
+                    }
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::Ime(ime) => {
-                log::info!("ime: {:?}", ime);
                 use winit::event::Ime;
                 match ime {
                     Ime::Preedit(s, _range) => {
+                        log::debug!("ime: Preedit({:?})", s);
                         state.preedit = if s.is_empty() { None } else { Some(s) };
                         state.window.request_redraw();
                     }
                     Ime::Commit(s) => {
+                        log::debug!("ime: Commit({:?})", s);
                         state.preedit = None;
                         if let Err(e) = state.pty.write(s.as_bytes()) {
                             log::warn!("pty write (ime commit): {e}");
@@ -120,16 +142,19 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                     }
                     Ime::Disabled => {
+                        log::info!("ime: Disabled");
                         if state.preedit.is_some() {
                             state.preedit = None;
                             state.window.request_redraw();
                         }
                     }
-                    Ime::Enabled => {}
+                    Ime::Enabled => {
+                        log::info!("ime: Enabled");
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                log::info!(
+                log::debug!(
                     "key: state={:?} logical={:?} text={:?}",
                     event.state,
                     event.logical_key,

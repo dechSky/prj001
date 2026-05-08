@@ -522,6 +522,8 @@ impl DirtyTracker {
 
 ### 5.5 render 모듈 핵심 타입
 
+> **주의**: 아래 시그니처는 설계 단계 스케치(2026-05-07). 실제 구현은 §6.4의 wgpu 29.0.3 / cosmic-text 0.19 API 변경점을 반영함 (M1~M5 진행 중 docs.rs 재확인으로 확정, 2026-05-08).
+
 ```rust
 // src/render/mod.rs
 
@@ -664,6 +666,27 @@ impl<'a> vte::Perform for TermPerform<'a> {
 - `wgpu 29.0.3` → `raw-window-handle ^0.6.2` (필수)
 - `winit 0.30.13` → `raw-window-handle ^0.6` (선택 dep, raw-window-handle 0.6 활성화)
 - → 두 크레이트는 raw-window-handle 0.6에서 만나므로 호환 ✅
+
+### 6.4 M1~M5 진입 시 발견된 API 변경점 (2026-05-08)
+
+설계 시점(2026-05-07)에는 미반영. 구현 진입 직전 docs.rs 재확인으로 확정. §5.5/5.6의 타입 스케치는 변경 *전* 형태이므로 실제 구현 시 아래 차이를 반영해야 한다.
+
+**wgpu 29.0.3** (이전 메이저 대비):
+
+- `InstanceDescriptor::default()` 없음 → `InstanceDescriptor::new_without_display_handle()` 사용. 또한 `Instance::new`는 값으로 받음 (레퍼런스 X).
+- `DeviceDescriptor`에 `experimental_features: wgpu::ExperimentalFeatures::disabled()` 필수 필드 추가.
+- `RenderPassColorAttachment`에 `depth_slice: Option<u32>` 필드 추가.
+- `RenderPassDescriptor`에 `multiview_mask: Option<u32>` 필드 추가.
+- `Surface::get_current_texture()` 반환값이 `Result<SurfaceTexture, SurfaceError>`가 아니라 `CurrentSurfaceTexture` enum 7 variants(`Success` / `Suboptimal` / `Outdated` / `Lost` / `Timeout` / `Occluded` / `Validation`). 렌더 루프에서 match 필수. §7 에러 처리 표의 `SurfaceError::Lost/Outdated` 행은 `CurrentSurfaceTexture::Lost/Outdated`로 읽어야 함.
+- `PipelineLayoutDescriptor.bind_group_layouts: &[Option<&BindGroupLayout>]` (이전 `&[&BindGroupLayout]`). `Some(&bgl)` 래핑 필수.
+- `PipelineLayoutDescriptor.push_constant_ranges` → `immediate_size: u32`로 교체 (push constants는 immediate data로 통합).
+- `RenderPipelineDescriptor.multiview` → `multiview_mask: Option<u32>` 이름 변경.
+
+**cosmic-text 0.19**:
+
+- `Buffer::set_text(text, &Attrs, Shaping, Option<Align>)` — `font_system` 인자는 받지 않음 (`shape_until_scroll`이 받음).
+- `LayoutRun`이 `line_y: f32`(baseline의 Y offset), `line_top`, `line_height`를 직접 노출. baseline 휴리스틱(line_height × 0.78) 대신 `line_y.ceil()` 사용 가능 (M6-6에서 적용; font_size=14에서 두 값이 우연히 동일).
+- `FontSystem::db()` → `&fontdb::Database`. `db.face(font_id)` → `Option<&FaceInfo>`. `face.post_script_name`, `face.families`로 fallback 진단 가능 (M6-7에서 활용).
 
 ### 추후 도입 검토
 - `softbuffer` — wgpu 디버깅/대안용 CPU 백엔드. MVP에선 도입 안 함.
