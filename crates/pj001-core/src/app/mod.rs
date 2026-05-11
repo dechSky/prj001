@@ -306,6 +306,7 @@ struct AppState {
     cursor_blinking_cache: bool,
     modifiers: ModifiersState,
     last_mouse_pos: Option<PhysicalPosition<f64>>,
+    dragging_divider: Option<layout::DividerHit>,
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
     pending_resize: Option<PhysicalSize<u32>>,
@@ -462,21 +463,32 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_mouse_pos = Some(position);
+                if state.dragging_divider.is_some() {
+                    state.drag_divider_to_mouse();
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 state.last_mouse_pos = None;
+                state.dragging_divider = None;
             }
             WindowEvent::MouseInput {
                 state: button_state,
                 button: MouseButton::Left,
                 ..
-            } => {
-                if button_state == ElementState::Pressed {
+            } => match button_state {
+                ElementState::Pressed => {
+                    if let Some(hit) = state.divider_hit_at_mouse() {
+                        state.dragging_divider = Some(hit);
+                        return;
+                    }
                     if let Some(pane_id) = state.pane_at_mouse(true) {
                         state.set_active(pane_id);
                     }
                 }
-            }
+                ElementState::Released => {
+                    state.dragging_divider = None;
+                }
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 // trackpad swipe / 마우스 휠로 scrollback 스크롤.
                 // delta y > 0 = 손가락 위로 = scrollback 위로(view_offset 증가).
@@ -1274,6 +1286,7 @@ impl AppState {
             cursor_blinking_cache: true,
             modifiers: ModifiersState::empty(),
             last_mouse_pos: None,
+            dragging_divider: None,
             pending_resize: None,
             ids,
         })
@@ -1302,6 +1315,51 @@ impl AppState {
     fn pane_at_mouse(&self, include_status_row: bool) -> Option<PaneId> {
         self.pane_index_at_mouse(include_status_row)
             .map(|idx| self.panes[idx].id)
+    }
+
+    fn mouse_cell(&self) -> Option<(usize, usize)> {
+        let pos = self.last_mouse_pos?;
+        let cell = self.renderer.cell_metrics();
+        if cell.width == 0 || cell.height == 0 || pos.x < 0.0 || pos.y < 0.0 {
+            return None;
+        }
+        Some((
+            (pos.x / cell.width as f64).floor() as usize,
+            (pos.y / cell.height as f64).floor() as usize,
+        ))
+    }
+
+    fn divider_hit_at_mouse(&self) -> Option<layout::DividerHit> {
+        let (col, row) = self.mouse_cell()?;
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        layout::divider_hit_at(
+            &self.layout_root,
+            size,
+            self.renderer.cell_metrics(),
+            col,
+            row,
+        )
+    }
+
+    fn drag_divider_to_mouse(&mut self) {
+        let Some(hit) = self.dragging_divider.clone() else {
+            return;
+        };
+        let Some((col, row)) = self.mouse_cell() else {
+            return;
+        };
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        if layout::set_split_ratio_at_cell(
+            &mut self.layout_root,
+            &hit,
+            size,
+            self.renderer.cell_metrics(),
+            col,
+            row,
+        ) {
+            self.apply_layout_viewports();
+            self.window.request_redraw();
+        }
     }
 
     /// M12-6 design §5: 마우스 hit-test로 SessionId 반환. pane_at_mouse → SessionId 매핑.

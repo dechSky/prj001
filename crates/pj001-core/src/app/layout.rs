@@ -58,6 +58,14 @@ impl SplitRatio {
         primary = primary.clamp(1, available - 1);
         primary
     }
+
+    fn from_primary_units(primary: usize, available: usize) -> Self {
+        if available <= 1 {
+            return Self::half();
+        }
+        let scaled = primary.saturating_mul(Self::MAX as usize) / available;
+        Self(scaled.clamp(Self::MIN as usize, (Self::MAX - Self::MIN) as usize) as u16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +215,17 @@ pub(super) struct HorizontalDivider {
     pub width: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DividerHit {
+    path: Vec<SplitBranch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitBranch {
+    Primary,
+    Secondary,
+}
+
 pub(super) fn compute_viewports(
     root: &Layout,
     size: PhysicalSize<u32>,
@@ -273,6 +292,52 @@ pub(super) fn horizontal_dividers(
     out
 }
 
+pub(super) fn divider_hit_at(
+    root: &Layout,
+    size: PhysicalSize<u32>,
+    cell: CellMetrics,
+    col: usize,
+    row: usize,
+) -> Option<DividerHit> {
+    let raw_rows = (size.height / cell.height).max(1) as usize;
+    let status_row = matches!(root, Layout::Split { .. })
+        .then_some(raw_rows - 1)
+        .filter(|_| raw_rows > 1);
+    let rows = status_row.unwrap_or(raw_rows);
+    let cols = (size.width / cell.width).max(1) as usize;
+    let rect = CellRect {
+        col: 0,
+        row: 0,
+        cols,
+        rows,
+    };
+    let mut path = Vec::new();
+    divider_hit_at_rect(root, rect, col, row, &mut path)
+}
+
+pub(super) fn set_split_ratio_at_cell(
+    root: &mut Layout,
+    hit: &DividerHit,
+    size: PhysicalSize<u32>,
+    cell: CellMetrics,
+    col: usize,
+    row: usize,
+) -> bool {
+    let raw_rows = (size.height / cell.height).max(1) as usize;
+    let status_row = matches!(root, Layout::Split { .. })
+        .then_some(raw_rows - 1)
+        .filter(|_| raw_rows > 1);
+    let rows = status_row.unwrap_or(raw_rows);
+    let cols = (size.width / cell.width).max(1) as usize;
+    let rect = CellRect {
+        col: 0,
+        row: 0,
+        cols,
+        rows,
+    };
+    set_split_ratio_at_rect(root, rect, &hit.path, col, row)
+}
+
 fn resolve(
     node: &Layout,
     rect: CellRect,
@@ -307,6 +372,112 @@ fn resolve(
             let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
             resolve(primary, primary_rect, status_row, size, cell, out);
             resolve(secondary, secondary_rect, status_row, size, cell, out);
+        }
+    }
+}
+
+fn divider_hit_at_rect(
+    node: &Layout,
+    rect: CellRect,
+    col: usize,
+    row: usize,
+    path: &mut Vec<SplitBranch>,
+) -> Option<DividerHit> {
+    match node {
+        Layout::Pane(_) => None,
+        Layout::Split {
+            axis,
+            ratio,
+            primary,
+            secondary,
+        } => {
+            match axis {
+                SplitAxis::Vertical if rect.cols >= 3 => {
+                    let divider_col = rect.col + ratio.primary_units(rect.cols - 1);
+                    if col == divider_col && row >= rect.row && row < rect.row + rect.rows {
+                        return Some(DividerHit { path: path.clone() });
+                    }
+                }
+                SplitAxis::Horizontal if rect.rows >= 3 => {
+                    let divider_row = rect.row + ratio.primary_units(rect.rows - 1);
+                    if row == divider_row && col >= rect.col && col < rect.col + rect.cols {
+                        return Some(DividerHit { path: path.clone() });
+                    }
+                }
+                _ => {}
+            }
+
+            let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
+            path.push(SplitBranch::Primary);
+            if let Some(hit) = divider_hit_at_rect(primary, primary_rect, col, row, path) {
+                path.pop();
+                return Some(hit);
+            }
+            path.pop();
+
+            path.push(SplitBranch::Secondary);
+            let hit = divider_hit_at_rect(secondary, secondary_rect, col, row, path);
+            path.pop();
+            hit
+        }
+    }
+}
+
+fn set_split_ratio_at_rect(
+    node: &mut Layout,
+    rect: CellRect,
+    path: &[SplitBranch],
+    col: usize,
+    row: usize,
+) -> bool {
+    match node {
+        Layout::Pane(_) => false,
+        Layout::Split {
+            axis,
+            ratio,
+            primary,
+            secondary,
+        } => {
+            if path.is_empty() {
+                *ratio = ratio_from_cell(*axis, rect, col, row);
+                return true;
+            }
+            let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
+            match path[0] {
+                SplitBranch::Primary => {
+                    set_split_ratio_at_rect(primary, primary_rect, &path[1..], col, row)
+                }
+                SplitBranch::Secondary => {
+                    set_split_ratio_at_rect(secondary, secondary_rect, &path[1..], col, row)
+                }
+            }
+        }
+    }
+}
+
+fn ratio_from_cell(axis: SplitAxis, rect: CellRect, col: usize, row: usize) -> SplitRatio {
+    match axis {
+        SplitAxis::Vertical => {
+            let divider = usize::from(rect.cols >= 3);
+            let content = rect.cols.saturating_sub(divider);
+            if content <= 1 {
+                return SplitRatio::half();
+            }
+            let primary = col
+                .saturating_sub(rect.col)
+                .clamp(1, content.saturating_sub(1));
+            SplitRatio::from_primary_units(primary, content)
+        }
+        SplitAxis::Horizontal => {
+            let divider = usize::from(rect.rows >= 3);
+            let content = rect.rows.saturating_sub(divider);
+            if content <= 1 {
+                return SplitRatio::half();
+            }
+            let primary = row
+                .saturating_sub(rect.row)
+                .clamp(1, content.saturating_sub(1));
+            SplitRatio::from_primary_units(primary, content)
         }
     }
 }
@@ -714,5 +885,50 @@ mod tests {
         assert_eq!(dividers.len(), 2);
         assert_eq!(dividers[0].row, 5);
         assert!(dividers[1].row > dividers[0].row);
+    }
+
+    #[test]
+    fn divider_hit_and_drag_updates_vertical_split_ratio() {
+        let mut root = Layout::from_initial_panes(&[PaneId(0), PaneId(1)]);
+        let hit = divider_hit_at(&root, PhysicalSize::new(120, 80), cell(), 6, 0)
+            .expect("vertical divider hit");
+
+        assert!(set_split_ratio_at_cell(
+            &mut root,
+            &hit,
+            PhysicalSize::new(120, 80),
+            cell(),
+            3,
+            0,
+        ));
+
+        let viewports = compute_viewports(&root, PhysicalSize::new(120, 80), cell());
+        assert_eq!(viewports[&PaneId(0)].cols, 3);
+        assert_eq!(viewports[&PaneId(1)].col_offset, 4);
+    }
+
+    #[test]
+    fn divider_hit_and_drag_updates_horizontal_split_ratio() {
+        let mut root = Layout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::half(),
+            primary: Box::new(pane(0)),
+            secondary: Box::new(pane(1)),
+        };
+        let hit = divider_hit_at(&root, PhysicalSize::new(120, 120), cell(), 0, 2)
+            .expect("horizontal divider hit");
+
+        assert!(set_split_ratio_at_cell(
+            &mut root,
+            &hit,
+            PhysicalSize::new(120, 120),
+            cell(),
+            0,
+            3,
+        ));
+
+        let viewports = compute_viewports(&root, PhysicalSize::new(120, 120), cell());
+        assert_eq!(viewports[&PaneId(0)].rows, 3);
+        assert_eq!(viewports[&PaneId(1)].row_offset, 4);
     }
 }
