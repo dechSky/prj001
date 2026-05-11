@@ -539,6 +539,14 @@ impl ApplicationHandler<UserEvent> for App {
                             state.set_active(PaneId(1));
                             return;
                         }
+                        if lower == "[" {
+                            state.focus_adjacent_pane(false);
+                            return;
+                        }
+                        if lower == "]" {
+                            state.focus_adjacent_pane(true);
+                            return;
+                        }
                         if lower == "d" {
                             let axis = if state.modifiers.shift_key() {
                                 SplitAxis::Horizontal
@@ -1014,6 +1022,34 @@ impl AppState {
             }
         }
         self.window.request_redraw();
+    }
+
+    fn focus_adjacent_pane(&mut self, next: bool) {
+        let order = self.layout_root.pane_order();
+        if order.len() <= 1 {
+            return;
+        }
+        let Some(current_idx) = order.iter().position(|id| *id == self.active) else {
+            return;
+        };
+        let len = order.len();
+        for step in 1..=len {
+            let idx = if next {
+                (current_idx + step) % len
+            } else {
+                (current_idx + len - (step % len)) % len
+            };
+            let candidate = order[idx];
+            if self
+                .session_id_for_pane(candidate)
+                .and_then(|session_id| self.sessions.get(&session_id))
+                .map(|session| session.alive)
+                .unwrap_or(false)
+            {
+                self.set_active(candidate);
+                return;
+            }
+        }
     }
 
     /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는

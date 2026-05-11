@@ -103,6 +103,24 @@ impl Layout {
     fn is_pane(&self, target: PaneId) -> bool {
         matches!(self, Self::Pane(id) if *id == target)
     }
+
+    pub(super) fn pane_order(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.collect_panes(&mut out);
+        out
+    }
+
+    fn collect_panes(&self, out: &mut Vec<PaneId>) {
+        match self {
+            Self::Pane(id) => out.push(*id),
+            Self::Split {
+                primary, secondary, ..
+            } => {
+                primary.collect_panes(out);
+                secondary.collect_panes(out);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -441,6 +459,14 @@ mod tests {
         assert!(!root.close_pane(PaneId(1)));
         assert!(!root.close_pane(PaneId(99)));
         assert_eq!(root, Layout::Pane(PaneId(1)));
+    }
+
+    #[test]
+    fn pane_order_uses_depth_first_primary_then_secondary() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+        assert!(root.split_pane(PaneId(2), SplitAxis::Horizontal, PaneId(3)));
+
+        assert_eq!(root.pane_order(), vec![PaneId(1), PaneId(2), PaneId(3)]);
     }
 
     #[test]
