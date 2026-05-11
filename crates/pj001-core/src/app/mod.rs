@@ -23,7 +23,7 @@ use crate::render::{CursorRender, Renderer};
 use event::{IdAllocator, PaneId, SessionId, UserEvent};
 #[cfg(test)]
 use layout::SplitRatio;
-use layout::{Layout, SplitAxis};
+use layout::{Layout, RatioDirection, SplitAxis};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
@@ -529,6 +529,32 @@ impl ApplicationHandler<UserEvent> for App {
                 use winit::keyboard::{Key, NamedKey};
                 // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
+                    if state.modifiers.shift_key() {
+                        if let Key::Named(named) = &event.logical_key {
+                            let handled = match named {
+                                NamedKey::ArrowLeft => state.adjust_active_split(
+                                    SplitAxis::Vertical,
+                                    RatioDirection::ShrinkActive,
+                                ),
+                                NamedKey::ArrowRight => state.adjust_active_split(
+                                    SplitAxis::Vertical,
+                                    RatioDirection::GrowActive,
+                                ),
+                                NamedKey::ArrowUp => state.adjust_active_split(
+                                    SplitAxis::Horizontal,
+                                    RatioDirection::ShrinkActive,
+                                ),
+                                NamedKey::ArrowDown => state.adjust_active_split(
+                                    SplitAxis::Horizontal,
+                                    RatioDirection::GrowActive,
+                                ),
+                                _ => false,
+                            };
+                            if handled {
+                                return;
+                            }
+                        }
+                    }
                     if let Key::Character(s) = &event.logical_key {
                         let lower = s.to_lowercase();
                         if lower == "1" {
@@ -1049,6 +1075,19 @@ impl AppState {
                 self.set_active(candidate);
                 return;
             }
+        }
+    }
+
+    fn adjust_active_split(&mut self, axis: SplitAxis, direction: RatioDirection) -> bool {
+        if self
+            .layout_root
+            .adjust_split_for_pane(self.active, axis, direction)
+        {
+            self.apply_layout_viewports();
+            self.window.request_redraw();
+            true
+        } else {
+            false
         }
     }
 

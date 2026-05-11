@@ -30,9 +30,23 @@ pub(super) struct SplitRatio(u16);
 
 impl SplitRatio {
     const MAX: u16 = 10_000;
+    const MIN: u16 = 1_000;
+    const STEP: u16 = 500;
 
     pub(super) const fn half() -> Self {
         Self(5_000)
+    }
+
+    fn adjust(self, delta: i16) -> Self {
+        if delta < 0 {
+            Self(self.0.saturating_sub(delta.unsigned_abs()).max(Self::MIN))
+        } else {
+            Self(
+                self.0
+                    .saturating_add(delta as u16)
+                    .min(Self::MAX - Self::MIN),
+            )
+        }
     }
 
     fn primary_units(self, available: usize) -> usize {
@@ -44,6 +58,12 @@ impl SplitRatio {
         primary = primary.clamp(1, available - 1);
         primary
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RatioDirection {
+    GrowActive,
+    ShrinkActive,
 }
 
 impl Layout {
@@ -110,6 +130,39 @@ impl Layout {
         out
     }
 
+    pub(super) fn adjust_split_for_pane(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        direction: RatioDirection,
+    ) -> bool {
+        match self {
+            Self::Pane(_) => false,
+            Self::Split {
+                axis: split_axis,
+                ratio,
+                primary,
+                secondary,
+            } => {
+                let target_in_primary = primary.contains_pane(target);
+                let target_in_secondary = secondary.contains_pane(target);
+                if *split_axis == axis && (target_in_primary || target_in_secondary) {
+                    let delta = match (target_in_primary, direction) {
+                        (true, RatioDirection::GrowActive)
+                        | (false, RatioDirection::ShrinkActive) => SplitRatio::STEP as i16,
+                        (true, RatioDirection::ShrinkActive)
+                        | (false, RatioDirection::GrowActive) => -(SplitRatio::STEP as i16),
+                    };
+                    *ratio = ratio.adjust(delta);
+                    true
+                } else {
+                    primary.adjust_split_for_pane(target, axis, direction)
+                        || secondary.adjust_split_for_pane(target, axis, direction)
+                }
+            }
+        }
+    }
+
     fn collect_panes(&self, out: &mut Vec<PaneId>) {
         match self {
             Self::Pane(id) => out.push(*id),
@@ -119,6 +172,15 @@ impl Layout {
                 primary.collect_panes(out);
                 secondary.collect_panes(out);
             }
+        }
+    }
+
+    fn contains_pane(&self, target: PaneId) -> bool {
+        match self {
+            Self::Pane(id) => *id == target,
+            Self::Split {
+                primary, secondary, ..
+            } => primary.contains_pane(target) || secondary.contains_pane(target),
         }
     }
 }
@@ -467,6 +529,47 @@ mod tests {
         assert!(root.split_pane(PaneId(2), SplitAxis::Horizontal, PaneId(3)));
 
         assert_eq!(root.pane_order(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+    }
+
+    #[test]
+    fn adjust_split_for_primary_pane_grows_primary_ratio() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+
+        assert!(root.adjust_split_for_pane(
+            PaneId(1),
+            SplitAxis::Vertical,
+            RatioDirection::GrowActive
+        ));
+
+        let viewports = compute_viewports(&root, PhysicalSize::new(200, 80), cell());
+        assert_eq!(viewports[&PaneId(1)].cols, 11);
+        assert_eq!(viewports[&PaneId(2)].cols, 8);
+    }
+
+    #[test]
+    fn adjust_split_for_secondary_pane_grows_secondary_space() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+
+        assert!(root.adjust_split_for_pane(
+            PaneId(2),
+            SplitAxis::Vertical,
+            RatioDirection::GrowActive
+        ));
+
+        let viewports = compute_viewports(&root, PhysicalSize::new(200, 80), cell());
+        assert_eq!(viewports[&PaneId(1)].cols, 9);
+        assert_eq!(viewports[&PaneId(2)].cols, 10);
+    }
+
+    #[test]
+    fn adjust_split_ignores_axis_without_matching_split() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+
+        assert!(!root.adjust_split_for_pane(
+            PaneId(1),
+            SplitAxis::Horizontal,
+            RatioDirection::GrowActive
+        ));
     }
 
     #[test]
