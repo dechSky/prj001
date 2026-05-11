@@ -221,6 +221,12 @@ pub fn run(config: Config) -> Result<()> {
 
 struct App {
     state: Option<AppState>,
+    /// M12-5 회귀 fix v3 (Codex thread 019e1659): spawn을 첫 winit `Resized` 후로 미룸.
+    /// resumed에서 window만 생성하고 여기 보관 → 첫 Resized에서 그 size로 PTY spawn.
+    /// startup SIGWINCH 0회 → wrap된 작은 창에서도 zsh duplicate prompt 회피.
+    pending_window: Option<Arc<Window>>,
+    /// about_to_wait fallback — 첫 cycle은 wait, 두 번째 cycle에도 Resized 없으면 inner_size로 spawn.
+    startup_waited_once: bool,
     proxy: EventLoopProxy<UserEvent>,
     config: Config,
 }
@@ -284,9 +290,38 @@ impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, config: Config) -> Self {
         Self {
             state: None,
+            pending_window: None,
+            startup_waited_once: false,
             proxy,
             config,
         }
+    }
+
+    /// M12-5 회귀 fix v3: 첫 winit `Resized` 받은 후 그 size로 PTY spawn.
+    /// startup SIGWINCH 0회 보장. Codex thread 019e1659.
+    fn finish_startup(&mut self, size: PhysicalSize<u32>) {
+        let Some(window) = self.pending_window.take() else {
+            return;
+        };
+        log::info!(
+            "startup initial resize: physical={}x{} inner_now={}x{}",
+            size.width,
+            size.height,
+            window.inner_size().width,
+            window.inner_size().height,
+        );
+        let state = pollster::block_on(AppState::new_with_size(
+            window,
+            self.proxy.clone(),
+            self.config.clone(),
+            size,
+        ))
+        .expect("AppState::new");
+        state.window.focus_window();
+        // M6-3 Phase 0: IME 이벤트 활성화.
+        state.window.set_ime_allowed(true);
+        state.window.set_ime_purpose(ImePurpose::Terminal);
+        self.state = Some(state);
     }
 }
 
@@ -350,24 +385,18 @@ fn compute_viewports(
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // M12-5 회귀 fix v3: state도 pending_window도 없을 때만 새 window 생성.
+        if self.state.is_some() || self.pending_window.is_some() {
             return;
         }
         let attrs = Window::default_attributes()
             .with_title("pj001")
             .with_inner_size(PhysicalSize::new(960u32, 600u32));
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
-        let state = pollster::block_on(AppState::new(
-            window,
-            self.proxy.clone(),
-            self.config.clone(),
-        ))
-        .expect("AppState::new");
-        state.window.focus_window();
-        // M6-3 Phase 0: IME 이벤트 활성화. Terminal purpose로 IME에 컨텍스트 hint.
-        state.window.set_ime_allowed(true);
-        state.window.set_ime_purpose(ImePurpose::Terminal);
-        self.state = Some(state);
+        // PTY spawn은 첫 Resized에서. window는 pending에 보관.
+        self.pending_window = Some(window);
+        self.startup_waited_once = false;
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
 
     fn window_event(
@@ -376,6 +405,13 @@ impl ApplicationHandler<UserEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // M12-5 회귀 fix v3: state=None일 때 첫 Resized만 startup trigger로 소비.
+        if self.state.is_none() {
+            if let WindowEvent::Resized(size) = event {
+                self.finish_startup(size);
+            }
+            return;
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -586,6 +622,20 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // M12-5 회귀 fix v3: state=None일 때 fallback. 첫 cycle은 wait,
+        // 두 번째 cycle에도 Resized 안 오면 inner_size로 spawn (앱 안 뜨는 케이스 회피).
+        if self.state.is_none() {
+            if let Some(window) = self.pending_window.as_ref() {
+                if self.startup_waited_once {
+                    let size = window.inner_size();
+                    self.finish_startup(size);
+                } else {
+                    self.startup_waited_once = true;
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
+            }
+            return;
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -813,12 +863,24 @@ impl AppState {
         }
     }
 
+    /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는
+    /// 첫 winit Resized를 받아 그 size를 넘기거나 (preferred), `inner_size()` fallback.
+    #[allow(dead_code)]
     async fn new(
         window: Arc<Window>,
         proxy: EventLoopProxy<UserEvent>,
         config: Config,
     ) -> Result<Self> {
         let size = window.inner_size();
+        Self::new_with_size(window, proxy, config, size).await
+    }
+
+    async fn new_with_size(
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
         let adapter = instance
@@ -875,6 +937,18 @@ impl AppState {
         let hooks = config.hooks.clone();
         let pane_specs = config.pane_specs()?;
         let layouts = compute_viewports(size, renderer.cell_metrics(), pane_specs.len());
+        log::info!(
+            "startup spawn size={}x{} cell={}x{} panes={} layouts={:?}",
+            size.width,
+            size.height,
+            renderer.cell_metrics().width,
+            renderer.cell_metrics().height,
+            pane_specs.len(),
+            layouts
+                .iter()
+                .map(|v| (v.cols, v.rows, v.col_offset, v.status_row))
+                .collect::<Vec<_>>(),
+        );
         let mut ids = IdAllocator::default();
         for (spec_index, spec) in pane_specs.into_iter().enumerate() {
             let pane_id = ids.new_pane();
@@ -1030,20 +1104,42 @@ impl AppState {
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
         let layouts = compute_viewports(size, self.renderer.cell_metrics(), self.panes.len());
+        log::info!(
+            "resize event size={}x{} cell={}x{} layouts={:?}",
+            size.width,
+            size.height,
+            self.renderer.cell_metrics().width,
+            self.renderer.cell_metrics().height,
+            layouts
+                .iter()
+                .map(|v| (v.cols, v.rows, v.col_offset, v.status_row))
+                .collect::<Vec<_>>(),
+        );
         for idx in 0..self.panes.len() {
             let viewport = layouts[idx];
-            // M12-5: mutation 단일 진입점 — viewport 전체 교체만 허용 (개별 field 직접 mutation X).
+            let prev = self.panes[idx].viewport;
+            // M12-5 회귀 fix (Codex threads 019e164b → 019e1653 가설 K):
+            // PTY/Term resize는 실제 terminal cell size(rows/cols)가 바뀔 때만 필요하다.
+            // col_offset/status_row/pixel 크기는 visual layout/chrome 값이라 이걸 trigger로
+            // pty.resize를 보내면 rows/cols가 같아도 SIGWINCH가 발생할 수 있다.
+            // split startup 직후 col_offset/status_row 차이가 zsh duplicate prompt 유발.
+            let pty_cell_size_changed =
+                prev.cols != viewport.cols || prev.rows != viewport.rows;
+            // viewport visual/pixel 값은 surface size 변경 시 달라질 수 있으므로 항상 갱신.
+            // M12-5 mutation 단일 진입점 — 전체 struct 교체만 허용.
             self.panes[idx].viewport = viewport;
-            let session = self.session_for_pane_idx_mut(idx);
-            if let Ok(mut term) = session.term.lock() {
-                term.resize(viewport.cols, viewport.rows);
+            if pty_cell_size_changed {
+                let session = self.session_for_pane_idx_mut(idx);
+                if let Ok(mut term) = session.term.lock() {
+                    term.resize(viewport.cols, viewport.rows);
+                }
+                let _ = session.pty.resize(PtySize {
+                    rows: viewport.rows as u16,
+                    cols: viewport.cols as u16,
+                    pixel_width: viewport.width_px as u16,
+                    pixel_height: viewport.height_px as u16,
+                });
             }
-            let _ = session.pty.resize(PtySize {
-                rows: viewport.rows as u16,
-                cols: viewport.cols as u16,
-                pixel_width: viewport.width_px as u16,
-                pixel_height: viewport.height_px as u16,
-            });
         }
         self.window.request_redraw();
     }
