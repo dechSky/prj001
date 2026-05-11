@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use winit::event_loop::EventLoopProxy;
 
-use crate::app::event::UserEvent;
+use crate::app::event::{PaneId, UserEvent};
 use crate::error::Result;
 use crate::grid::Term;
 
@@ -24,6 +24,7 @@ impl PtyHandle {
         size: PtySize,
         term: Arc<Mutex<Term>>,
         proxy: EventLoopProxy<UserEvent>,
+        pane: PaneId,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
@@ -38,7 +39,7 @@ impl PtyHandle {
 
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
-        let reader_thread = reader::spawn(reader, term, proxy);
+        let reader_thread = reader::spawn(reader, term, proxy, pane);
 
         Ok(Self {
             master: pair.master,

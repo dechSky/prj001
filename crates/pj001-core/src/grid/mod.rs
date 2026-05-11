@@ -509,11 +509,7 @@ impl Term {
     }
 
     fn grid(&self) -> &Grid {
-        if self.use_alt {
-            &self.alt
-        } else {
-            &self.main
-        }
+        if self.use_alt { &self.alt } else { &self.main }
     }
 
     fn grid_mut(&mut self) -> &mut Grid {
@@ -642,7 +638,9 @@ impl Term {
         } else if result.cursor_global_row >= total - new_rows {
             total - new_rows
         } else {
-            result.cursor_global_row.saturating_sub(new_rows.saturating_sub(1))
+            result
+                .cursor_global_row
+                .saturating_sub(new_rows.saturating_sub(1))
         };
 
         // 새 scrollback 빌드: NewRow[0..main_start]를 ScrollbackRow로.
@@ -768,12 +766,7 @@ impl Term {
             attrs |= Attrs::WIDE;
         }
         let g = self.grid_mut();
-        *g.cell_mut(row, col) = Cell {
-            ch,
-            fg,
-            bg,
-            attrs,
-        };
+        *g.cell_mut(row, col) = Cell { ch, fg, bg, attrs };
         if w == 2 {
             *g.cell_mut(row, col + 1) = Cell {
                 ch: ' ',
@@ -1245,7 +1238,10 @@ mod tests {
             term.carriage_return();
         }
         let sb_before = term.scrollback.len();
-        assert!(sb_before > 0, "scrollback should have rows; got {sb_before}");
+        assert!(
+            sb_before > 0,
+            "scrollback should have rows; got {sb_before}"
+        );
 
         // 넓히기 + rows도 키워서 scrollback 일부가 main으로 끌려옴.
         term.resize(20, 8);
@@ -1274,12 +1270,11 @@ mod tests {
         let last_str = format!("L{}", SCROLLBACK_CAP + 9);
         let dump = dump_main_chars(&term);
         let in_main = dump.iter().any(|s| s.contains(&last_str[..2]));
-        let in_sb = term
-            .scrollback
-            .iter()
-            .rev()
-            .take(5)
-            .any(|r| r.cells.iter().any(|c| c.ch == last_str.chars().next().unwrap()));
+        let in_sb = term.scrollback.iter().rev().take(5).any(|r| {
+            r.cells
+                .iter()
+                .any(|c| c.ch == last_str.chars().next().unwrap())
+        });
         assert!(in_main || in_sb, "최신 줄 보존");
     }
 
@@ -1307,11 +1302,24 @@ mod tests {
         term.newline();
         term.carriage_return();
         // scrollback last가 WRAPPED여야 (push 시점 row 0가 WRAPPED)
-        assert!(term.scrollback.back().unwrap().flags.contains(RowFlags::WRAPPED));
+        assert!(
+            term.scrollback
+                .back()
+                .unwrap()
+                .flags
+                .contains(RowFlags::WRAPPED)
+        );
         // CUP으로 row 0으로 점프
         term.set_cursor(0, 0);
         // scrollback last의 WRAPPED는 클리어되었어야
-        assert!(!term.scrollback.back().unwrap().flags.contains(RowFlags::WRAPPED));
+        assert!(
+            !term
+                .scrollback
+                .back()
+                .unwrap()
+                .flags
+                .contains(RowFlags::WRAPPED)
+        );
     }
 
     #[test]
@@ -1379,7 +1387,7 @@ mod tests {
         // 입력: 4 cols grid에서 출력 후 3 cols로 reflow.
         let mut term = Term::new(4, 3);
         term.print('한'); // (0, 0..2) WIDE+WIDE_CONT
-        term.print('a');  // (0, 2)
+        term.print('a'); // (0, 2)
         term.print('한'); // 마지막 1칸 남음 → wrap → (1, 0..2) WIDE
         // row 0: 한 a, row 1: 한
         let dump_old = dump_main_chars(&term);
@@ -1424,7 +1432,11 @@ mod tests {
             .scrollback
             .iter()
             .any(|r| r.cells.iter().take(2).all(|c| c.ch == 'a'));
-        assert!(aa_in_sb, "'aa' row missing in scrollback: sb={:?}", term.scrollback);
+        assert!(
+            aa_in_sb,
+            "'aa' row missing in scrollback: sb={:?}",
+            term.scrollback
+        );
     }
 
     #[test]
@@ -1435,7 +1447,11 @@ mod tests {
         term.switch_alt_screen(true);
         // alt grid row_flags 모두 비어있어야
         for r in 0..3 {
-            assert!(!term.row_flags(r).contains(RowFlags::WRAPPED), "alt row {}", r);
+            assert!(
+                !term.row_flags(r).contains(RowFlags::WRAPPED),
+                "alt row {}",
+                r
+            );
         }
         term.switch_alt_screen(false);
         // main 복귀: row 0 WRAPPED 그대로

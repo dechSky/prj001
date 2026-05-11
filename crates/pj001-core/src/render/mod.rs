@@ -36,6 +36,7 @@ pub struct Renderer {
     cell: CellMetrics,
     baseline: f32,
     viewport: [f32; 2],
+    pending_instances: Vec<CellInstance>,
 }
 
 impl Renderer {
@@ -72,38 +73,37 @@ impl Renderer {
             ..Default::default()
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg"),
@@ -239,6 +239,7 @@ impl Renderer {
             cell,
             baseline,
             viewport,
+            pending_instances: Vec::new(),
         }
     }
 
@@ -256,13 +257,19 @@ impl Renderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    pub fn update_term(
+    pub fn begin_terms(&mut self) {
+        self.pending_instances.clear();
+        self.instance_count = 0;
+    }
+
+    pub fn append_term(
         &mut self,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
         term: &Term,
         preedit: Option<(&str, usize, usize)>,
         cursor: Option<geometry::CursorRender>,
+        col_offset: usize,
+        row_offset: usize,
     ) {
         // atlas miss 글리프를 동적으로 raster + insert
         for r in 0..term.rows() {
@@ -294,25 +301,114 @@ impl Renderer {
                 }
             }
         }
-        let mut instances =
-            geometry::build_instances(term, &self.atlas, self.baseline, cursor);
+        let mut instances = geometry::build_instances_at(
+            term,
+            &self.atlas,
+            self.baseline,
+            cursor,
+            col_offset,
+            row_offset,
+        );
         if let Some((preedit_str, col, row)) = preedit {
-            let mut preedit_inst = geometry::build_preedit_instances(
+            let mut preedit_inst = geometry::build_preedit_instances_at(
                 preedit_str,
                 col,
                 row,
                 term.cols(),
                 &self.atlas,
                 self.baseline,
+                col_offset,
+                row_offset,
             );
             instances.append(&mut preedit_inst);
         }
-        self.instance_count = instances.len() as u32;
-        if instances.is_empty() {
+        self.pending_instances.append(&mut instances);
+    }
+
+    pub fn append_text_line(
+        &mut self,
+        queue: &wgpu::Queue,
+        text: &str,
+        col: usize,
+        row: usize,
+        width: usize,
+        fg: [f32; 4],
+        bg: [f32; 4],
+    ) {
+        if width == 0 {
             return;
         }
-        if instances.len() > self.instance_capacity {
-            let new_cap = instances.len().next_power_of_two();
+        let chars: Vec<char> = text.chars().take(width).collect();
+        for ch in &chars {
+            if *ch == ' ' || (*ch as u32) < 0x20 {
+                continue;
+            }
+            if self.atlas.get(*ch).is_none() {
+                if let Some(raster) = self.font_stack.raster_one(*ch) {
+                    self.atlas.insert(queue, *ch, &raster);
+                }
+            }
+        }
+
+        for idx in 0..width {
+            let ch = chars.get(idx).copied().unwrap_or(' ');
+            let entry = if ch == ' ' || (ch as u32) < 0x20 {
+                None
+            } else {
+                self.atlas.get(ch).filter(|e| e.width > 0 && e.height > 0)
+            };
+            let (uv_min, uv_max, glyph_offset, glyph_size) = if let Some(e) = entry {
+                (
+                    e.uv_min,
+                    e.uv_max,
+                    [
+                        e.placement_left as f32,
+                        self.baseline - e.placement_top as f32,
+                    ],
+                    [e.width as f32, e.height as f32],
+                )
+            } else {
+                ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2])
+            };
+            self.pending_instances.push(CellInstance {
+                cell_xy: [(col + idx) as f32, row as f32],
+                uv_min,
+                uv_max,
+                glyph_offset,
+                glyph_size,
+                fg,
+                bg,
+                cell_span: 1.0,
+                flags: 0,
+                _pad: [0.0; 2],
+            });
+        }
+    }
+
+    pub fn append_fill_column(&mut self, col: usize, row: usize, height: usize, bg: [f32; 4]) {
+        for idx in 0..height {
+            self.pending_instances.push(CellInstance {
+                cell_xy: [col as f32, (row + idx) as f32],
+                uv_min: [0.0; 2],
+                uv_max: [0.0; 2],
+                glyph_offset: [0.0; 2],
+                glyph_size: [0.0; 2],
+                fg: [0.0; 4],
+                bg,
+                cell_span: 1.0,
+                flags: 0,
+                _pad: [0.0; 2],
+            });
+        }
+    }
+
+    pub fn finish_terms(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.instance_count = self.pending_instances.len() as u32;
+        if self.pending_instances.is_empty() {
+            return;
+        }
+        if self.pending_instances.len() > self.instance_capacity {
+            let new_cap = self.pending_instances.len().next_power_of_two();
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance-buffer"),
                 size: (new_cap * std::mem::size_of::<CellInstance>()) as u64,
@@ -341,7 +437,11 @@ impl Renderer {
                 ],
             });
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.pending_instances),
+        );
     }
 
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {

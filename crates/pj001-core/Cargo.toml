@@ -1,0 +1,21 @@
+[package]
+name = "pj001-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true
+cosmic-text.workspace = true
+log.workspace = true
+pollster.workspace = true
+portable-pty.workspace = true
+swash.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+vte.workspace = true
+wgpu.workspace = true
+winit.workspace = true

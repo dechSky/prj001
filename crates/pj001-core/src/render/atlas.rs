@@ -81,10 +81,7 @@ impl GlyphAtlas {
         }
         if self.shelf_y + h > ATLAS_SIZE {
             // 정책 A: grow-only 4096², panic
-            panic!(
-                "glyph atlas full: cannot fit {}x{} for char {:?}",
-                w, h, ch
-            );
+            panic!("glyph atlas full: cannot fit {}x{} for char {:?}", w, h, ch);
         }
 
         let pixels: Vec<u8> = match raster.content {

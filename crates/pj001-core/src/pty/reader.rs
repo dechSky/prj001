@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::app::event::UserEvent;
+use crate::app::event::{PaneId, UserEvent};
 use crate::grid::Term;
 use crate::vt::TermPerform;
 
@@ -12,6 +12,7 @@ pub fn spawn(
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term>>,
     proxy: EventLoopProxy<UserEvent>,
+    pane: PaneId,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("pty-reader".into())
@@ -21,7 +22,7 @@ pub fn spawn(
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = proxy.send_event(UserEvent::ChildExited(0));
+                        let _ = proxy.send_event(UserEvent::ChildExited { pane, code: 0 });
                         return;
                     }
                     Ok(n) => {
@@ -33,10 +34,13 @@ pub fn spawn(
                             let mut perform = TermPerform::new(&mut term);
                             parser.advance(&mut perform, &buf[..n]);
                         }
-                        let _ = proxy.send_event(UserEvent::Repaint);
+                        let _ = proxy.send_event(UserEvent::Repaint(pane));
                     }
                     Err(e) => {
-                        let _ = proxy.send_event(UserEvent::PtyError(e.to_string()));
+                        let _ = proxy.send_event(UserEvent::PtyError {
+                            pane,
+                            message: e.to_string(),
+                        });
                         return;
                     }
                 }
@@ -49,7 +53,11 @@ pub fn spawn(
 /// 디버깅용. 길면 truncate.
 fn hex_ascii(bytes: &[u8]) -> String {
     const MAX: usize = 256;
-    let slice = if bytes.len() > MAX { &bytes[..MAX] } else { bytes };
+    let slice = if bytes.len() > MAX {
+        &bytes[..MAX]
+    } else {
+        bytes
+    };
     let mut hex = String::with_capacity(slice.len() * 3);
     let mut ascii = String::with_capacity(slice.len());
     for &b in slice {

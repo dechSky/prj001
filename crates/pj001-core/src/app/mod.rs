@@ -1,0 +1,1198 @@
+pub mod event;
+mod input;
+
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use portable_pty::PtySize;
+use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::ModifiersState;
+use winit::window::{ImePurpose, Window, WindowId};
+
+use crate::error::{Error, Result};
+use crate::grid::Term;
+use crate::pty::PtyHandle;
+use crate::render::{CursorRender, Renderer};
+use event::{PaneId, UserEvent};
+
+const FONT_SIZE: f32 = 14.0;
+const CURSOR_BLINK_MS: u64 = 500;
+const STATUS_FG: [f32; 4] = [0.92, 0.94, 0.96, 1.0];
+const STATUS_ACTIVE_BG: [f32; 4] = [0.14, 0.30, 0.42, 1.0];
+const STATUS_INACTIVE_BG: [f32; 4] = [0.12, 0.13, 0.15, 1.0];
+const STATUS_DEAD_BG: [f32; 4] = [0.40, 0.12, 0.12, 1.0];
+const DIVIDER_BG: [f32; 4] = [0.22, 0.23, 0.26, 1.0];
+
+/// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
+fn log_page_dispatch_once(target: &'static str) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static LOGGED: AtomicU8 = AtomicU8::new(0);
+    let bit: u8 = if target.starts_with("PTY") { 1 } else { 2 };
+    let prev = LOGGED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        log::info!("page-key dispatch: target={target}");
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub sessions: Vec<SessionSpec>,
+    pub initial_layout: InitialLayout,
+    pub hooks: Hooks,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSpec {
+    pub title: String,
+    pub command: CommandSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandSpec {
+    Shell,
+    Custom(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitialLayout {
+    Single {
+        session: usize,
+    },
+    Split {
+        direction: SplitDirection,
+        first: usize,
+        second: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitDirection {
+    Vertical,
+}
+
+/// Optional integration hooks for embedders.
+///
+/// `lifecycle_sink` is invoked for session start and child-exit events. PTY
+/// errors currently mark panes dead but are not reported as lifecycle events.
+/// `route_sink` is reserved for the future generic routing primitive and is not
+/// invoked yet.
+#[derive(Clone, Default)]
+pub struct Hooks {
+    pub route_sink: Option<Arc<dyn RouteSink>>,
+    pub lifecycle_sink: Option<Arc<dyn LifecycleSink>>,
+}
+
+impl fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hooks")
+            .field(
+                "route_sink",
+                &self.route_sink.as_ref().map(|_| "<RouteSink>"),
+            )
+            .field(
+                "lifecycle_sink",
+                &self.lifecycle_sink.as_ref().map(|_| "<LifecycleSink>"),
+            )
+            .finish()
+    }
+}
+
+pub trait RouteSink: Send + Sync {
+    fn on_route(&self, event: RouteEvent);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteEvent {
+    pub from: usize,
+    pub to: Vec<usize>,
+    pub bytes: Vec<u8>,
+}
+
+pub trait LifecycleSink: Send + Sync {
+    fn on_lifecycle(&self, event: LifecycleEvent);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    SessionStarted { session: usize, title: String },
+    SessionExited { session: usize, code: i32 },
+}
+
+/// Hook trait objects are intentionally ignored for equality. This keeps CLI
+/// parser tests focused on structural config and avoids pretending sinks have
+/// useful value equality.
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.sessions == other.sessions && self.initial_layout == other.initial_layout
+    }
+}
+
+impl Eq for Config {}
+
+impl Config {
+    pub fn single_shell(shell: Option<String>) -> Self {
+        Self {
+            sessions: vec![SessionSpec {
+                title: "shell".to_string(),
+                command: shell.map_or(CommandSpec::Shell, CommandSpec::Custom),
+            }],
+            initial_layout: InitialLayout::Single { session: 0 },
+            hooks: Hooks::default(),
+        }
+    }
+
+    pub fn vertical_split(first: SessionSpec, second: SessionSpec) -> Self {
+        Self {
+            sessions: vec![first, second],
+            initial_layout: InitialLayout::Split {
+                direction: SplitDirection::Vertical,
+                first: 0,
+                second: 1,
+            },
+            hooks: Hooks::default(),
+        }
+    }
+
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    fn pane_specs(&self) -> Result<Vec<SessionSpec>> {
+        let indices = match self.initial_layout {
+            InitialLayout::Single { session } => vec![session],
+            InitialLayout::Split {
+                direction: SplitDirection::Vertical,
+                first,
+                second,
+            } => {
+                if first == second {
+                    return Err(Error::Args(
+                        "split layout requires two distinct sessions".to_string(),
+                    ));
+                }
+                vec![first, second]
+            }
+        };
+
+        indices
+            .into_iter()
+            .map(|idx| {
+                self.sessions.get(idx).cloned().ok_or_else(|| {
+                    Error::Args(format!("layout references missing session index {idx}"))
+                })
+            })
+            .collect()
+    }
+}
+
+impl CommandSpec {
+    fn resolve(&self) -> String {
+        match self {
+            CommandSpec::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
+            CommandSpec::Custom(command) => command.clone(),
+        }
+    }
+}
+
+pub fn run(config: Config) -> Result<()> {
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder
+            .with_activation_policy(ActivationPolicy::Regular)
+            .with_activate_ignoring_other_apps(true);
+    }
+    let event_loop = builder.build()?;
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(proxy, config);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+struct App {
+    state: Option<AppState>,
+    proxy: EventLoopProxy<UserEvent>,
+    config: Config,
+}
+
+struct Pane {
+    id: PaneId,
+    title: String,
+    pty: PtyHandle,
+    term: Arc<Mutex<Term>>,
+    cols: usize,
+    rows: usize,
+    col_offset: usize,
+    status_row: Option<usize>,
+    alive: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PaneLayout {
+    cols: usize,
+    rows: usize,
+    col_offset: usize,
+    status_row: Option<usize>,
+    pixel_width: u32,
+    pixel_height: u32,
+}
+
+struct AppState {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    panes: Vec<Pane>,
+    active: PaneId,
+    renderer: Renderer,
+    hooks: Hooks,
+    last_ime_cursor: Option<(usize, usize)>,
+    preedit: Option<String>,
+    cursor_visible: bool,
+    last_blink: Instant,
+    focused: bool,
+    cursor_blinking_cache: bool,
+    modifiers: ModifiersState,
+    last_mouse_pos: Option<PhysicalPosition<f64>>,
+    /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
+    /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
+    pending_resize: Option<PhysicalSize<u32>>,
+}
+
+impl App {
+    fn new(proxy: EventLoopProxy<UserEvent>, config: Config) -> Self {
+        Self {
+            state: None,
+            proxy,
+            config,
+        }
+    }
+}
+
+fn pane_layouts(
+    size: PhysicalSize<u32>,
+    cell: crate::render::CellMetrics,
+    count: usize,
+) -> Vec<PaneLayout> {
+    debug_assert!(
+        count <= 2,
+        "pane_layouts currently supports at most two panes"
+    );
+    let raw_rows = (size.height / cell.height).max(1) as usize;
+    if count <= 1 {
+        let cols = (size.width / cell.width).max(1) as usize;
+        return vec![PaneLayout {
+            cols,
+            rows: raw_rows,
+            col_offset: 0,
+            status_row: None,
+            pixel_width: size.width,
+            pixel_height: size.height,
+        }];
+    }
+
+    let status_row = (raw_rows > 1).then_some(raw_rows - 1);
+    let rows = status_row.unwrap_or(raw_rows);
+    let total_cols = (size.width / cell.width).max(3) as usize;
+    let divider_cols = 1usize;
+    let left_cols = (total_cols / 2).max(1);
+    let right_cols = total_cols.saturating_sub(left_cols + divider_cols).max(1);
+    vec![
+        PaneLayout {
+            cols: left_cols,
+            rows,
+            col_offset: 0,
+            status_row,
+            pixel_width: left_cols as u32 * cell.width,
+            pixel_height: rows as u32 * cell.height,
+        },
+        PaneLayout {
+            cols: right_cols,
+            rows,
+            col_offset: left_cols + divider_cols,
+            status_row,
+            pixel_width: right_cols as u32 * cell.width,
+            pixel_height: rows as u32 * cell.height,
+        },
+    ]
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("pj001")
+            .with_inner_size(PhysicalSize::new(960u32, 600u32));
+        let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+        let state = pollster::block_on(AppState::new(
+            window,
+            self.proxy.clone(),
+            self.config.clone(),
+        ))
+        .expect("AppState::new");
+        state.window.focus_window();
+        // M6-3 Phase 0: IME 이벤트 활성화. Terminal purpose로 IME에 컨텍스트 hint.
+        state.window.set_ime_allowed(true);
+        state.window.set_ime_purpose(ImePurpose::Terminal);
+        self.state = Some(state);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods.state();
+            }
+            WindowEvent::Focused(focused) => {
+                state.focused = focused;
+                if focused {
+                    // 포커스 회복 시 즉시 cursor 보이기 (다음 blink phase 기다리지 않음).
+                    state.cursor_visible = true;
+                }
+                state.window.request_redraw();
+                // M10-3: focus reporting on이면 PTY로 송신. lock drop 후 write.
+                let idx = state.active_index();
+                let send: Option<&[u8]> = {
+                    let term = state.panes[idx].term.lock().unwrap();
+                    if term.focus_reporting() {
+                        Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = send {
+                    if let Err(e) = state.panes[idx].pty.write(bytes) {
+                        log::warn!("focus report write: {e}");
+                    }
+                }
+            }
+            WindowEvent::Resized(size) => {
+                // M17-5 coalesce: 즉시 resize 안 하고 누적. about_to_wait에서 마지막 size 한 번 처리.
+                state.pending_resize = Some(size);
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::CursorMoved { position, .. } => {
+                state.last_mouse_pos = Some(position);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                state.last_mouse_pos = None;
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if button_state == ElementState::Pressed {
+                    if let Some(idx) = state.pane_index_at_mouse(true) {
+                        let id = state.panes[idx].id;
+                        state.set_active(id);
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // trackpad swipe / 마우스 휠로 scrollback 스크롤.
+                // delta y > 0 = 손가락 위로 = scrollback 위로(view_offset 증가).
+                let cell_h = state.renderer.cell_metrics().height as f32;
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as isize,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        if cell_h > 0.0 {
+                            (pos.y / cell_h as f64) as isize
+                        } else {
+                            0
+                        }
+                    }
+                };
+                if lines != 0 {
+                    let target = if state.last_mouse_pos.is_some() {
+                        state.pane_index_at_mouse(false)
+                    } else {
+                        Some(state.active_index())
+                    };
+                    if let Some(idx) = target {
+                        if let Ok(mut term) = state.panes[idx].term.lock() {
+                            term.scroll_view_by(lines);
+                        }
+                        state.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                use winit::event::Ime;
+                match ime {
+                    Ime::Preedit(s, _range) => {
+                        log::debug!("ime: Preedit({:?})", s);
+                        state.preedit = if s.is_empty() { None } else { Some(s) };
+                        state.window.request_redraw();
+                    }
+                    Ime::Commit(s) => {
+                        log::debug!("ime: Commit({:?})", s);
+                        state.preedit = None;
+                        let idx = state.active_index();
+                        if let Err(e) = state.panes[idx].pty.write(s.as_bytes()) {
+                            log::warn!("pty write (ime commit): {e}");
+                        }
+                        state.window.request_redraw();
+                    }
+                    Ime::Disabled => {
+                        log::info!("ime: Disabled");
+                        if state.preedit.is_some() {
+                            state.preedit = None;
+                            state.window.request_redraw();
+                        }
+                    }
+                    Ime::Enabled => {
+                        log::info!("ime: Enabled");
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                log::debug!(
+                    "key: state={:?} logical={:?} text={:?}",
+                    event.state,
+                    event.logical_key,
+                    event.text
+                );
+                use winit::keyboard::{Key, NamedKey};
+                // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
+                if event.state == ElementState::Pressed && state.modifiers.super_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        let lower = s.to_lowercase();
+                        if lower == "1" {
+                            state.set_active(PaneId(0));
+                            return;
+                        }
+                        if lower == "2" {
+                            state.set_active(PaneId(1));
+                            return;
+                        }
+                        if lower == "q" || lower == "w" {
+                            log::info!("cmd+{lower}: exit");
+                            event_loop.exit();
+                            return;
+                        }
+                        if lower == "v" {
+                            // M10-6: clipboard paste. bracketed_paste mode면 \e[200~/\e[201~ 래핑.
+                            state.handle_paste();
+                            return;
+                        }
+                    }
+                    // 그 외 Cmd+key: swallow (PTY 안 보냄).
+                    log::debug!("swallowed Cmd+key: {:?}", event.logical_key);
+                    return;
+                }
+                // M8-5: PageUp/Down 분기 — alt screen이면 PTY 전송, main이면 scrollback.
+                if event.state == ElementState::Pressed {
+                    if let Key::Named(named @ (NamedKey::PageUp | NamedKey::PageDown)) =
+                        &event.logical_key
+                    {
+                        let idx = state.active_index();
+                        let alt = state.panes[idx]
+                            .term
+                            .lock()
+                            .map(|t| t.is_alt_screen())
+                            .unwrap_or(false);
+                        if alt {
+                            // alt screen: encode_named_key가 byte 반환 → 일반 PTY 송신 흐름.
+                            log_page_dispatch_once("PTY (alt screen)");
+                        } else {
+                            // main screen: scrollback view 스크롤. PTY 안 보냄.
+                            if let Ok(mut term) = state.panes[idx].term.lock() {
+                                let page = term.rows().saturating_sub(1).max(1) as isize;
+                                let delta = if matches!(named, NamedKey::PageUp) {
+                                    page
+                                } else {
+                                    -page
+                                };
+                                term.scroll_view_by(delta);
+                            }
+                            state.window.request_redraw();
+                            log_page_dispatch_once("scrollback (main screen)");
+                            return;
+                        }
+                    }
+                }
+                // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
+                if event.state == ElementState::Pressed {
+                    let idx = state.active_index();
+                    if let Ok(mut term) = state.panes[idx].term.lock() {
+                        if term.view_offset() > 0 {
+                            term.snap_to_bottom();
+                            state.window.request_redraw();
+                        }
+                    }
+                }
+                // single lock snapshot (advisor 가이드).
+                let idx = state.active_index();
+                let mode = {
+                    let term = state.panes[idx].term.lock().unwrap();
+                    input::InputMode {
+                        cursor_keys_application: term.cursor_keys_application(),
+                        alt_screen: term.is_alt_screen(),
+                        modifiers: state.modifiers,
+                    }
+                };
+                if let Some(bytes) = input::encode_key(&event, mode) {
+                    if let Err(e) = state.panes[idx].pty.write(&bytes) {
+                        log::warn!("pty write: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        // M17-5: 누적된 resize를 한 번만 처리.
+        if let Some(size) = state.pending_resize.take() {
+            state.resize(size);
+        }
+        // 깜빡임 정지 조건:
+        // - 창 비활성 (focused=false)
+        // - cursor.blinking=false (DECSCUSR steady)
+        // 정지 시 cursor_visible=true 유지 (계속 보임), Wait로 idle.
+        if !state.focused || !state.cursor_blinking_cache {
+            if !state.cursor_visible {
+                state.cursor_visible = true;
+                state.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let blink = Duration::from_millis(CURSOR_BLINK_MS);
+        let now = Instant::now();
+        let next = if now.duration_since(state.last_blink) >= blink {
+            state.cursor_visible = !state.cursor_visible;
+            state.last_blink = now;
+            state.window.request_redraw();
+            now + blink
+        } else {
+            state.last_blink + blink
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Repaint(pane) => {
+                log::debug!("repaint requested by pane {}", pane.0);
+                if let Some(state) = &self.state {
+                    state.window.request_redraw();
+                }
+            }
+            UserEvent::ChildExited { pane, code } => {
+                log::info!("pane {} child exited (code={code})", pane.0);
+                if let Some(state) = &mut self.state {
+                    state.emit_lifecycle(LifecycleEvent::SessionExited {
+                        session: pane.0,
+                        code,
+                    });
+                    if state.panes.len() <= 1 {
+                        event_loop.exit();
+                    } else if let Some(p) = state.panes.iter_mut().find(|p| p.id == pane) {
+                        p.alive = false;
+                        if state.panes.iter().all(|p| !p.alive) {
+                            event_loop.exit();
+                        } else if state.active == pane {
+                            if let Some(next) = state.panes.iter().find(|p| p.alive).map(|p| p.id) {
+                                state.set_active(next);
+                            }
+                        }
+                        state.window.request_redraw();
+                    }
+                }
+            }
+            UserEvent::PtyError { pane, message } => {
+                log::error!("pane {} pty error: {message}", pane.0);
+                if let Some(state) = &mut self.state {
+                    if state.panes.len() <= 1 {
+                        event_loop.exit();
+                    } else if let Some(p) = state.panes.iter_mut().find(|p| p.id == pane) {
+                        p.alive = false;
+                        if state.panes.iter().all(|p| !p.alive) {
+                            event_loop.exit();
+                        } else if state.active == pane {
+                            if let Some(next) = state.panes.iter().find(|p| p.alive).map(|p| p.id) {
+                                state.set_active(next);
+                            }
+                        }
+                        state.window.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AppState {
+    fn active_index(&self) -> usize {
+        self.panes
+            .iter()
+            .position(|p| p.id == self.active)
+            .unwrap_or(0)
+    }
+
+    fn pane_index_at_mouse(&self, include_status_row: bool) -> Option<usize> {
+        let pos = self.last_mouse_pos?;
+        let cell = self.renderer.cell_metrics();
+        if cell.width == 0 || cell.height == 0 || pos.x < 0.0 || pos.y < 0.0 {
+            return None;
+        }
+
+        let col = (pos.x / cell.width as f64).floor() as usize;
+        let row = (pos.y / cell.height as f64).floor() as usize;
+        self.panes.iter().position(|pane| {
+            if !pane.alive {
+                return false;
+            }
+            let col_start = pane.col_offset;
+            let col_end = pane.col_offset + pane.cols;
+            let row_end = if include_status_row {
+                pane.status_row.map(|r| r + 1).unwrap_or(pane.rows)
+            } else {
+                pane.rows
+            };
+            col >= col_start && col < col_end && row < row_end
+        })
+    }
+
+    fn set_active(&mut self, id: PaneId) {
+        let Some(new_idx) = self.panes.iter().position(|p| p.id == id && p.alive) else {
+            return;
+        };
+        if self.active == id {
+            return;
+        }
+
+        let old_idx = self.active_index();
+        if self.focused {
+            self.send_focus_report(old_idx, false);
+            self.send_focus_report(new_idx, true);
+        }
+
+        if let Some(pane) = self.panes.get(new_idx) {
+            self.active = id;
+            self.window.set_title(&format!("{} — pj001", pane.title));
+            self.cursor_visible = true;
+            self.last_ime_cursor = None;
+            self.preedit = None;
+            self.window.request_redraw();
+        }
+    }
+
+    fn send_focus_report(&mut self, idx: usize, focused: bool) {
+        let Some(pane) = self.panes.get_mut(idx) else {
+            return;
+        };
+        let send = pane
+            .term
+            .lock()
+            .map(|term| term.focus_reporting())
+            .unwrap_or(false);
+        if send {
+            let bytes: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            if let Err(e) = pane.pty.write(bytes) {
+                log::warn!("focus report write (pane {}): {e}", pane.id.0);
+            }
+        }
+    }
+
+    fn emit_lifecycle(&self, event: LifecycleEvent) {
+        if let Some(sink) = &self.hooks.lifecycle_sink {
+            sink.on_lifecycle(event);
+        }
+    }
+
+    async fn new(
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+    ) -> Result<Self> {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(window.clone())?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|_| Error::NoAdapter)?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("pj001-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: 4096,
+                    ..wgpu::Limits::downlevel_defaults()
+                },
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: caps.present_modes[0],
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
+
+        let renderer = Renderer::new(
+            &device,
+            &queue,
+            format,
+            [size.width as f32, size.height as f32],
+            FONT_SIZE,
+        );
+
+        let mut panes = Vec::new();
+        let hooks = config.hooks.clone();
+        let sessions = config.pane_specs()?;
+        let layouts = pane_layouts(size, renderer.cell_metrics(), sessions.len());
+        for (idx, session) in sessions.into_iter().enumerate() {
+            let id = PaneId(idx);
+            let layout = layouts[idx];
+            let term = Arc::new(Mutex::new(Term::new(layout.cols, layout.rows)));
+            let shell = session.command.resolve();
+            log::info!("pane {} shell: {}", id.0, shell);
+            let pty = PtyHandle::spawn(
+                &shell,
+                PtySize {
+                    rows: layout.rows as u16,
+                    cols: layout.cols as u16,
+                    pixel_width: layout.pixel_width as u16,
+                    pixel_height: layout.pixel_height as u16,
+                },
+                term.clone(),
+                proxy.clone(),
+                id,
+            )?;
+            let title = session.title;
+            panes.push(Pane {
+                id,
+                title: title.clone(),
+                pty,
+                term,
+                cols: layout.cols,
+                rows: layout.rows,
+                col_offset: layout.col_offset,
+                status_row: layout.status_row,
+                alive: true,
+            });
+            if let Some(sink) = &hooks.lifecycle_sink {
+                sink.on_lifecycle(LifecycleEvent::SessionStarted {
+                    session: idx,
+                    title,
+                });
+            }
+        }
+
+        Ok(Self {
+            window,
+            surface,
+            surface_config,
+            device,
+            queue,
+            panes,
+            active: PaneId::first(),
+            renderer,
+            hooks,
+            last_ime_cursor: None,
+            preedit: None,
+            cursor_visible: true,
+            last_blink: Instant::now(),
+            focused: true,
+            cursor_blinking_cache: true,
+            modifiers: ModifiersState::empty(),
+            last_mouse_pos: None,
+            pending_resize: None,
+        })
+    }
+
+    /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
+    fn handle_paste(&mut self) {
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("clipboard read failed: {e}");
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        let idx = self.active_index();
+        // scrollback view 활성 시 paste는 bottom으로 snap.
+        if let Ok(mut term) = self.panes[idx].term.lock() {
+            if term.view_offset() > 0 {
+                term.snap_to_bottom();
+                self.window.request_redraw();
+            }
+        }
+        let bracketed = self.panes[idx]
+            .term
+            .lock()
+            .map(|t| t.bracketed_paste())
+            .unwrap_or(false);
+        log::debug!(
+            "paste: {} bytes, bracketed={}, lines={}",
+            text.len(),
+            bracketed,
+            text.matches('\n').count() + 1
+        );
+        if bracketed {
+            let _ = self.panes[idx].pty.write(b"\x1b[200~");
+            let _ = self.panes[idx].pty.write(text.as_bytes());
+            let _ = self.panes[idx].pty.write(b"\x1b[201~");
+        } else {
+            let _ = self.panes[idx].pty.write(text.as_bytes());
+        }
+    }
+
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        self.surface_config.width = size.width;
+        self.surface_config.height = size.height;
+        self.surface.configure(&self.device, &self.surface_config);
+        self.renderer
+            .resize(&self.queue, [size.width as f32, size.height as f32]);
+        let layouts = pane_layouts(size, self.renderer.cell_metrics(), self.panes.len());
+        for (pane, layout) in self.panes.iter_mut().zip(layouts) {
+            pane.cols = layout.cols;
+            pane.rows = layout.rows;
+            pane.col_offset = layout.col_offset;
+            pane.status_row = layout.status_row;
+            if let Ok(mut term) = pane.term.lock() {
+                term.resize(layout.cols, layout.rows);
+            }
+            let _ = pane.pty.resize(PtySize {
+                rows: layout.rows as u16,
+                cols: layout.cols as u16,
+                pixel_width: layout.pixel_width as u16,
+                pixel_height: layout.pixel_height as u16,
+            });
+        }
+        self.window.request_redraw();
+    }
+
+    fn render(&mut self) {
+        // M10-1: vt가 누적한 응답(DSR/DA 등)을 PTY로 송신. lock 잡고 drain → drop → write.
+        for pane in &mut self.panes {
+            let responses: Vec<Vec<u8>> = if let Ok(mut term) = pane.term.lock() {
+                term.drain_responses()
+            } else {
+                Vec::new()
+            };
+            for resp in responses {
+                if let Err(e) = pane.pty.write(&resp) {
+                    log::warn!("pty response write (pane {}): {e}", pane.id.0);
+                }
+            }
+        }
+
+        use wgpu::CurrentSurfaceTexture as C;
+        let frame = match self.surface.get_current_texture() {
+            C::Success(t) | C::Suboptimal(t) => t,
+            C::Outdated | C::Lost => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            C::Timeout | C::Occluded | C::Validation => return,
+        };
+
+        self.renderer.begin_terms();
+        let active = self.active;
+        for pane in &self.panes {
+            if let Ok(mut term) = pane.term.lock() {
+                let cur = term.cursor();
+                let is_active = pane.id == active;
+                if is_active {
+                    self.cursor_blinking_cache = cur.blinking;
+                    if let Some(t) = term.take_title_if_changed() {
+                        self.window.set_title(&format!("{} — pj001", t));
+                    }
+                }
+                let in_scrollback = term.view_offset() > 0;
+                let preedit_arg = if is_active {
+                    self.preedit.as_deref().map(|s| (s, cur.col, cur.row))
+                } else {
+                    None
+                };
+                let cursor_render =
+                    if is_active && cur.visible && self.cursor_visible && !in_scrollback {
+                        let (row, col) = if let Some((preedit_str, col, row)) = preedit_arg {
+                            let mut c = col;
+                            for ch in preedit_str.chars() {
+                                c += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            }
+                            (row, c.min(term.cols().saturating_sub(1)))
+                        } else {
+                            (cur.row, cur.col)
+                        };
+                        Some(CursorRender {
+                            row,
+                            col,
+                            shape: cur.shape,
+                            focused: self.focused,
+                        })
+                    } else {
+                        None
+                    };
+                let preedit_for_render = if in_scrollback { None } else { preedit_arg };
+                self.renderer.append_term(
+                    &self.queue,
+                    &term,
+                    preedit_for_render,
+                    cursor_render,
+                    pane.col_offset,
+                    0,
+                );
+                // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
+                if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
+                    let cell = self.renderer.cell_metrics();
+                    let pos = winit::dpi::PhysicalPosition::<f64>::new(
+                        ((cur.col + pane.col_offset) as u32 * cell.width) as f64,
+                        (cur.row as u32 * cell.height) as f64,
+                    );
+                    let size = winit::dpi::PhysicalSize::<u32>::new(cell.width, cell.height);
+                    self.window.set_ime_cursor_area(pos, size);
+                    self.last_ime_cursor = Some((cur.row, cur.col));
+                }
+            }
+        }
+        self.append_split_chrome();
+        self.renderer.finish_terms(&self.device, &self.queue);
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pj001-encoder"),
+            });
+        self.renderer.draw(&mut encoder, &view);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+    }
+
+    fn append_split_chrome(&mut self) {
+        if self.panes.len() < 2 {
+            return;
+        }
+
+        if let Some(divider_col) = self
+            .panes
+            .get(1)
+            .map(|pane| pane.col_offset.saturating_sub(1))
+        {
+            let height = self
+                .panes
+                .iter()
+                .filter_map(|pane| pane.status_row.map(|row| row + 1))
+                .max()
+                .unwrap_or_else(|| self.panes.iter().map(|pane| pane.rows).max().unwrap_or(0));
+            self.renderer
+                .append_fill_column(divider_col, 0, height, DIVIDER_BG);
+        }
+
+        for pane in &self.panes {
+            let Some(status_row) = pane.status_row else {
+                continue;
+            };
+            let state = if !pane.alive {
+                "DEAD"
+            } else if pane.id == self.active {
+                "ACTIVE"
+            } else {
+                "READY"
+            };
+            let bg = if !pane.alive {
+                STATUS_DEAD_BG
+            } else if pane.id == self.active {
+                STATUS_ACTIVE_BG
+            } else {
+                STATUS_INACTIVE_BG
+            };
+            let text = format!(" {state} {} ", pane.title);
+            self.renderer.append_text_line(
+                &self.queue,
+                &text,
+                pane.col_offset,
+                status_row,
+                pane.cols,
+                STATUS_FG,
+                bg,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::CellMetrics;
+
+    fn cell() -> CellMetrics {
+        CellMetrics {
+            width: 10,
+            height: 20,
+            baseline: 15.0,
+        }
+    }
+
+    #[test]
+    fn pane_layouts_single_uses_full_window() {
+        let layouts = pane_layouts(PhysicalSize::new(100, 80), cell(), 1);
+
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].cols, 10);
+        assert_eq!(layouts[0].rows, 4);
+        assert_eq!(layouts[0].col_offset, 0);
+        assert_eq!(layouts[0].status_row, None);
+        assert_eq!(layouts[0].pixel_width, 100);
+        assert_eq!(layouts[0].pixel_height, 80);
+    }
+
+    #[test]
+    fn pane_layouts_split_reserves_divider_column() {
+        let layouts = pane_layouts(PhysicalSize::new(100, 80), cell(), 2);
+
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].cols, 5);
+        assert_eq!(layouts[0].col_offset, 0);
+        assert_eq!(layouts[1].cols, 4);
+        assert_eq!(layouts[1].col_offset, 6);
+        assert_eq!(layouts[0].rows, 3);
+        assert_eq!(layouts[1].rows, 3);
+        assert_eq!(layouts[0].status_row, Some(3));
+        assert_eq!(layouts[1].status_row, Some(3));
+    }
+
+    #[test]
+    fn pane_layouts_split_keeps_minimum_cells() {
+        let layouts = pane_layouts(PhysicalSize::new(1, 1), cell(), 2);
+
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].cols, 1);
+        assert_eq!(layouts[1].cols, 1);
+        assert_eq!(layouts[0].rows, 1);
+        assert_eq!(layouts[1].rows, 1);
+        assert_eq!(layouts[0].status_row, None);
+        assert_eq!(layouts[1].status_row, None);
+    }
+
+    #[test]
+    fn config_single_shell_builds_one_session() {
+        let config = Config::single_shell(Some("/bin/zsh".to_string()));
+        let sessions = config.pane_specs().unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "shell");
+        assert_eq!(
+            sessions[0].command,
+            CommandSpec::Custom("/bin/zsh".to_string())
+        );
+    }
+
+    #[test]
+    fn config_vertical_split_builds_pair() {
+        let config = Config::vertical_split(
+            SessionSpec {
+                title: "left".to_string(),
+                command: CommandSpec::Custom("/bin/zsh".to_string()),
+            },
+            SessionSpec {
+                title: "right".to_string(),
+                command: CommandSpec::Custom("/bin/bash".to_string()),
+            },
+        );
+        let sessions = config.pane_specs().unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].title, "left");
+        assert_eq!(sessions[1].title, "right");
+        assert_eq!(
+            config.initial_layout,
+            InitialLayout::Split {
+                direction: SplitDirection::Vertical,
+                first: 0,
+                second: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn config_rejects_missing_layout_session() {
+        let config = Config {
+            sessions: vec![SessionSpec {
+                title: "one".to_string(),
+                command: CommandSpec::Shell,
+            }],
+            initial_layout: InitialLayout::Split {
+                direction: SplitDirection::Vertical,
+                first: 0,
+                second: 1,
+            },
+            hooks: Hooks::default(),
+        };
+
+        assert!(config.pane_specs().is_err());
+    }
+
+    #[test]
+    fn config_rejects_duplicate_split_session() {
+        let config = Config {
+            sessions: vec![SessionSpec {
+                title: "one".to_string(),
+                command: CommandSpec::Shell,
+            }],
+            initial_layout: InitialLayout::Split {
+                direction: SplitDirection::Vertical,
+                first: 0,
+                second: 0,
+            },
+            hooks: Hooks::default(),
+        };
+
+        assert!(config.pane_specs().is_err());
+    }
+}

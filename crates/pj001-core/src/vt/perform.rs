@@ -37,7 +37,12 @@ impl<'a> Perform for TermPerform<'a> {
         if intermediates == b" " && action == 'q' {
             let n = arg_at(params, 0, 0);
             if let Some((shape, blinking)) = decscusr_to_shape(n) {
-                log::info!("decscusr: n={} → shape={:?} blinking={}", n, shape, blinking);
+                log::info!(
+                    "decscusr: n={} → shape={:?} blinking={}",
+                    n,
+                    shape,
+                    blinking
+                );
                 self.term.set_cursor_shape(shape, blinking);
             } else {
                 log::debug!("decscusr: unknown n={}", n);
@@ -437,7 +442,10 @@ mod tests {
     fn osc_7_sets_title_from_file_url() {
         let mut term = Term::new(80, 24);
         // file://hostname/Users/derek/Documents → /Users/derek/Documents
-        run(&mut term, b"\x1b]7;file://Derek-Mac/Users/derek/Documents\x07");
+        run(
+            &mut term,
+            b"\x1b]7;file://Derek-Mac/Users/derek/Documents\x07",
+        );
         let t = term.take_title_if_changed().unwrap();
         // HOME에 따라 ~/... 또는 /Users/...
         assert!(t.contains("Documents"), "title was {:?}", t);
@@ -455,7 +463,10 @@ mod tests {
     fn osc_2_sets_window_title() {
         let mut term = Term::new(80, 24);
         run(&mut term, b"\x1b]2;hello world\x07"); // OSC 2 ; "hello world" BEL
-        assert_eq!(term.take_title_if_changed(), Some("hello world".to_string()));
+        assert_eq!(
+            term.take_title_if_changed(),
+            Some("hello world".to_string())
+        );
         // 두 번째 호출은 None (dirty 클리어됨)
         assert_eq!(term.take_title_if_changed(), None);
     }

@@ -22,6 +22,9 @@ pub enum Error {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("argument error: {0}")]
+    Args(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

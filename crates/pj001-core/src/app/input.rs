@@ -51,11 +51,7 @@ fn modifier_param(mods: ModifiersState) -> Option<u8> {
     if mods.control_key() {
         bits |= 4;
     }
-    if bits == 0 {
-        None
-    } else {
-        Some(1 + bits)
-    }
+    if bits == 0 { None } else { Some(1 + bits) }
 }
 
 /// NamedKey 매핑. modifier 조합 시 xterm CSI 1;Pm 형식 적용.
@@ -306,10 +302,19 @@ mod tests {
         assert_eq!(modifier_param(ModifiersState::empty()), None);
         assert_eq!(modifier_param(ModifiersState::SHIFT), Some(2));
         assert_eq!(modifier_param(ModifiersState::ALT), Some(3));
-        assert_eq!(modifier_param(ModifiersState::SHIFT | ModifiersState::ALT), Some(4));
+        assert_eq!(
+            modifier_param(ModifiersState::SHIFT | ModifiersState::ALT),
+            Some(4)
+        );
         assert_eq!(modifier_param(ModifiersState::CONTROL), Some(5));
-        assert_eq!(modifier_param(ModifiersState::SHIFT | ModifiersState::CONTROL), Some(6));
-        assert_eq!(modifier_param(ModifiersState::ALT | ModifiersState::CONTROL), Some(7));
+        assert_eq!(
+            modifier_param(ModifiersState::SHIFT | ModifiersState::CONTROL),
+            Some(6)
+        );
+        assert_eq!(
+            modifier_param(ModifiersState::ALT | ModifiersState::CONTROL),
+            Some(7)
+        );
         assert_eq!(
             modifier_param(ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL),
             Some(8)
@@ -322,7 +327,10 @@ mod tests {
         m.modifiers = ModifiersState::SHIFT;
         assert_eq!(encode_named_key(&NamedKey::ArrowUp, m), vec(b"\x1b[1;2A"));
         assert_eq!(encode_named_key(&NamedKey::ArrowDown, m), vec(b"\x1b[1;2B"));
-        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1b[1;2C"));
+        assert_eq!(
+            encode_named_key(&NamedKey::ArrowRight, m),
+            vec(b"\x1b[1;2C")
+        );
         assert_eq!(encode_named_key(&NamedKey::ArrowLeft, m), vec(b"\x1b[1;2D"));
     }
 
@@ -330,7 +338,10 @@ mod tests {
     fn ctrl_arrow_modifier_form() {
         let mut m = mode(false);
         m.modifiers = ModifiersState::CONTROL;
-        assert_eq!(encode_named_key(&NamedKey::ArrowRight, m), vec(b"\x1b[1;5C"));
+        assert_eq!(
+            encode_named_key(&NamedKey::ArrowRight, m),
+            vec(b"\x1b[1;5C")
+        );
     }
 
     #[test]

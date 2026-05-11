@@ -35,11 +35,13 @@ pub struct CursorRender {
 const FG_DEFAULT: [f32; 4] = [0.86, 0.86, 0.86, 1.0];
 const BG_DEFAULT: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 
-pub fn build_instances(
+pub fn build_instances_at(
     term: &Term,
     atlas: &GlyphAtlas,
     baseline: f32,
     cursor: Option<CursorRender>,
+    col_offset: usize,
+    row_offset: usize,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     for r in 0..term.rows() {
@@ -61,9 +63,7 @@ pub fn build_instances(
             let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
                 None
             } else {
-                atlas
-                    .get(cell.ch)
-                    .filter(|e| e.width > 0 && e.height > 0)
+                atlas.get(cell.ch).filter(|e| e.width > 0 && e.height > 0)
             };
 
             let bg_is_default = bg == BG_DEFAULT;
@@ -89,7 +89,7 @@ pub fn build_instances(
             };
 
             out.push(CellInstance {
-                cell_xy: [c as f32, r as f32],
+                cell_xy: [(c + col_offset) as f32, (r + row_offset) as f32],
                 uv_min,
                 uv_max,
                 glyph_offset,
@@ -108,13 +108,12 @@ pub fn build_instances(
     if let Some(cur) = cursor {
         // M9-2: cursor 위치 cell이 WIDE면 cursor도 2 cell 차지. WIDE_CONT(짝 cell) 위에
         // cursor가 있으면 한 cell 왼쪽으로 보정해서 WIDE 본체 위로 정렬.
-        let (cur_row, cur_col) = if term.cell(cur.row, cur.col).attrs.contains(Attrs::WIDE_CONT)
-            && cur.col > 0
-        {
-            (cur.row, cur.col - 1)
-        } else {
-            (cur.row, cur.col)
-        };
+        let (cur_row, cur_col) =
+            if term.cell(cur.row, cur.col).attrs.contains(Attrs::WIDE_CONT) && cur.col > 0 {
+                (cur.row, cur.col - 1)
+            } else {
+                (cur.row, cur.col)
+            };
         let cell = term.cell(cur_row, cur_col);
         let cur_span = if cell.attrs.contains(Attrs::WIDE) {
             2.0
@@ -133,9 +132,7 @@ pub fn build_instances(
         let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
             None
         } else {
-            atlas
-                .get(cell.ch)
-                .filter(|e| e.width > 0 && e.height > 0)
+            atlas.get(cell.ch).filter(|e| e.width > 0 && e.height > 0)
         };
         let (uv_min, uv_max, glyph_offset, glyph_size) = if let Some(e) = entry {
             (
@@ -158,7 +155,7 @@ pub fn build_instances(
             flags |= 0x08;
         }
         out.push(CellInstance {
-            cell_xy: [cur_col as f32, cur_row as f32],
+            cell_xy: [(cur_col + col_offset) as f32, (cur_row + row_offset) as f32],
             uv_min,
             uv_max,
             glyph_offset,
@@ -176,13 +173,15 @@ pub fn build_instances(
 
 /// IME preedit overlay. Term grid는 건드리지 않고 cursor (start_col, start_row) 위치부터
 /// preedit string을 dim된 fg로 그려넣는다. cell 경계 넘어가면 truncate.
-pub fn build_preedit_instances(
+pub fn build_preedit_instances_at(
     preedit: &str,
     start_col: usize,
     start_row: usize,
     cols: usize,
     atlas: &GlyphAtlas,
     baseline: f32,
+    col_offset: usize,
+    row_offset: usize,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     let mut col = start_col;
@@ -212,7 +211,7 @@ pub fn build_preedit_instances(
             ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2])
         };
         out.push(CellInstance {
-            cell_xy: [col as f32, start_row as f32],
+            cell_xy: [(col + col_offset) as f32, (start_row + row_offset) as f32],
             uv_min,
             uv_max,
             glyph_offset,
@@ -247,12 +246,7 @@ fn resolve(c: Color, is_fg: bool) -> [f32; 4] {
             }
         }
         Color::Indexed(n) => indexed(n),
-        Color::Rgb(r, g, b) => [
-            r as f32 / 255.0,
-            g as f32 / 255.0,
-            b as f32 / 255.0,
-            1.0,
-        ],
+        Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
     }
 }
 

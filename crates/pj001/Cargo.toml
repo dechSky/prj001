@@ -1,0 +1,9 @@
+[package]
+name = "pj001"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+env_logger.workspace = true
+pj001-core.workspace = true
