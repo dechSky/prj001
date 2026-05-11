@@ -540,7 +540,12 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         if lower == "d" {
-                            if let Err(e) = state.split_active_vertical() {
+                            let axis = if state.modifiers.shift_key() {
+                                SplitAxis::Horizontal
+                            } else {
+                                SplitAxis::Vertical
+                            };
+                            if let Err(e) = state.split_active(axis) {
                                 log::warn!("cmd+d split failed: {e}");
                             }
                             return;
@@ -943,12 +948,9 @@ impl AppState {
         }
     }
 
-    fn split_active_vertical(&mut self) -> Result<()> {
+    fn split_active(&mut self, axis: SplitAxis) -> Result<()> {
         let new_pane = self.ids.new_pane();
-        if !self
-            .layout_root
-            .split_pane(self.active, SplitAxis::Vertical, new_pane)
-        {
+        if !self.layout_root.split_pane(self.active, axis, new_pane) {
             log::warn!("split requested for missing active pane {}", self.active.0);
             return Ok(());
         }
@@ -1377,6 +1379,12 @@ impl AppState {
         {
             self.renderer
                 .append_fill_column(divider.col, divider.row, divider.height, DIVIDER_BG);
+        }
+        for divider in
+            layout::horizontal_dividers(&self.layout_root, size, self.renderer.cell_metrics())
+        {
+            self.renderer
+                .append_fill_row(divider.col, divider.row, divider.width, DIVIDER_BG);
         }
 
         for pane in &self.panes {

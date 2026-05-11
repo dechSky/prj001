@@ -97,6 +97,13 @@ pub(super) struct VerticalDivider {
     pub height: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HorizontalDivider {
+    pub col: usize,
+    pub row: usize,
+    pub width: usize,
+}
+
 pub(super) fn compute_viewports(
     root: &Layout,
     size: PhysicalSize<u32>,
@@ -138,6 +145,28 @@ pub(super) fn vertical_dividers(
     };
     let mut out = Vec::new();
     collect_vertical_dividers(root, rect, &mut out);
+    out
+}
+
+pub(super) fn horizontal_dividers(
+    root: &Layout,
+    size: PhysicalSize<u32>,
+    cell: CellMetrics,
+) -> Vec<HorizontalDivider> {
+    let raw_rows = (size.height / cell.height).max(1) as usize;
+    let status_row = matches!(root, Layout::Split { .. })
+        .then_some(raw_rows - 1)
+        .filter(|_| raw_rows > 1);
+    let rows = status_row.unwrap_or(raw_rows);
+    let cols = (size.width / cell.width).max(1) as usize;
+    let rect = CellRect {
+        col: 0,
+        row: 0,
+        cols,
+        rows,
+    };
+    let mut out = Vec::new();
+    collect_horizontal_dividers(root, rect, &mut out);
     out
 }
 
@@ -244,6 +273,31 @@ fn collect_vertical_dividers(node: &Layout, rect: CellRect, out: &mut Vec<Vertic
             let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
             collect_vertical_dividers(primary, primary_rect, out);
             collect_vertical_dividers(secondary, secondary_rect, out);
+        }
+    }
+}
+
+fn collect_horizontal_dividers(node: &Layout, rect: CellRect, out: &mut Vec<HorizontalDivider>) {
+    match node {
+        Layout::Pane(_) => {}
+        Layout::Split {
+            axis,
+            ratio,
+            primary,
+            secondary,
+        } => {
+            if *axis == SplitAxis::Horizontal && rect.rows >= 3 {
+                let content = rect.rows - 1;
+                let primary_rows = ratio.primary_units(content);
+                out.push(HorizontalDivider {
+                    col: rect.col,
+                    row: rect.row + primary_rows,
+                    width: rect.cols,
+                });
+            }
+            let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
+            collect_horizontal_dividers(primary, primary_rect, out);
+            collect_horizontal_dividers(secondary, secondary_rect, out);
         }
     }
 }
@@ -453,5 +507,25 @@ mod tests {
         assert_eq!(dividers.len(), 2);
         assert_eq!(dividers[0].col, 6);
         assert!(dividers[1].col > dividers[0].col);
+    }
+
+    #[test]
+    fn horizontal_dividers_include_nested_horizontal_split() {
+        let root = Layout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::half(),
+            primary: Box::new(pane(0)),
+            secondary: Box::new(Layout::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: SplitRatio::half(),
+                primary: Box::new(pane(1)),
+                secondary: Box::new(pane(2)),
+            }),
+        };
+        let dividers = horizontal_dividers(&root, PhysicalSize::new(120, 220), cell());
+
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(dividers[0].row, 5);
+        assert!(dividers[1].row > dividers[0].row);
     }
 }

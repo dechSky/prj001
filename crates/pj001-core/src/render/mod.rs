@@ -402,6 +402,23 @@ impl Renderer {
         }
     }
 
+    pub fn append_fill_row(&mut self, col: usize, row: usize, width: usize, bg: [f32; 4]) {
+        for idx in 0..width {
+            self.pending_instances.push(CellInstance {
+                cell_xy: [(col + idx) as f32, row as f32],
+                uv_min: [0.0; 2],
+                uv_max: [0.0; 2],
+                glyph_offset: [0.0; 2],
+                glyph_size: [0.0; 2],
+                fg: [0.0; 4],
+                bg,
+                cell_span: 1.0,
+                flags: 0,
+                _pad: [0.0; 2],
+            });
+        }
+    }
+
     pub fn finish_terms(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.instance_count = self.pending_instances.len() as u32;
         if self.pending_instances.is_empty() {
