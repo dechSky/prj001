@@ -46,6 +46,21 @@ impl SplitRatio {
     }
 }
 
+impl Layout {
+    pub(super) fn from_initial_panes(panes: &[PaneId]) -> Self {
+        match panes {
+            [single] => Self::Pane(*single),
+            [first, second] => Self::Split {
+                axis: SplitAxis::Vertical,
+                ratio: SplitRatio::half(),
+                primary: Box::new(Self::Pane(*first)),
+                secondary: Box::new(Self::Pane(*second)),
+            },
+            _ => panic!("initial layout currently supports one or two panes"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CellRect {
     col: usize,
@@ -188,6 +203,27 @@ mod tests {
 
     fn pane(id: u64) -> Layout {
         Layout::Pane(PaneId(id))
+    }
+
+    #[test]
+    fn initial_layout_single_is_pane() {
+        assert_eq!(
+            Layout::from_initial_panes(&[PaneId(7)]),
+            Layout::Pane(PaneId(7))
+        );
+    }
+
+    #[test]
+    fn initial_layout_pair_is_vertical_half_split() {
+        assert_eq!(
+            Layout::from_initial_panes(&[PaneId(1), PaneId(2)]),
+            Layout::Split {
+                axis: SplitAxis::Vertical,
+                ratio: SplitRatio::half(),
+                primary: Box::new(Layout::Pane(PaneId(1))),
+                secondary: Box::new(Layout::Pane(PaneId(2))),
+            }
+        );
     }
 
     #[test]

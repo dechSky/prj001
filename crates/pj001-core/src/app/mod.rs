@@ -21,7 +21,9 @@ use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
 use event::{IdAllocator, PaneId, SessionId, UserEvent};
-use layout::{Layout, SplitAxis, SplitRatio};
+use layout::Layout;
+#[cfg(test)]
+use layout::{SplitAxis, SplitRatio};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
@@ -275,6 +277,8 @@ struct AppState {
     /// M12-3: PTY 프로세스 보관. Pane은 SessionId로 참조.
     sessions: HashMap<SessionId, Session>,
     panes: Vec<Pane>,
+    /// M13-2: active tab 도입 전 단일 BSP root. M13 dynamic split/close가 이 tree를 mutate.
+    layout_root: Layout,
     active: PaneId,
     renderer: Renderer,
     hooks: Hooks,
@@ -336,6 +340,7 @@ impl App {
 /// M12-5: PaneViewport의 단일 생성 진입점. M11 `pane_layouts` rename.
 /// M13에서 BSP 기반 재구현 시 같은 시그니처(또는 LayoutNode 받는 형태)로 확장.
 /// `count <= 2` 가정은 M13 진입 직전까지만 유효 — M13에서 N-pane 일반화.
+#[cfg(test)]
 fn compute_viewports(
     size: PhysicalSize<u32>,
     cell: crate::render::CellMetrics,
@@ -927,11 +932,14 @@ impl AppState {
             FONT_SIZE,
         );
 
-        let mut panes = Vec::new();
-        let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         let hooks = config.hooks.clone();
         let pane_specs = config.pane_specs()?;
-        let layouts = compute_viewports(size, renderer.cell_metrics(), pane_specs.len());
+        let mut ids = IdAllocator::default();
+        let pane_ids = (0..pane_specs.len())
+            .map(|_| ids.new_pane())
+            .collect::<Vec<_>>();
+        let layout_root = Layout::from_initial_panes(&pane_ids);
+        let layouts = layout::compute_viewports(&layout_root, size, renderer.cell_metrics());
         log::info!(
             "startup spawn size={}x{} cell={}x{} panes={} layouts={:?}",
             size.width,
@@ -940,15 +948,16 @@ impl AppState {
             renderer.cell_metrics().height,
             pane_specs.len(),
             layouts
-                .iter()
+                .values()
                 .map(|v| (v.cols, v.rows, v.col_offset, v.status_row))
                 .collect::<Vec<_>>(),
         );
-        let mut ids = IdAllocator::default();
+        let mut panes = Vec::new();
+        let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         for (spec_index, spec) in pane_specs.into_iter().enumerate() {
-            let pane_id = ids.new_pane();
+            let pane_id = pane_ids[spec_index];
             let session_id = ids.new_session();
-            let viewport = layouts[spec_index];
+            let viewport = layouts[&pane_id];
             let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
             let shell = spec.command.resolve();
             log::info!("pane {} shell: {}", pane_id.0, shell);
@@ -996,6 +1005,7 @@ impl AppState {
             queue,
             sessions,
             panes,
+            layout_root,
             active: PaneId::first(),
             renderer,
             hooks,
@@ -1095,7 +1105,8 @@ impl AppState {
         self.surface.configure(&self.device, &self.surface_config);
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
-        let layouts = compute_viewports(size, self.renderer.cell_metrics(), self.panes.len());
+        let layouts =
+            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
         log::info!(
             "resize event size={}x{} cell={}x{} layouts={:?}",
             size.width,
@@ -1103,12 +1114,13 @@ impl AppState {
             self.renderer.cell_metrics().width,
             self.renderer.cell_metrics().height,
             layouts
-                .iter()
+                .values()
                 .map(|v| (v.cols, v.rows, v.col_offset, v.status_row))
                 .collect::<Vec<_>>(),
         );
         for idx in 0..self.panes.len() {
-            let viewport = layouts[idx];
+            let pane_id = self.panes[idx].id;
+            let viewport = layouts[&pane_id];
             let prev = self.panes[idx].viewport;
             // M12-5 회귀 fix (Codex threads 019e164b → 019e1653 가설 K):
             // PTY/Term resize는 실제 terminal cell size(rows/cols)가 바뀔 때만 필요하다.
