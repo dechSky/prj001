@@ -1489,10 +1489,11 @@ impl AppState {
                 self.window.request_redraw();
                 return;
             }
-            C::Timeout | C::Occluded | C::Validation => {
+            C::Timeout => {
                 self.window.request_redraw();
                 return;
             }
+            C::Occluded | C::Validation => return,
         };
 
         self.renderer.begin_terms();
