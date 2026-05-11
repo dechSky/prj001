@@ -269,6 +269,20 @@ struct PaneViewport {
     height_px: u32,
 }
 
+fn status_segment(
+    group_col: usize,
+    group_cols: usize,
+    group_len: usize,
+    index: usize,
+) -> (usize, usize) {
+    if group_len <= 1 {
+        return (group_col, group_cols);
+    }
+    let start = group_col + (group_cols * index / group_len);
+    let end = group_col + (group_cols * (index + 1) / group_len);
+    (start, end.saturating_sub(start).max(1))
+}
+
 struct AppState {
     window: Arc<Window>,
     proxy: EventLoopProxy<UserEvent>,
@@ -1523,6 +1537,7 @@ impl AppState {
                 .append_fill_row(divider.col, divider.row, divider.width, DIVIDER_BG);
         }
 
+        let mut status_items = Vec::new();
         for pane in &self.panes {
             let Some(status_row) = pane.viewport.status_row else {
                 continue;
@@ -1544,15 +1559,50 @@ impl AppState {
                 STATUS_INACTIVE_BG
             };
             let text = format!(" {state} {} ", session.title);
-            self.renderer.append_text_line(
-                &self.queue,
-                &text,
-                pane.viewport.col_offset,
+            status_items.push((
                 status_row,
+                pane.viewport.col_offset,
                 pane.viewport.cols,
-                STATUS_FG,
+                text,
                 bg,
-            );
+            ));
+        }
+
+        let mut rendered = vec![false; status_items.len()];
+        for idx in 0..status_items.len() {
+            if rendered[idx] {
+                continue;
+            }
+            let (row, col, cols, _, _) = &status_items[idx];
+            let group: Vec<usize> = status_items
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(candidate_idx, (candidate_row, candidate_col, candidate_cols, _, _))| {
+                        (!rendered[candidate_idx]
+                            && candidate_row == row
+                            && candidate_col == col
+                            && candidate_cols == cols)
+                            .then_some(candidate_idx)
+                    },
+                )
+                .collect();
+            let group_len = group.len();
+            for (group_idx, item_idx) in group.into_iter().enumerate() {
+                rendered[item_idx] = true;
+                let (status_row, group_col, group_cols, text, bg) = &status_items[item_idx];
+                let (segment_col, segment_cols) =
+                    status_segment(*group_col, *group_cols, group_len, group_idx);
+                self.renderer.append_text_line(
+                    &self.queue,
+                    text,
+                    segment_col,
+                    *status_row,
+                    segment_cols,
+                    STATUS_FG,
+                    *bg,
+                );
+            }
         }
     }
 }
@@ -1633,6 +1683,15 @@ mod tests {
         assert_eq!(layouts[1].x_px, 10);
         assert_eq!(layouts[0].col_offset + layouts[0].cols, 1);
         assert_eq!(layouts[1].col_offset + layouts[1].cols, 2);
+    }
+
+    #[test]
+    fn status_segment_divides_shared_status_region() {
+        assert_eq!(status_segment(0, 10, 2, 0), (0, 5));
+        assert_eq!(status_segment(0, 10, 2, 1), (5, 5));
+        assert_eq!(status_segment(6, 5, 3, 0), (6, 1));
+        assert_eq!(status_segment(6, 5, 3, 1), (7, 2));
+        assert_eq!(status_segment(6, 5, 3, 2), (9, 2));
     }
 
     #[test]
