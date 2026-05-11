@@ -1,5 +1,6 @@
 pub mod event;
 mod input;
+mod layout;
 mod session;
 
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
 use event::{IdAllocator, PaneId, SessionId, UserEvent};
+use layout::{Layout, SplitAxis, SplitRatio};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
@@ -358,52 +360,16 @@ fn compute_viewports(
         }];
     }
 
-    let status_row = (raw_rows > 1).then_some(raw_rows - 1);
-    let rows = status_row.unwrap_or(raw_rows);
-    let physical_cols = (size.width / cell.width) as usize;
-    let total_cols = physical_cols.max(1);
-    let divider_cols = usize::from(total_cols >= 3);
-    let content_cols = total_cols.saturating_sub(divider_cols);
-    let left_cols = content_cols.div_ceil(2).max(1);
-    let right_cols = content_cols.saturating_sub(left_cols).max(1);
-    let right_offset = if physical_cols <= 1 {
-        0
-    } else {
-        left_cols + divider_cols
+    let left = PaneId(0);
+    let right = PaneId(1);
+    let root = Layout::Split {
+        axis: SplitAxis::Vertical,
+        ratio: SplitRatio::half(),
+        primary: Box::new(Layout::Pane(left)),
+        secondary: Box::new(Layout::Pane(right)),
     };
-    let left_width_px = if physical_cols == 0 {
-        size.width
-    } else {
-        left_cols as u32 * cell.width
-    };
-    let right_width_px = if physical_cols == 0 {
-        size.width
-    } else {
-        right_cols as u32 * cell.width
-    };
-    let row_height_px = rows as u32 * cell.height;
-    vec![
-        PaneViewport {
-            cols: left_cols,
-            rows,
-            col_offset: 0,
-            status_row,
-            x_px: 0,
-            y_px: 0,
-            width_px: left_width_px,
-            height_px: row_height_px,
-        },
-        PaneViewport {
-            cols: right_cols,
-            rows,
-            col_offset: right_offset,
-            status_row,
-            x_px: right_offset as u32 * cell.width,
-            y_px: 0,
-            width_px: right_width_px,
-            height_px: row_height_px,
-        },
-    ]
+    let viewports = layout::compute_viewports(&root, size, cell);
+    vec![viewports[&left], viewports[&right]]
 }
 
 impl ApplicationHandler<UserEvent> for App {
