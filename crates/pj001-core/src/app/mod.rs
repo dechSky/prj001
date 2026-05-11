@@ -229,20 +229,24 @@ struct Pane {
     id: PaneId,
     /// M12-3: 어떤 Session을 보여주는가. M14까지 1 Session = 0..1 Pane.
     session: SessionId,
-    cols: usize,
-    rows: usize,
-    col_offset: usize,
-    status_row: Option<usize>,
+    /// M12-5: cell + pixel 단위 viewport. 직접 field mutation 금지 — `compute_viewports`만 통과.
+    viewport: PaneViewport,
 }
 
+/// M12-5: pane이 점유하는 시각 영역. cell 단위(cols/rows/col_offset/status_row)와
+/// pixel 단위(x_px/y_px/width_px/height_px) 양쪽 보유. 직접 mutation 금지 정책 —
+/// `compute_viewports`만이 새 PaneViewport를 생성. M13 BSP 진입 시 동일 struct를
+/// LayoutNode resolve 결과로 받음.
 #[derive(Clone, Copy)]
-struct PaneLayout {
+struct PaneViewport {
     cols: usize,
     rows: usize,
     col_offset: usize,
     status_row: Option<usize>,
-    pixel_width: u32,
-    pixel_height: u32,
+    x_px: u32,
+    y_px: u32,
+    width_px: u32,
+    height_px: u32,
 }
 
 struct AppState {
@@ -283,25 +287,30 @@ impl App {
     }
 }
 
-fn pane_layouts(
+/// M12-5: PaneViewport의 단일 생성 진입점. M11 `pane_layouts` rename.
+/// M13에서 BSP 기반 재구현 시 같은 시그니처(또는 LayoutNode 받는 형태)로 확장.
+/// `count <= 2` 가정은 M13 진입 직전까지만 유효 — M13에서 N-pane 일반화.
+fn compute_viewports(
     size: PhysicalSize<u32>,
     cell: crate::render::CellMetrics,
     count: usize,
-) -> Vec<PaneLayout> {
+) -> Vec<PaneViewport> {
     debug_assert!(
         count <= 2,
-        "pane_layouts currently supports at most two panes"
+        "compute_viewports currently supports at most two panes (M13 BSP에서 N-pane 일반화)"
     );
     let raw_rows = (size.height / cell.height).max(1) as usize;
     if count <= 1 {
         let cols = (size.width / cell.width).max(1) as usize;
-        return vec![PaneLayout {
+        return vec![PaneViewport {
             cols,
             rows: raw_rows,
             col_offset: 0,
             status_row: None,
-            pixel_width: size.width,
-            pixel_height: size.height,
+            x_px: 0,
+            y_px: 0,
+            width_px: size.width,
+            height_px: size.height,
         }];
     }
 
@@ -311,22 +320,27 @@ fn pane_layouts(
     let divider_cols = 1usize;
     let left_cols = (total_cols / 2).max(1);
     let right_cols = total_cols.saturating_sub(left_cols + divider_cols).max(1);
+    let row_height_px = rows as u32 * cell.height;
     vec![
-        PaneLayout {
+        PaneViewport {
             cols: left_cols,
             rows,
             col_offset: 0,
             status_row,
-            pixel_width: left_cols as u32 * cell.width,
-            pixel_height: rows as u32 * cell.height,
+            x_px: 0,
+            y_px: 0,
+            width_px: left_cols as u32 * cell.width,
+            height_px: row_height_px,
         },
-        PaneLayout {
+        PaneViewport {
             cols: right_cols,
             rows,
             col_offset: left_cols + divider_cols,
             status_row,
-            pixel_width: right_cols as u32 * cell.width,
-            pixel_height: rows as u32 * cell.height,
+            x_px: (left_cols + divider_cols) as u32 * cell.width,
+            y_px: 0,
+            width_px: right_cols as u32 * cell.width,
+            height_px: row_height_px,
         },
     ]
 }
@@ -711,12 +725,13 @@ impl AppState {
             if !sessions.get(&pane.session).map(|s| s.alive).unwrap_or(false) {
                 return false;
             }
-            let col_start = pane.col_offset;
-            let col_end = pane.col_offset + pane.cols;
+            let vp = &pane.viewport;
+            let col_start = vp.col_offset;
+            let col_end = vp.col_offset + vp.cols;
             let row_end = if include_status_row {
-                pane.status_row.map(|r| r + 1).unwrap_or(pane.rows)
+                vp.status_row.map(|r| r + 1).unwrap_or(vp.rows)
             } else {
-                pane.rows
+                vp.rows
             };
             col >= col_start && col < col_end && row < row_end
         })
@@ -855,7 +870,7 @@ impl AppState {
         let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         let hooks = config.hooks.clone();
         let pane_specs = config.pane_specs()?;
-        let layouts = pane_layouts(size, renderer.cell_metrics(), pane_specs.len());
+        let layouts = compute_viewports(size, renderer.cell_metrics(), pane_specs.len());
         let mut next_pane_id: u64 = 0;
         let mut next_session_id: u64 = 0;
         for (spec_index, spec) in pane_specs.into_iter().enumerate() {
@@ -867,17 +882,17 @@ impl AppState {
             next_session_id = next_session_id
                 .checked_add(1)
                 .expect("session id overflow (u64 exhausted)");
-            let layout = layouts[spec_index];
-            let term = Arc::new(Mutex::new(Term::new(layout.cols, layout.rows)));
+            let viewport = layouts[spec_index];
+            let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
             let shell = spec.command.resolve();
             log::info!("pane {} shell: {}", pane_id.0, shell);
             let pty = PtyHandle::spawn(
                 &shell,
                 PtySize {
-                    rows: layout.rows as u16,
-                    cols: layout.cols as u16,
-                    pixel_width: layout.pixel_width as u16,
-                    pixel_height: layout.pixel_height as u16,
+                    rows: viewport.rows as u16,
+                    cols: viewport.cols as u16,
+                    pixel_width: viewport.width_px as u16,
+                    pixel_height: viewport.height_px as u16,
                 },
                 term.clone(),
                 proxy.clone(),
@@ -900,10 +915,7 @@ impl AppState {
             panes.push(Pane {
                 id: pane_id,
                 session: session_id,
-                cols: layout.cols,
-                rows: layout.rows,
-                col_offset: layout.col_offset,
-                status_row: layout.status_row,
+                viewport,
             });
             if let Some(sink) = &hooks.lifecycle_sink {
                 sink.on_lifecycle(LifecycleEvent::SessionStarted {
@@ -1029,25 +1041,20 @@ impl AppState {
         self.surface.configure(&self.device, &self.surface_config);
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
-        let layouts = pane_layouts(size, self.renderer.cell_metrics(), self.panes.len());
+        let layouts = compute_viewports(size, self.renderer.cell_metrics(), self.panes.len());
         for idx in 0..self.panes.len() {
-            let layout = layouts[idx];
-            {
-                let pane = &mut self.panes[idx];
-                pane.cols = layout.cols;
-                pane.rows = layout.rows;
-                pane.col_offset = layout.col_offset;
-                pane.status_row = layout.status_row;
-            }
+            let viewport = layouts[idx];
+            // M12-5: mutation 단일 진입점 — viewport 전체 교체만 허용 (개별 field 직접 mutation X).
+            self.panes[idx].viewport = viewport;
             let session = self.session_for_pane_idx_mut(idx);
             if let Ok(mut term) = session.term.lock() {
-                term.resize(layout.cols, layout.rows);
+                term.resize(viewport.cols, viewport.rows);
             }
             let _ = session.pty.resize(PtySize {
-                rows: layout.rows as u16,
-                cols: layout.cols as u16,
-                pixel_width: layout.pixel_width as u16,
-                pixel_height: layout.pixel_height as u16,
+                rows: viewport.rows as u16,
+                cols: viewport.cols as u16,
+                pixel_width: viewport.width_px as u16,
+                pixel_height: viewport.height_px as u16,
             });
         }
         self.window.request_redraw();
@@ -1086,7 +1093,7 @@ impl AppState {
         for idx in 0..pane_count {
             let (pane_id, pane_col_offset, session_id) = {
                 let p = &self.panes[idx];
-                (p.id, p.col_offset, p.session)
+                (p.id, p.viewport.col_offset, p.session)
             };
             let term_arc = self.sessions[&session_id].term.clone();
             if let Ok(mut term) = term_arc.lock() {
@@ -1170,20 +1177,26 @@ impl AppState {
         if let Some(divider_col) = self
             .panes
             .get(1)
-            .map(|pane| pane.col_offset.saturating_sub(1))
+            .map(|pane| pane.viewport.col_offset.saturating_sub(1))
         {
             let height = self
                 .panes
                 .iter()
-                .filter_map(|pane| pane.status_row.map(|row| row + 1))
+                .filter_map(|pane| pane.viewport.status_row.map(|row| row + 1))
                 .max()
-                .unwrap_or_else(|| self.panes.iter().map(|pane| pane.rows).max().unwrap_or(0));
+                .unwrap_or_else(|| {
+                    self.panes
+                        .iter()
+                        .map(|pane| pane.viewport.rows)
+                        .max()
+                        .unwrap_or(0)
+                });
             self.renderer
                 .append_fill_column(divider_col, 0, height, DIVIDER_BG);
         }
 
         for pane in &self.panes {
-            let Some(status_row) = pane.status_row else {
+            let Some(status_row) = pane.viewport.status_row else {
                 continue;
             };
             let session = &self.sessions[&pane.session];
@@ -1206,9 +1219,9 @@ impl AppState {
             self.renderer.append_text_line(
                 &self.queue,
                 &text,
-                pane.col_offset,
+                pane.viewport.col_offset,
                 status_row,
-                pane.cols,
+                pane.viewport.cols,
                 STATUS_FG,
                 bg,
             );
@@ -1230,27 +1243,31 @@ mod tests {
     }
 
     #[test]
-    fn pane_layouts_single_uses_full_window() {
-        let layouts = pane_layouts(PhysicalSize::new(100, 80), cell(), 1);
+    fn compute_viewports_single_uses_full_window() {
+        let layouts = compute_viewports(PhysicalSize::new(100, 80), cell(), 1);
 
         assert_eq!(layouts.len(), 1);
         assert_eq!(layouts[0].cols, 10);
         assert_eq!(layouts[0].rows, 4);
         assert_eq!(layouts[0].col_offset, 0);
         assert_eq!(layouts[0].status_row, None);
-        assert_eq!(layouts[0].pixel_width, 100);
-        assert_eq!(layouts[0].pixel_height, 80);
+        assert_eq!(layouts[0].x_px, 0);
+        assert_eq!(layouts[0].y_px, 0);
+        assert_eq!(layouts[0].width_px, 100);
+        assert_eq!(layouts[0].height_px, 80);
     }
 
     #[test]
-    fn pane_layouts_split_reserves_divider_column() {
-        let layouts = pane_layouts(PhysicalSize::new(100, 80), cell(), 2);
+    fn compute_viewports_split_reserves_divider_column() {
+        let layouts = compute_viewports(PhysicalSize::new(100, 80), cell(), 2);
 
         assert_eq!(layouts.len(), 2);
         assert_eq!(layouts[0].cols, 5);
         assert_eq!(layouts[0].col_offset, 0);
+        assert_eq!(layouts[0].x_px, 0);
         assert_eq!(layouts[1].cols, 4);
         assert_eq!(layouts[1].col_offset, 6);
+        assert_eq!(layouts[1].x_px, 60);
         assert_eq!(layouts[0].rows, 3);
         assert_eq!(layouts[1].rows, 3);
         assert_eq!(layouts[0].status_row, Some(3));
@@ -1258,8 +1275,8 @@ mod tests {
     }
 
     #[test]
-    fn pane_layouts_split_keeps_minimum_cells() {
-        let layouts = pane_layouts(PhysicalSize::new(1, 1), cell(), 2);
+    fn compute_viewports_split_keeps_minimum_cells() {
+        let layouts = compute_viewports(PhysicalSize::new(1, 1), cell(), 2);
 
         assert_eq!(layouts.len(), 2);
         assert_eq!(layouts[0].cols, 1);
