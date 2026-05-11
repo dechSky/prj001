@@ -1,10 +1,58 @@
 # pj001 — MVP+ 로드맵 (M11~M19)
 
-**상태**: 로드맵 v2 (2026-05-08). 코드/세부 설계 미반영.
+**상태**: 로드맵 v2 (2026-05-08, historical). 코드/세부 설계 미반영. **2026-05-11부로 정본 이전 — 실제 milestone trajectory는 `archive/docs/architecture/m12-m16-pj001-sessions-tabs-bridge-plan.md` 참조**.
 **목적**: M7까지 도달한 "표시·실행" 영역 위에, **Mac 터미널 일상 사용 격차**를 메우고 그 위로 확장.
 **스타일**: high-level 1장. 각 단계 진입 직전 별도 `M??-design.md` 작성(M7 cursor / M8 keyboard와 동일 패턴).
 
 **v2 변경 (vs v1, 누락 점검 반영)**: M11 신설(VT 인프라 보강) → M12~M19로 시프트. M13(OSC) 스코프 확장. M15(단축키) 확장. §15 out-of-scope 박스 신설. §16 post-MVP+ cleanup 추가.
+
+---
+
+## 2026-05-11 갱신 — 정본 이전 + milestone 번호 재배치
+
+**완료 상태**: M1~M10 + M17(reflow) + **M11 workspace 분리**(commit `396a536`, cargo test 66 → 75) 완료. archive-bridge MVP crate 생성(archive `f18b257`).
+
+**상용 급 OSS 지향 확장**: 학습 목적에서 "macOS 전용 빠르고 정확한 GPU 터미널, Alacritty/Ghostty 하위 80% 사용 사례 통과, AI CLI 깨뜨리지 않는 host terminal"(Codex 정의)로 1차 목표 확장. 광역 웹 분석(Warp/iTerm2/Ghostty/WezTerm/Alacritty/Kitty/Terminal.app) + Codex 2nd opinion 완료.
+
+### 새 milestone 번호 (정본: archive m12-m16 plan)
+
+| # | 본 로드맵 (v2, deprecated) | 새 번호 (m12-m16 plan) | 주제 |
+|---|---|---|---|
+| ~~M11~~ | VT 인프라 보강 (ICH/DCH/IL/DL/ECH/DECSTR/RIS/G0+DEC line drawing) | **재배치 필요** — 새 trajectory 어디에 들어가는지 미확정 (M13/M14 단계 외부) |
+| M12 (신규) | — | **Session 추출** (PTY ↔ visible slot 분리, refactor only) |
+| M13 (신규) | — | **Layout tree** (BSP, flexible split + divider drag + 3+ pane) |
+| M14 (신규) | — | **Tabs** (tab bar, Cmd+T, Cmd+숫자) |
+| M15 (신규) | — | **AgentKind + dynamic spawn** |
+| M16 (신규) | — | **Bridge graph** (multi-select N-target routing) |
+
+### 본 로드맵 잔여 항목 처리
+
+본 로드맵 §2~§10의 M11~M19 모두 새 trajectory와 충돌 또는 미정렬. **archive m12-m16 plan + 상용 갭 분석 P0~P3 권고**가 정본이며, 본 로드맵 잔여 항목은 다음 분류로 재처리 예정:
+
+1. **VT 인프라 보강** (원래 M11): 새 trajectory와 직교 — 별도 milestone(M13 layout tree 진입 전 또는 그 사이)로 재배치 권장. P0 보안 트랙(paste/drop sanitization + fuzzing) 동반.
+2. **마우스 selection + Cmd+C** (원래 M12): M14 tabs 이후 또는 P0 보안 트랙과 묶음.
+3. **OSC bundle / mouse reporting / find / 폰트 줌** (원래 M13~M16): m12-m16 plan과 직교 — 별도 trajectory로 유지, P1.
+4. **resize reflow** (원래 M17): ✅ M17로 이미 완료(commit `4ebc513`).
+5. **탭/멀티창** (원래 M18): m12-m16 plan의 M14 Tabs로 흡수.
+6. **환경설정** (원래 M19): 상용 갭 분석에서 config file + keybindings + profiles는 P1로 격상.
+
+### 의도적 미지원 재검토 (Codex 권고)
+
+- **OSC 52** 미지원 → **opt-in (기본 off)**: `allow_osc52 = off/ask/local-only/on`. Claude Code류 `/copy` 호환.
+- **Kitty graphics** 미지원 → **P3 experimental flag**. AI 인라인 이미지 트렌드 대비.
+- **Sparkle** 미지원 → **공개 사용자 1000+ 시점 도입**. 지금은 수동 GitHub release + notarized DMG.
+- **Triggers / OSC 1337 / tmux deep / i18n / telemetry / Hotkey window** 미지원 유지.
+
+### 상용 급 P0~P3 (Codex 합의)
+
+- **P0**: m12-m16 trajectory(M12 layout 일반화 → M13 BSP) + VT 인프라 보강 + 마우스 selection + paste/drop sanitization + fuzzing + crash log local bundle
+- **P1**: OSC 8/133/7 + title stack + config + keybindings + profiles + KKP + mouse reporting + find + buffer clear + font zoom
+- **P2**: Developer ID signing + notarization + release DMG + 보안 정책 문서 + ligature + accessibility minimal tree
+- **P3**: preferences GUI + vibrancy/blur + Sparkle + Quick terminal + Kitty graphics experimental + AppleScript/Shortcuts
+
+---
+
+## (이하 historical — 2026-05-08 v2 본문)
 
 ---
 
