@@ -1486,9 +1486,13 @@ impl AppState {
             C::Success(t) | C::Suboptimal(t) => t,
             C::Outdated | C::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
+                self.window.request_redraw();
                 return;
             }
-            C::Timeout | C::Occluded | C::Validation => return,
+            C::Timeout | C::Occluded | C::Validation => {
+                self.window.request_redraw();
+                return;
+            }
         };
 
         self.renderer.begin_terms();
