@@ -350,8 +350,9 @@ impl App {
         // M6-3 Phase 0: IME 이벤트 활성화.
         state.window.set_ime_allowed(true);
         state.window.set_ime_purpose(ImePurpose::Terminal);
-        state.window.request_redraw();
+        let window = state.window.clone();
         self.state = Some(state);
+        window.request_redraw();
     }
 }
 
