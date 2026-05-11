@@ -19,3 +19,78 @@ impl PaneId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
+
+/// M12-6: design §2.1 정합. ID 재사용 금지 monotonic counter.
+/// AppState가 보유하던 raw next_*_id 필드 + allocate_* 메서드를 한 struct로 묶음.
+#[derive(Debug, Default)]
+pub struct IdAllocator {
+    next_pane: u64,
+    next_session: u64,
+}
+
+impl IdAllocator {
+    pub fn new_pane(&mut self) -> PaneId {
+        let id = PaneId(self.next_pane);
+        self.next_pane = self
+            .next_pane
+            .checked_add(1)
+            .expect("pane id overflow (u64 exhausted)");
+        id
+    }
+
+    pub fn new_session(&mut self) -> SessionId {
+        let id = SessionId(self.next_session);
+        self.next_session = self
+            .next_session
+            .checked_add(1)
+            .expect("session id overflow (u64 exhausted)");
+        id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_allocator_starts_at_zero() {
+        let mut ids = IdAllocator::default();
+        assert_eq!(ids.new_pane(), PaneId(0));
+        assert_eq!(ids.new_session(), SessionId(0));
+    }
+
+    #[test]
+    fn id_allocator_is_monotonic() {
+        let mut ids = IdAllocator::default();
+        let a = ids.new_pane();
+        let b = ids.new_pane();
+        let c = ids.new_pane();
+        assert_eq!(a, PaneId(0));
+        assert_eq!(b, PaneId(1));
+        assert_eq!(c, PaneId(2));
+        // session counter는 pane counter와 독립.
+        assert_eq!(ids.new_session(), SessionId(0));
+        assert_eq!(ids.new_session(), SessionId(1));
+    }
+
+    #[test]
+    fn id_allocator_does_not_reuse() {
+        let mut ids = IdAllocator::default();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            assert!(seen.insert(ids.new_pane()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            assert!(seen.insert(ids.new_session()));
+        }
+    }
+
+    #[test]
+    fn pane_and_session_id_are_orderable() {
+        // M16 BTreeSet<SessionId> 대비 — PartialOrd/Ord derive 검증.
+        let mut v = vec![SessionId(3), SessionId(1), SessionId(2)];
+        v.sort();
+        assert_eq!(v, vec![SessionId(1), SessionId(2), SessionId(3)]);
+    }
+}

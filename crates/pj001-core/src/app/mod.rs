@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
-use event::{PaneId, SessionId, UserEvent};
+use event::{IdAllocator, PaneId, SessionId, UserEvent};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
@@ -243,7 +243,10 @@ struct PaneViewport {
     rows: usize,
     col_offset: usize,
     status_row: Option<usize>,
+    /// M13 BSP scissor rect / pixel-단위 hit-test 진입 시 활용. M12에는 PTY size 계산용.
+    #[allow(dead_code)]
     x_px: u32,
+    #[allow(dead_code)]
     y_px: u32,
     width_px: u32,
     height_px: u32,
@@ -272,9 +275,9 @@ struct AppState {
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
     pending_resize: Option<PhysicalSize<u32>>,
-    /// M12-1: 재사용 금지 monotonic counter. M12-3에서 Session 추출 시 활용.
-    next_pane_id: u64,
-    next_session_id: u64,
+    /// M12-6: design §2.1의 monotonic ID 정책을 IdAllocator로 캡슐화. M15 dynamic spawn에서 활용.
+    #[allow(dead_code)]
+    ids: IdAllocator,
 }
 
 impl App {
@@ -422,9 +425,8 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if button_state == ElementState::Pressed {
-                    if let Some(idx) = state.pane_index_at_mouse(true) {
-                        let id = state.panes[idx].id;
-                        state.set_active(id);
+                    if let Some(pane_id) = state.pane_at_mouse(true) {
+                        state.set_active(pane_id);
                     }
                 }
             }
@@ -754,7 +756,9 @@ impl AppState {
             .map(|p| p.id)
     }
 
-    /// M12-3: PaneId → SessionId 매핑.
+    /// M12-3: PaneId → SessionId 매핑. M12-4 재작성에서 inline으로 옮겨갔지만 M13 BSP layout
+    /// traversal에서 PaneId 기반 lookup에 다시 활용 예정.
+    #[allow(dead_code)]
     fn session_id_for_pane(&self, pane: PaneId) -> Option<SessionId> {
         self.panes.iter().find(|p| p.id == pane).map(|p| p.session)
     }
@@ -871,17 +875,10 @@ impl AppState {
         let hooks = config.hooks.clone();
         let pane_specs = config.pane_specs()?;
         let layouts = compute_viewports(size, renderer.cell_metrics(), pane_specs.len());
-        let mut next_pane_id: u64 = 0;
-        let mut next_session_id: u64 = 0;
+        let mut ids = IdAllocator::default();
         for (spec_index, spec) in pane_specs.into_iter().enumerate() {
-            let pane_id = PaneId(next_pane_id);
-            next_pane_id = next_pane_id
-                .checked_add(1)
-                .expect("pane id overflow (u64 exhausted)");
-            let session_id = SessionId(next_session_id);
-            next_session_id = next_session_id
-                .checked_add(1)
-                .expect("session id overflow (u64 exhausted)");
+            let pane_id = ids.new_pane();
+            let session_id = ids.new_session();
             let viewport = layouts[spec_index];
             let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
             let shell = spec.command.resolve();
@@ -945,8 +942,7 @@ impl AppState {
             modifiers: ModifiersState::empty(),
             last_mouse_pos: None,
             pending_resize: None,
-            next_pane_id,
-            next_session_id,
+            ids,
         })
     }
 
@@ -969,25 +965,17 @@ impl AppState {
             .expect("session for pane not found")
     }
 
-    /// M12-1: 재사용 금지 monotonic counter. M12-3에서 Session 추출 시 활용.
-    #[allow(dead_code)]
-    fn allocate_pane_id(&mut self) -> PaneId {
-        let id = PaneId(self.next_pane_id);
-        self.next_pane_id = self
-            .next_pane_id
-            .checked_add(1)
-            .expect("pane id overflow (u64 exhausted)");
-        id
+    /// M12-6 design §5: 마우스 hit-test로 PaneId 반환. click site에서 idx 거치지 않고 사용.
+    fn pane_at_mouse(&self, include_status_row: bool) -> Option<PaneId> {
+        self.pane_index_at_mouse(include_status_row)
+            .map(|idx| self.panes[idx].id)
     }
 
+    /// M12-6 design §5: 마우스 hit-test로 SessionId 반환. pane_at_mouse → SessionId 매핑.
     #[allow(dead_code)]
-    fn allocate_session_id(&mut self) -> SessionId {
-        let id = SessionId(self.next_session_id);
-        self.next_session_id = self
-            .next_session_id
-            .checked_add(1)
-            .expect("session id overflow (u64 exhausted)");
-        id
+    fn session_at_mouse(&self, include_status_row: bool) -> Option<SessionId> {
+        self.pane_index_at_mouse(include_status_row)
+            .map(|idx| self.panes[idx].session)
     }
 
     /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
