@@ -77,14 +77,16 @@ pub(super) enum RatioDirection {
 impl Layout {
     pub(super) fn from_initial_panes(panes: &[PaneId]) -> Self {
         match panes {
-            [single] => Self::Pane(*single),
-            [first, second] => Self::Split {
-                axis: SplitAxis::Vertical,
-                ratio: SplitRatio::half(),
-                primary: Box::new(Self::Pane(*first)),
-                secondary: Box::new(Self::Pane(*second)),
-            },
-            _ => panic!("initial layout currently supports one or two panes"),
+            [] => panic!("initial layout requires at least one pane"),
+            [first, rest @ ..] => {
+                rest.iter()
+                    .fold(Self::Pane(*first), |layout, pane| Self::Split {
+                        axis: SplitAxis::Vertical,
+                        ratio: SplitRatio::half(),
+                        primary: Box::new(layout),
+                        secondary: Box::new(Self::Pane(*pane)),
+                    })
+            }
         }
     }
 
@@ -628,6 +630,16 @@ mod tests {
                 secondary: Box::new(Layout::Pane(PaneId(2))),
             }
         );
+    }
+
+    #[test]
+    fn initial_layout_three_panes_uses_vertical_spine() {
+        let root = Layout::from_initial_panes(&[PaneId(1), PaneId(2), PaneId(3)]);
+        let viewports = compute_viewports(&root, PhysicalSize::new(120, 80), cell());
+
+        assert_eq!(root.pane_order(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+        assert_eq!(viewports.len(), 3);
+        assert!(viewports[&PaneId(3)].col_offset > viewports[&PaneId(2)].col_offset);
     }
 
     #[test]
