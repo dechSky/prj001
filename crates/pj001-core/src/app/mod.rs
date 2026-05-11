@@ -1,6 +1,8 @@
 pub mod event;
 mod input;
+mod session;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +20,7 @@ use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
 use event::{PaneId, SessionId, UserEvent};
+use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
 const CURSOR_BLINK_MS: u64 = 500;
@@ -224,14 +227,12 @@ struct App {
 
 struct Pane {
     id: PaneId,
-    title: String,
-    pty: PtyHandle,
-    term: Arc<Mutex<Term>>,
+    /// M12-3: 어떤 Session을 보여주는가. M14까지 1 Session = 0..1 Pane.
+    session: SessionId,
     cols: usize,
     rows: usize,
     col_offset: usize,
     status_row: Option<usize>,
-    alive: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -250,6 +251,8 @@ struct AppState {
     surface_config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// M12-3: PTY 프로세스 보관. Pane은 SessionId로 참조.
+    sessions: HashMap<SessionId, Session>,
     panes: Vec<Pane>,
     active: PaneId,
     renderer: Renderer,
@@ -374,7 +377,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // M10-3: focus reporting on이면 PTY로 송신. lock drop 후 write.
                 let idx = state.active_index();
                 let send: Option<&[u8]> = {
-                    let term = state.panes[idx].term.lock().unwrap();
+                    let term = state.session_for_pane_idx(idx).term.lock().unwrap();
                     if term.focus_reporting() {
                         Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
                     } else {
@@ -382,7 +385,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 };
                 if let Some(bytes) = send {
-                    if let Err(e) = state.panes[idx].pty.write(bytes) {
+                    if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes) {
                         log::warn!("focus report write: {e}");
                     }
                 }
@@ -432,7 +435,7 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(state.active_index())
                     };
                     if let Some(idx) = target {
-                        if let Ok(mut term) = state.panes[idx].term.lock() {
+                        if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
                             term.scroll_view_by(lines);
                         }
                         state.window.request_redraw();
@@ -451,7 +454,8 @@ impl ApplicationHandler<UserEvent> for App {
                         log::debug!("ime: Commit({:?})", s);
                         state.preedit = None;
                         let idx = state.active_index();
-                        if let Err(e) = state.panes[idx].pty.write(s.as_bytes()) {
+                        if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(s.as_bytes())
+                        {
                             log::warn!("pty write (ime commit): {e}");
                         }
                         state.window.request_redraw();
@@ -509,7 +513,8 @@ impl ApplicationHandler<UserEvent> for App {
                         &event.logical_key
                     {
                         let idx = state.active_index();
-                        let alt = state.panes[idx]
+                        let alt = state
+                            .session_for_pane_idx(idx)
                             .term
                             .lock()
                             .map(|t| t.is_alt_screen())
@@ -519,7 +524,7 @@ impl ApplicationHandler<UserEvent> for App {
                             log_page_dispatch_once("PTY (alt screen)");
                         } else {
                             // main screen: scrollback view 스크롤. PTY 안 보냄.
-                            if let Ok(mut term) = state.panes[idx].term.lock() {
+                            if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
                                 let page = term.rows().saturating_sub(1).max(1) as isize;
                                 let delta = if matches!(named, NamedKey::PageUp) {
                                     page
@@ -537,7 +542,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
                 if event.state == ElementState::Pressed {
                     let idx = state.active_index();
-                    if let Ok(mut term) = state.panes[idx].term.lock() {
+                    if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
                         if term.view_offset() > 0 {
                             term.snap_to_bottom();
                             state.window.request_redraw();
@@ -547,7 +552,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // single lock snapshot (advisor 가이드).
                 let idx = state.active_index();
                 let mode = {
-                    let term = state.panes[idx].term.lock().unwrap();
+                    let term = state.session_for_pane_idx(idx).term.lock().unwrap();
                     input::InputMode {
                         cursor_keys_application: term.cursor_keys_application(),
                         alt_screen: term.is_alt_screen(),
@@ -555,7 +560,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 };
                 if let Some(bytes) = input::encode_key(&event, mode) {
-                    if let Err(e) = state.panes[idx].pty.write(&bytes) {
+                    if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(&bytes) {
                         log::warn!("pty write: {e}");
                     }
                 }
@@ -608,18 +613,24 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ChildExited { pane, code } => {
                 log::info!("pane {} child exited (code={code})", pane.0);
                 if let Some(state) = &mut self.state {
-                    state.emit_lifecycle(LifecycleEvent::SessionExited {
-                        session_id: SessionId(pane.0),
-                        code,
-                    });
+                    let session_id = state.session_id_for_pane(pane);
+                    if let Some(sid) = session_id {
+                        state.emit_lifecycle(LifecycleEvent::SessionExited {
+                            session_id: sid,
+                            code,
+                        });
+                    }
                     if state.panes.len() <= 1 {
                         event_loop.exit();
-                    } else if let Some(p) = state.panes.iter_mut().find(|p| p.id == pane) {
-                        p.alive = false;
-                        if state.panes.iter().all(|p| !p.alive) {
+                    } else if let Some(sid) = session_id {
+                        if let Some(s) = state.sessions.get_mut(&sid) {
+                            s.alive = false;
+                            s.exit_code = Some(code);
+                        }
+                        if state.all_sessions_dead() {
                             event_loop.exit();
                         } else if state.active == pane {
-                            if let Some(next) = state.panes.iter().find(|p| p.alive).map(|p| p.id) {
+                            if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
                         }
@@ -632,12 +643,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(state) = &mut self.state {
                     if state.panes.len() <= 1 {
                         event_loop.exit();
-                    } else if let Some(p) = state.panes.iter_mut().find(|p| p.id == pane) {
-                        p.alive = false;
-                        if state.panes.iter().all(|p| !p.alive) {
+                    } else if let Some(sid) = state.session_id_for_pane(pane) {
+                        if let Some(s) = state.sessions.get_mut(&sid) {
+                            s.alive = false;
+                        }
+                        if state.all_sessions_dead() {
                             event_loop.exit();
                         } else if state.active == pane {
-                            if let Some(next) = state.panes.iter().find(|p| p.alive).map(|p| p.id) {
+                            if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
                         }
@@ -666,8 +679,9 @@ impl AppState {
 
         let col = (pos.x / cell.width as f64).floor() as usize;
         let row = (pos.y / cell.height as f64).floor() as usize;
+        let sessions = &self.sessions;
         self.panes.iter().position(|pane| {
-            if !pane.alive {
+            if !sessions.get(&pane.session).map(|s| s.alive).unwrap_or(false) {
                 return false;
             }
             let col_start = pane.col_offset;
@@ -681,8 +695,33 @@ impl AppState {
         })
     }
 
+    /// M12-3: 모든 session이 dead면 true.
+    fn all_sessions_dead(&self) -> bool {
+        let sessions = &self.sessions;
+        self.panes
+            .iter()
+            .all(|p| !sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
+    }
+
+    /// M12-3: 다음 alive pane을 찾음.
+    fn next_alive_pane_id(&self) -> Option<PaneId> {
+        let sessions = &self.sessions;
+        self.panes
+            .iter()
+            .find(|p| sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
+            .map(|p| p.id)
+    }
+
+    /// M12-3: PaneId → SessionId 매핑.
+    fn session_id_for_pane(&self, pane: PaneId) -> Option<SessionId> {
+        self.panes.iter().find(|p| p.id == pane).map(|p| p.session)
+    }
+
     fn set_active(&mut self, id: PaneId) {
-        let Some(new_idx) = self.panes.iter().position(|p| p.id == id && p.alive) else {
+        let sessions = &self.sessions;
+        let Some(new_idx) = self.panes.iter().position(|p| {
+            p.id == id && sessions.get(&p.session).map(|s| s.alive).unwrap_or(false)
+        }) else {
             return;
         };
         if self.active == id {
@@ -695,29 +734,29 @@ impl AppState {
             self.send_focus_report(new_idx, true);
         }
 
-        if let Some(pane) = self.panes.get(new_idx) {
-            self.active = id;
-            self.window.set_title(&format!("{} — pj001", pane.title));
-            self.cursor_visible = true;
-            self.last_ime_cursor = None;
-            self.preedit = None;
-            self.window.request_redraw();
-        }
+        let title = self.session_for_pane_idx(new_idx).title.clone();
+        self.active = id;
+        self.window.set_title(&format!("{} — pj001", title));
+        self.cursor_visible = true;
+        self.last_ime_cursor = None;
+        self.preedit = None;
+        self.window.request_redraw();
     }
 
     fn send_focus_report(&mut self, idx: usize, focused: bool) {
-        let Some(pane) = self.panes.get_mut(idx) else {
+        if idx >= self.panes.len() {
             return;
-        };
-        let send = pane
+        }
+        let session = self.session_for_pane_idx_mut(idx);
+        let send = session
             .term
             .lock()
             .map(|term| term.focus_reporting())
             .unwrap_or(false);
         if send {
             let bytes: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
-            if let Err(e) = pane.pty.write(bytes) {
-                log::warn!("focus report write (pane {}): {e}", pane.id.0);
+            if let Err(e) = session.pty.write(bytes) {
+                log::warn!("focus report write (session {}): {e}", session.id.0);
             }
         }
     }
@@ -786,19 +825,25 @@ impl AppState {
         );
 
         let mut panes = Vec::new();
+        let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         let hooks = config.hooks.clone();
-        let sessions = config.pane_specs()?;
-        let layouts = pane_layouts(size, renderer.cell_metrics(), sessions.len());
+        let pane_specs = config.pane_specs()?;
+        let layouts = pane_layouts(size, renderer.cell_metrics(), pane_specs.len());
         let mut next_pane_id: u64 = 0;
-        for (idx, session) in sessions.into_iter().enumerate() {
-            let id = PaneId(next_pane_id);
+        let mut next_session_id: u64 = 0;
+        for (spec_index, spec) in pane_specs.into_iter().enumerate() {
+            let pane_id = PaneId(next_pane_id);
             next_pane_id = next_pane_id
                 .checked_add(1)
                 .expect("pane id overflow (u64 exhausted)");
-            let layout = layouts[idx];
+            let session_id = SessionId(next_session_id);
+            next_session_id = next_session_id
+                .checked_add(1)
+                .expect("session id overflow (u64 exhausted)");
+            let layout = layouts[spec_index];
             let term = Arc::new(Mutex::new(Term::new(layout.cols, layout.rows)));
-            let shell = session.command.resolve();
-            log::info!("pane {} shell: {}", id.0, shell);
+            let shell = spec.command.resolve();
+            log::info!("pane {} shell: {}", pane_id.0, shell);
             let pty = PtyHandle::spawn(
                 &shell,
                 PtySize {
@@ -809,23 +854,33 @@ impl AppState {
                 },
                 term.clone(),
                 proxy.clone(),
-                id,
+                pane_id,
             )?;
-            let title = session.title;
+            let title = spec.title;
+            sessions.insert(
+                session_id,
+                Session {
+                    id: session_id,
+                    title: title.clone(),
+                    command: shell,
+                    pty,
+                    term,
+                    alive: true,
+                    exit_code: None,
+                    created_at: Instant::now(),
+                },
+            );
             panes.push(Pane {
-                id,
-                title: title.clone(),
-                pty,
-                term,
+                id: pane_id,
+                session: session_id,
                 cols: layout.cols,
                 rows: layout.rows,
                 col_offset: layout.col_offset,
                 status_row: layout.status_row,
-                alive: true,
             });
             if let Some(sink) = &hooks.lifecycle_sink {
                 sink.on_lifecycle(LifecycleEvent::SessionStarted {
-                    session_id: SessionId(id.0),
+                    session_id,
                     title,
                 });
             }
@@ -837,6 +892,7 @@ impl AppState {
             surface_config,
             device,
             queue,
+            sessions,
             panes,
             active: PaneId::first(),
             renderer,
@@ -851,8 +907,27 @@ impl AppState {
             last_mouse_pos: None,
             pending_resize: None,
             next_pane_id,
-            next_session_id: 0,
+            next_session_id,
         })
+    }
+
+    /// M12-3: pane index → Session lookup. borrow scope 짧게 유지하기 위해 SessionId만 복사.
+    fn session_id_for_pane_idx(&self, idx: usize) -> SessionId {
+        self.panes[idx].session
+    }
+
+    /// M12-3: pane index → Session (immutable).
+    fn session_for_pane_idx(&self, idx: usize) -> &Session {
+        let session_id = self.session_id_for_pane_idx(idx);
+        &self.sessions[&session_id]
+    }
+
+    /// M12-3: pane index → Session (mutable). lookup이 panes/sessions 동시 borrow가 아니라 두 단계.
+    fn session_for_pane_idx_mut(&mut self, idx: usize) -> &mut Session {
+        let session_id = self.session_id_for_pane_idx(idx);
+        self.sessions
+            .get_mut(&session_id)
+            .expect("session for pane not found")
     }
 
     /// M12-1: 재사용 금지 monotonic counter. M12-3에서 Session 추출 시 활용.
@@ -890,13 +965,14 @@ impl AppState {
         }
         let idx = self.active_index();
         // scrollback view 활성 시 paste는 bottom으로 snap.
-        if let Ok(mut term) = self.panes[idx].term.lock() {
+        if let Ok(mut term) = self.session_for_pane_idx(idx).term.lock() {
             if term.view_offset() > 0 {
                 term.snap_to_bottom();
                 self.window.request_redraw();
             }
         }
-        let bracketed = self.panes[idx]
+        let bracketed = self
+            .session_for_pane_idx(idx)
             .term
             .lock()
             .map(|t| t.bracketed_paste())
@@ -907,12 +983,13 @@ impl AppState {
             bracketed,
             text.matches('\n').count() + 1
         );
+        let session = self.session_for_pane_idx_mut(idx);
         if bracketed {
-            let _ = self.panes[idx].pty.write(b"\x1b[200~");
-            let _ = self.panes[idx].pty.write(text.as_bytes());
-            let _ = self.panes[idx].pty.write(b"\x1b[201~");
+            let _ = session.pty.write(b"\x1b[200~");
+            let _ = session.pty.write(text.as_bytes());
+            let _ = session.pty.write(b"\x1b[201~");
         } else {
-            let _ = self.panes[idx].pty.write(text.as_bytes());
+            let _ = session.pty.write(text.as_bytes());
         }
     }
 
@@ -926,15 +1003,20 @@ impl AppState {
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
         let layouts = pane_layouts(size, self.renderer.cell_metrics(), self.panes.len());
-        for (pane, layout) in self.panes.iter_mut().zip(layouts) {
-            pane.cols = layout.cols;
-            pane.rows = layout.rows;
-            pane.col_offset = layout.col_offset;
-            pane.status_row = layout.status_row;
-            if let Ok(mut term) = pane.term.lock() {
+        for idx in 0..self.panes.len() {
+            let layout = layouts[idx];
+            {
+                let pane = &mut self.panes[idx];
+                pane.cols = layout.cols;
+                pane.rows = layout.rows;
+                pane.col_offset = layout.col_offset;
+                pane.status_row = layout.status_row;
+            }
+            let session = self.session_for_pane_idx_mut(idx);
+            if let Ok(mut term) = session.term.lock() {
                 term.resize(layout.cols, layout.rows);
             }
-            let _ = pane.pty.resize(PtySize {
+            let _ = session.pty.resize(PtySize {
                 rows: layout.rows as u16,
                 cols: layout.cols as u16,
                 pixel_width: layout.pixel_width as u16,
@@ -946,15 +1028,17 @@ impl AppState {
 
     fn render(&mut self) {
         // M10-1: vt가 누적한 응답(DSR/DA 등)을 PTY로 송신. lock 잡고 drain → drop → write.
-        for pane in &mut self.panes {
-            let responses: Vec<Vec<u8>> = if let Ok(mut term) = pane.term.lock() {
+        for idx in 0..self.panes.len() {
+            let pane_id = self.panes[idx].id;
+            let session = self.session_for_pane_idx_mut(idx);
+            let responses: Vec<Vec<u8>> = if let Ok(mut term) = session.term.lock() {
                 term.drain_responses()
             } else {
                 Vec::new()
             };
             for resp in responses {
-                if let Err(e) = pane.pty.write(&resp) {
-                    log::warn!("pty response write (pane {}): {e}", pane.id.0);
+                if let Err(e) = session.pty.write(&resp) {
+                    log::warn!("pty response write (pane {}): {e}", pane_id.0);
                 }
             }
         }
@@ -971,10 +1055,16 @@ impl AppState {
 
         self.renderer.begin_terms();
         let active = self.active;
-        for pane in &self.panes {
-            if let Ok(mut term) = pane.term.lock() {
+        let pane_count = self.panes.len();
+        for idx in 0..pane_count {
+            let (pane_id, pane_col_offset, session_id) = {
+                let p = &self.panes[idx];
+                (p.id, p.col_offset, p.session)
+            };
+            let term_arc = self.sessions[&session_id].term.clone();
+            if let Ok(mut term) = term_arc.lock() {
                 let cur = term.cursor();
-                let is_active = pane.id == active;
+                let is_active = pane_id == active;
                 if is_active {
                     self.cursor_blinking_cache = cur.blinking;
                     if let Some(t) = term.take_title_if_changed() {
@@ -1013,14 +1103,14 @@ impl AppState {
                     &term,
                     preedit_for_render,
                     cursor_render,
-                    pane.col_offset,
+                    pane_col_offset,
                     0,
                 );
                 // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
                 if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
                     let cell = self.renderer.cell_metrics();
                     let pos = winit::dpi::PhysicalPosition::<f64>::new(
-                        ((cur.col + pane.col_offset) as u32 * cell.width) as f64,
+                        ((cur.col + pane_col_offset) as u32 * cell.width) as f64,
                         (cur.row as u32 * cell.height) as f64,
                     );
                     let size = winit::dpi::PhysicalSize::<u32>::new(cell.width, cell.height);
@@ -1069,21 +1159,23 @@ impl AppState {
             let Some(status_row) = pane.status_row else {
                 continue;
             };
-            let state = if !pane.alive {
+            let session = &self.sessions[&pane.session];
+            let alive = session.alive;
+            let state = if !alive {
                 "DEAD"
             } else if pane.id == self.active {
                 "ACTIVE"
             } else {
                 "READY"
             };
-            let bg = if !pane.alive {
+            let bg = if !alive {
                 STATUS_DEAD_BG
             } else if pane.id == self.active {
                 STATUS_ACTIVE_BG
             } else {
                 STATUS_INACTIVE_BG
             };
-            let text = format!(" {state} {} ", pane.title);
+            let text = format!(" {state} {} ", session.title);
             self.renderer.append_text_line(
                 &self.queue,
                 &text,
