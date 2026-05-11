@@ -105,10 +105,11 @@ pub trait RouteSink: Send + Sync {
     fn on_route(&self, event: RouteEvent);
 }
 
+/// M12-2: route_sink는 reserved (M16에서 호출됨). 시그니처는 SessionId로 미리 정합.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteEvent {
-    pub from: usize,
-    pub to: Vec<usize>,
+    pub from_session: SessionId,
+    pub to_sessions: Vec<SessionId>,
     pub bytes: Vec<u8>,
 }
 
@@ -118,8 +119,8 @@ pub trait LifecycleSink: Send + Sync {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleEvent {
-    SessionStarted { session: usize, title: String },
-    SessionExited { session: usize, code: i32 },
+    SessionStarted { session_id: SessionId, title: String },
+    SessionExited { session_id: SessionId, code: i32 },
 }
 
 /// Hook trait objects are intentionally ignored for equality. This keeps CLI
@@ -608,7 +609,7 @@ impl ApplicationHandler<UserEvent> for App {
                 log::info!("pane {} child exited (code={code})", pane.0);
                 if let Some(state) = &mut self.state {
                     state.emit_lifecycle(LifecycleEvent::SessionExited {
-                        session: pane.0 as usize,
+                        session_id: SessionId(pane.0),
                         code,
                     });
                     if state.panes.len() <= 1 {
@@ -824,7 +825,7 @@ impl AppState {
             });
             if let Some(sink) = &hooks.lifecycle_sink {
                 sink.on_lifecycle(LifecycleEvent::SessionStarted {
-                    session: idx,
+                    session_id: SessionId(id.0),
                     title,
                 });
             }
