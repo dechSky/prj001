@@ -462,6 +462,10 @@ impl ApplicationHandler<UserEvent> for App {
                 state.pending_resize = Some(size);
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
+            WindowEvent::Occluded(false) => {
+                state.window.request_redraw();
+            }
+            WindowEvent::Occluded(true) => {}
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_mouse_pos = Some(position);
