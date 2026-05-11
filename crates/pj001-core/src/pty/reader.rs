@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::app::event::{PaneId, UserEvent};
+use crate::app::event::{SessionId, UserEvent};
 use crate::grid::Term;
 use crate::vt::TermPerform;
 
@@ -12,7 +12,7 @@ pub fn spawn(
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term>>,
     proxy: EventLoopProxy<UserEvent>,
-    pane: PaneId,
+    session: SessionId,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("pty-reader".into())
@@ -22,7 +22,10 @@ pub fn spawn(
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = proxy.send_event(UserEvent::ChildExited { pane, code: 0 });
+                        let _ = proxy.send_event(UserEvent::SessionExited {
+                            id: session,
+                            code: 0,
+                        });
                         return;
                     }
                     Ok(n) => {
@@ -34,11 +37,11 @@ pub fn spawn(
                             let mut perform = TermPerform::new(&mut term);
                             parser.advance(&mut perform, &buf[..n]);
                         }
-                        let _ = proxy.send_event(UserEvent::Repaint(pane));
+                        let _ = proxy.send_event(UserEvent::SessionRepaint(session));
                     }
                     Err(e) => {
-                        let _ = proxy.send_event(UserEvent::PtyError {
-                            pane,
+                        let _ = proxy.send_event(UserEvent::SessionPtyError {
+                            id: session,
                             message: e.to_string(),
                         });
                         return;

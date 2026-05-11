@@ -604,32 +604,49 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Repaint(pane) => {
-                log::debug!("repaint requested by pane {}", pane.0);
+            UserEvent::SessionRepaint(session_id) => {
+                log::debug!("repaint requested by session {}", session_id.0);
                 if let Some(state) = &self.state {
-                    state.window.request_redraw();
+                    // M12-4 design §3.3: 방어적 lookup. unknown session은 debug log + ignore.
+                    if !state.sessions.contains_key(&session_id) {
+                        log::debug!(
+                            "SessionRepaint for unknown session {:?}, ignore",
+                            session_id
+                        );
+                        return;
+                    }
+                    if state.panes.iter().any(|p| p.session == session_id) {
+                        state.window.request_redraw();
+                    }
                 }
             }
-            UserEvent::ChildExited { pane, code } => {
-                log::info!("pane {} child exited (code={code})", pane.0);
+            UserEvent::SessionExited { id, code } => {
+                log::info!("session {} child exited (code={code})", id.0);
                 if let Some(state) = &mut self.state {
-                    let session_id = state.session_id_for_pane(pane);
-                    if let Some(sid) = session_id {
-                        state.emit_lifecycle(LifecycleEvent::SessionExited {
-                            session_id: sid,
-                            code,
-                        });
+                    if !state.sessions.contains_key(&id) {
+                        log::debug!("SessionExited for unknown session {:?}, ignore", id);
+                        return;
                     }
+                    // Codex v2 권고: 단일 pane exit 분기 전에 session 상태 일관성 먼저.
+                    if let Some(s) = state.sessions.get_mut(&id) {
+                        s.alive = false;
+                        s.exit_code = Some(code);
+                    }
+                    state.emit_lifecycle(LifecycleEvent::SessionExited {
+                        session_id: id,
+                        code,
+                    });
                     if state.panes.len() <= 1 {
                         event_loop.exit();
-                    } else if let Some(sid) = session_id {
-                        if let Some(s) = state.sessions.get_mut(&sid) {
-                            s.alive = false;
-                            s.exit_code = Some(code);
-                        }
+                    } else {
+                        let active_session = state
+                            .panes
+                            .iter()
+                            .find(|p| p.id == state.active)
+                            .map(|p| p.session);
                         if state.all_sessions_dead() {
                             event_loop.exit();
-                        } else if state.active == pane {
+                        } else if active_session == Some(id) {
                             if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
@@ -638,18 +655,28 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::PtyError { pane, message } => {
-                log::error!("pane {} pty error: {message}", pane.0);
+            UserEvent::SessionPtyError { id, message } => {
+                log::error!("session {} pty error: {message}", id.0);
                 if let Some(state) = &mut self.state {
+                    if !state.sessions.contains_key(&id) {
+                        log::debug!("SessionPtyError for unknown session {:?}, ignore", id);
+                        return;
+                    }
+                    // Codex v2 권고: session 상태 일관성 먼저.
+                    if let Some(s) = state.sessions.get_mut(&id) {
+                        s.alive = false;
+                    }
                     if state.panes.len() <= 1 {
                         event_loop.exit();
-                    } else if let Some(sid) = state.session_id_for_pane(pane) {
-                        if let Some(s) = state.sessions.get_mut(&sid) {
-                            s.alive = false;
-                        }
+                    } else {
+                        let active_session = state
+                            .panes
+                            .iter()
+                            .find(|p| p.id == state.active)
+                            .map(|p| p.session);
                         if state.all_sessions_dead() {
                             event_loop.exit();
-                        } else if state.active == pane {
+                        } else if active_session == Some(id) {
                             if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
@@ -854,7 +881,7 @@ impl AppState {
                 },
                 term.clone(),
                 proxy.clone(),
-                pane_id,
+                session_id,
             )?;
             let title = spec.title;
             sessions.insert(
