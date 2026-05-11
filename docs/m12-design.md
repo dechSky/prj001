@@ -1,6 +1,11 @@
 # M12 — Session 추출 (behavior-preserving refactor)
 
-**상태**: 설계 v2 (2026-05-11). 코드 미진입. archive `docs/architecture/m12-m16-pj001-sessions-tabs-bridge-plan.md` §M12를 ancestor로 두고 Codex 2nd opinion(2026-05-11, thread `019e15ef`) blocking 2건 + 권고 5건 반영.
+> **⚠ STALE — 본 파일은 superseded되었습니다 (2026-05-11)**.
+> 정본: archive `docs/architecture/m12-pj001-session-extraction-design.md` v2 통합본.
+> 본 파일은 §0 line 62 sketch에 `kind: AgentKind`가 §2.2 결정(비도입)과 모순, §7.1 test #5/#14/#15도 모순. 모두 정본에서 정리됨.
+> **코드 진입 전 반드시 archive 정본을 참조하세요.** 본 파일 sync는 후속 pj001 세션 책임.
+
+**상태**: 설계 v2 (2026-05-11) — **archive 정본으로 대체됨**. 코드 미진입. archive `docs/architecture/m12-m16-pj001-sessions-tabs-bridge-plan.md` §M12를 ancestor로 두고 Codex 2nd opinion(2026-05-11, thread `019e15ef`) blocking 2건 + 권고 5건 반영.
 **v2 변경 (vs v1, Codex 검토 반영)**: AgentKind는 core에서 제거(plan §2.2 보정 — Claude/Codex variant는 core/archive 분리 원칙 위반), JSON schema v1 유지 명시(내부 Rust 타입만 SessionId), 단계 분해 재정렬(API boundary 별도 step 분리), Ord trait + checked_add + spec_index 변수명, RouteEvent M12 정리 정책 명시, 회귀 시나리오 +9.
 **목적**: "PTY 프로세스"와 "보이는 슬롯"을 분리한다. 외부 동작은 M11과 완전히 동일하다. M13(Layout tree) / M14(Tabs) / M15(AgentKind 활용) / M16(Bridge)의 토대가 되는 자료구조 분리만 수행.
 **범위**: refactor only. 새 UX 없음, 새 단축키 없음, 새 CLI flag 없음.
