@@ -550,7 +550,16 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        if lower == "q" || lower == "w" {
+                        if lower == "w" {
+                            if state.panes.len() <= 1 {
+                                log::info!("cmd+w: exit last pane");
+                                event_loop.exit();
+                            } else {
+                                state.close_active_pane();
+                            }
+                            return;
+                        }
+                        if lower == "q" {
                             log::info!("cmd+{lower}: exit");
                             event_loop.exit();
                             return;
@@ -972,6 +981,39 @@ impl AppState {
         self.apply_layout_viewports();
         self.set_active(new_pane);
         Ok(())
+    }
+
+    fn close_active_pane(&mut self) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        let closing = self.active;
+        if !self.layout_root.close_pane(closing) {
+            log::warn!("close requested for missing active pane {}", closing.0);
+            return;
+        }
+        let Some(idx) = self.panes.iter().position(|p| p.id == closing) else {
+            log::warn!("close requested for missing pane {}", closing.0);
+            return;
+        };
+        let closing_session = self.panes[idx].session;
+        self.panes.remove(idx);
+        self.sessions.remove(&closing_session);
+        self.apply_layout_viewports();
+        if let Some(next) = self.next_alive_pane_id() {
+            self.active = next;
+            self.cursor_visible = true;
+            self.last_ime_cursor = None;
+            self.preedit = None;
+            if let Some(next_idx) = self.panes.iter().position(|p| p.id == next) {
+                if self.focused {
+                    self.send_focus_report(next_idx, true);
+                }
+                let title = self.session_for_pane_idx(next_idx).title.clone();
+                self.window.set_title(&format!("{} — pj001", title));
+            }
+        }
+        self.window.request_redraw();
     }
 
     /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는

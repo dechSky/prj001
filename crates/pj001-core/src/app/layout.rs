@@ -80,6 +80,29 @@ impl Layout {
             }
         }
     }
+
+    pub(super) fn close_pane(&mut self, target: PaneId) -> bool {
+        match self {
+            Self::Pane(_) => false,
+            Self::Split {
+                primary, secondary, ..
+            } => {
+                if primary.is_pane(target) {
+                    *self = (**secondary).clone();
+                    true
+                } else if secondary.is_pane(target) {
+                    *self = (**primary).clone();
+                    true
+                } else {
+                    primary.close_pane(target) || secondary.close_pane(target)
+                }
+            }
+        }
+    }
+
+    fn is_pane(&self, target: PaneId) -> bool {
+        matches!(self, Self::Pane(id) if *id == target)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -387,6 +410,36 @@ mod tests {
         let mut root = Layout::Pane(PaneId(1));
 
         assert!(!root.split_pane(PaneId(99), SplitAxis::Vertical, PaneId(2)));
+        assert_eq!(root, Layout::Pane(PaneId(1)));
+    }
+
+    #[test]
+    fn close_pane_promotes_sibling() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+
+        assert!(root.close_pane(PaneId(1)));
+        assert_eq!(root, Layout::Pane(PaneId(2)));
+    }
+
+    #[test]
+    fn close_pane_finds_nested_target() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+        assert!(root.split_pane(PaneId(2), SplitAxis::Vertical, PaneId(3)));
+
+        assert!(root.close_pane(PaneId(2)));
+        let viewports = compute_viewports(&root, PhysicalSize::new(120, 80), cell());
+
+        assert_eq!(viewports.len(), 2);
+        assert!(viewports.contains_key(&PaneId(1)));
+        assert!(viewports.contains_key(&PaneId(3)));
+    }
+
+    #[test]
+    fn close_pane_rejects_last_or_missing_pane() {
+        let mut root = Layout::Pane(PaneId(1));
+
+        assert!(!root.close_pane(PaneId(1)));
+        assert!(!root.close_pane(PaneId(99)));
         assert_eq!(root, Layout::Pane(PaneId(1)));
     }
 
