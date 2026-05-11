@@ -21,9 +21,9 @@ use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
 use event::{IdAllocator, PaneId, SessionId, UserEvent};
-use layout::Layout;
 #[cfg(test)]
-use layout::{SplitAxis, SplitRatio};
+use layout::SplitRatio;
+use layout::{Layout, SplitAxis};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
@@ -270,6 +270,7 @@ struct PaneViewport {
 
 struct AppState {
     window: Arc<Window>,
+    proxy: EventLoopProxy<UserEvent>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
@@ -536,6 +537,12 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         if lower == "2" {
                             state.set_active(PaneId(1));
+                            return;
+                        }
+                        if lower == "d" {
+                            if let Err(e) = state.split_active_vertical() {
+                                log::warn!("cmd+d split failed: {e}");
+                            }
                             return;
                         }
                         if lower == "q" || lower == "w" {
@@ -863,6 +870,108 @@ impl AppState {
         }
     }
 
+    fn spawn_session_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        spec: SessionSpec,
+        viewport: PaneViewport,
+    ) -> Result<()> {
+        let session_id = self.ids.new_session();
+        let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
+        let shell = spec.command.resolve();
+        log::info!("pane {} shell: {}", pane_id.0, shell);
+        let pty = PtyHandle::spawn(
+            &shell,
+            PtySize {
+                rows: viewport.rows as u16,
+                cols: viewport.cols as u16,
+                pixel_width: viewport.width_px as u16,
+                pixel_height: viewport.height_px as u16,
+            },
+            term.clone(),
+            self.proxy.clone(),
+            session_id,
+        )?;
+        let title = spec.title;
+        self.sessions.insert(
+            session_id,
+            Session {
+                id: session_id,
+                title: title.clone(),
+                command: shell,
+                pty,
+                term,
+                alive: true,
+                exit_code: None,
+                created_at: Instant::now(),
+            },
+        );
+        self.panes.push(Pane {
+            id: pane_id,
+            session: session_id,
+            viewport,
+        });
+        self.emit_lifecycle(LifecycleEvent::SessionStarted { session_id, title });
+        Ok(())
+    }
+
+    fn apply_layout_viewports(&mut self) {
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        let layouts =
+            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
+        for idx in 0..self.panes.len() {
+            let pane_id = self.panes[idx].id;
+            let Some(viewport) = layouts.get(&pane_id).copied() else {
+                log::warn!("layout missing viewport for pane {}", pane_id.0);
+                continue;
+            };
+            let prev = self.panes[idx].viewport;
+            let pty_cell_size_changed = prev.cols != viewport.cols || prev.rows != viewport.rows;
+            self.panes[idx].viewport = viewport;
+            if pty_cell_size_changed {
+                let session = self.session_for_pane_idx_mut(idx);
+                if let Ok(mut term) = session.term.lock() {
+                    term.resize(viewport.cols, viewport.rows);
+                }
+                let _ = session.pty.resize(PtySize {
+                    rows: viewport.rows as u16,
+                    cols: viewport.cols as u16,
+                    pixel_width: viewport.width_px as u16,
+                    pixel_height: viewport.height_px as u16,
+                });
+            }
+        }
+    }
+
+    fn split_active_vertical(&mut self) -> Result<()> {
+        let new_pane = self.ids.new_pane();
+        if !self
+            .layout_root
+            .split_pane(self.active, SplitAxis::Vertical, new_pane)
+        {
+            log::warn!("split requested for missing active pane {}", self.active.0);
+            return Ok(());
+        }
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        let layouts =
+            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
+        let Some(viewport) = layouts.get(&new_pane).copied() else {
+            log::warn!("split produced no viewport for new pane {}", new_pane.0);
+            return Ok(());
+        };
+        self.spawn_session_for_pane(
+            new_pane,
+            SessionSpec {
+                title: "shell".to_string(),
+                command: CommandSpec::Shell,
+            },
+            viewport,
+        )?;
+        self.apply_layout_viewports();
+        self.set_active(new_pane);
+        Ok(())
+    }
+
     /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는
     /// 첫 winit Resized를 받아 그 size를 넘기거나 (preferred), `inner_size()` fallback.
     #[allow(dead_code)]
@@ -999,6 +1108,7 @@ impl AppState {
 
         Ok(Self {
             window,
+            proxy,
             surface,
             surface_config,
             device,
@@ -1261,25 +1371,12 @@ impl AppState {
             return;
         }
 
-        if let Some(divider_col) = self
-            .panes
-            .get(1)
-            .map(|pane| pane.viewport.col_offset.saturating_sub(1))
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        for divider in
+            layout::vertical_dividers(&self.layout_root, size, self.renderer.cell_metrics())
         {
-            let height = self
-                .panes
-                .iter()
-                .filter_map(|pane| pane.viewport.status_row.map(|row| row + 1))
-                .max()
-                .unwrap_or_else(|| {
-                    self.panes
-                        .iter()
-                        .map(|pane| pane.viewport.rows)
-                        .max()
-                        .unwrap_or(0)
-                });
             self.renderer
-                .append_fill_column(divider_col, 0, height, DIVIDER_BG);
+                .append_fill_column(divider.col, divider.row, divider.height, DIVIDER_BG);
         }
 
         for pane in &self.panes {

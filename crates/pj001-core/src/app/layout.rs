@@ -59,6 +59,27 @@ impl Layout {
             _ => panic!("initial layout currently supports one or two panes"),
         }
     }
+
+    pub(super) fn split_pane(&mut self, target: PaneId, axis: SplitAxis, new_pane: PaneId) -> bool {
+        match self {
+            Self::Pane(id) if *id == target => {
+                *self = Self::Split {
+                    axis,
+                    ratio: SplitRatio::half(),
+                    primary: Box::new(Self::Pane(target)),
+                    secondary: Box::new(Self::Pane(new_pane)),
+                };
+                true
+            }
+            Self::Pane(_) => false,
+            Self::Split {
+                primary, secondary, ..
+            } => {
+                primary.split_pane(target, axis, new_pane)
+                    || secondary.split_pane(target, axis, new_pane)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +88,13 @@ struct CellRect {
     row: usize,
     cols: usize,
     rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VerticalDivider {
+    pub col: usize,
+    pub row: usize,
+    pub height: usize,
 }
 
 pub(super) fn compute_viewports(
@@ -88,6 +116,28 @@ pub(super) fn compute_viewports(
     };
     let mut out = HashMap::new();
     resolve(root, rect, status_row, size, cell, &mut out);
+    out
+}
+
+pub(super) fn vertical_dividers(
+    root: &Layout,
+    size: PhysicalSize<u32>,
+    cell: CellMetrics,
+) -> Vec<VerticalDivider> {
+    let raw_rows = (size.height / cell.height).max(1) as usize;
+    let status_row = matches!(root, Layout::Split { .. })
+        .then_some(raw_rows - 1)
+        .filter(|_| raw_rows > 1);
+    let rows = status_row.unwrap_or(raw_rows);
+    let cols = (size.width / cell.width).max(1) as usize;
+    let rect = CellRect {
+        col: 0,
+        row: 0,
+        cols,
+        rows,
+    };
+    let mut out = Vec::new();
+    collect_vertical_dividers(root, rect, &mut out);
     out
 }
 
@@ -173,6 +223,31 @@ fn split_rect(rect: CellRect, axis: SplitAxis, ratio: SplitRatio) -> (CellRect, 
     }
 }
 
+fn collect_vertical_dividers(node: &Layout, rect: CellRect, out: &mut Vec<VerticalDivider>) {
+    match node {
+        Layout::Pane(_) => {}
+        Layout::Split {
+            axis,
+            ratio,
+            primary,
+            secondary,
+        } => {
+            if *axis == SplitAxis::Vertical && rect.cols >= 3 {
+                let content = rect.cols - 1;
+                let primary_cols = ratio.primary_units(content);
+                out.push(VerticalDivider {
+                    col: rect.col + primary_cols,
+                    row: rect.row,
+                    height: rect.rows,
+                });
+            }
+            let (primary_rect, secondary_rect) = split_rect(rect, *axis, *ratio);
+            collect_vertical_dividers(primary, primary_rect, out);
+            collect_vertical_dividers(secondary, secondary_rect, out);
+        }
+    }
+}
+
 fn rect_width_px(rect: CellRect, size: PhysicalSize<u32>, cell: CellMetrics) -> u32 {
     if rect.col == 0 && size.width < cell.width {
         return size.width;
@@ -224,6 +299,41 @@ mod tests {
                 secondary: Box::new(Layout::Pane(PaneId(2))),
             }
         );
+    }
+
+    #[test]
+    fn split_pane_replaces_target_with_split() {
+        let mut root = Layout::Pane(PaneId(1));
+
+        assert!(root.split_pane(PaneId(1), SplitAxis::Vertical, PaneId(2)));
+        assert_eq!(
+            root,
+            Layout::Split {
+                axis: SplitAxis::Vertical,
+                ratio: SplitRatio::half(),
+                primary: Box::new(Layout::Pane(PaneId(1))),
+                secondary: Box::new(Layout::Pane(PaneId(2))),
+            }
+        );
+    }
+
+    #[test]
+    fn split_pane_finds_nested_target() {
+        let mut root = Layout::from_initial_panes(&[PaneId(1), PaneId(2)]);
+
+        assert!(root.split_pane(PaneId(2), SplitAxis::Vertical, PaneId(3)));
+        let viewports = compute_viewports(&root, PhysicalSize::new(120, 80), cell());
+
+        assert_eq!(viewports.len(), 3);
+        assert!(viewports[&PaneId(3)].col_offset > viewports[&PaneId(2)].col_offset);
+    }
+
+    #[test]
+    fn split_pane_returns_false_for_missing_target() {
+        let mut root = Layout::Pane(PaneId(1));
+
+        assert!(!root.split_pane(PaneId(99), SplitAxis::Vertical, PaneId(2)));
+        assert_eq!(root, Layout::Pane(PaneId(1)));
     }
 
     #[test]
@@ -323,5 +433,25 @@ mod tests {
         assert_eq!(viewports[&PaneId(1)].col_offset, 6);
         assert_eq!(viewports[&PaneId(2)].col_offset, 6);
         assert!(viewports[&PaneId(2)].y_px > viewports[&PaneId(1)].y_px);
+    }
+
+    #[test]
+    fn vertical_dividers_include_nested_vertical_split() {
+        let root = Layout::Split {
+            axis: SplitAxis::Vertical,
+            ratio: SplitRatio::half(),
+            primary: Box::new(pane(0)),
+            secondary: Box::new(Layout::Split {
+                axis: SplitAxis::Vertical,
+                ratio: SplitRatio::half(),
+                primary: Box::new(pane(1)),
+                secondary: Box::new(pane(2)),
+            }),
+        };
+        let dividers = vertical_dividers(&root, PhysicalSize::new(120, 80), cell());
+
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(dividers[0].col, 6);
+        assert!(dividers[1].col > dividers[0].col);
     }
 }
