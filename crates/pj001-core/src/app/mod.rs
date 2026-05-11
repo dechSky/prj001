@@ -258,6 +258,7 @@ struct PaneViewport {
     cols: usize,
     rows: usize,
     col_offset: usize,
+    row_offset: usize,
     status_row: Option<usize>,
     /// M13 BSP scissor rect / pixel-단위 hit-test 진입 시 활용. M12에는 PTY size 계산용.
     #[allow(dead_code)]
@@ -358,6 +359,7 @@ fn compute_viewports(
             cols,
             rows: raw_rows,
             col_offset: 0,
+            row_offset: 0,
             status_row: None,
             x_px: 0,
             y_px: 0,
@@ -833,12 +835,12 @@ impl AppState {
             let vp = &pane.viewport;
             let col_start = vp.col_offset;
             let col_end = vp.col_offset + vp.cols;
-            let row_end = if include_status_row {
-                vp.status_row.map(|r| r + 1).unwrap_or(vp.rows)
-            } else {
-                vp.rows
-            };
-            col >= col_start && col < col_end && row < row_end
+            let row_start = vp.row_offset;
+            let row_end = vp.row_offset + vp.rows;
+            let in_content = row >= row_start && row < row_end;
+            let in_status =
+                include_status_row && vp.status_row.is_some_and(|status_row| row == status_row);
+            col >= col_start && col < col_end && (in_content || in_status)
         })
     }
 
@@ -1407,9 +1409,14 @@ impl AppState {
         let active = self.active;
         let pane_count = self.panes.len();
         for idx in 0..pane_count {
-            let (pane_id, pane_col_offset, session_id) = {
+            let (pane_id, pane_col_offset, pane_row_offset, session_id) = {
                 let p = &self.panes[idx];
-                (p.id, p.viewport.col_offset, p.session)
+                (
+                    p.id,
+                    p.viewport.col_offset,
+                    p.viewport.row_offset,
+                    p.session,
+                )
             };
             let term_arc = self.sessions[&session_id].term.clone();
             if let Ok(mut term) = term_arc.lock() {
@@ -1454,14 +1461,14 @@ impl AppState {
                     preedit_for_render,
                     cursor_render,
                     pane_col_offset,
-                    0,
+                    pane_row_offset,
                 );
                 // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
                 if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
                     let cell = self.renderer.cell_metrics();
                     let pos = winit::dpi::PhysicalPosition::<f64>::new(
                         ((cur.col + pane_col_offset) as u32 * cell.width) as f64,
-                        (cur.row as u32 * cell.height) as f64,
+                        ((cur.row + pane_row_offset) as u32 * cell.height) as f64,
                     );
                     let size = winit::dpi::PhysicalSize::<u32>::new(cell.width, cell.height);
                     self.window.set_ime_cursor_area(pos, size);

@@ -289,6 +289,7 @@ fn resolve(
                     cols: rect.cols.max(1),
                     rows: rect.rows.max(1),
                     col_offset: rect.col,
+                    row_offset: rect.row,
                     status_row,
                     x_px: rect.col as u32 * cell.width,
                     y_px: rect.row as u32 * cell.height,
@@ -580,6 +581,7 @@ mod tests {
         assert_eq!(vp.cols, 10);
         assert_eq!(vp.rows, 4);
         assert_eq!(vp.col_offset, 0);
+        assert_eq!(vp.row_offset, 0);
         assert_eq!(vp.status_row, None);
         assert_eq!(vp.width_px, 100);
         assert_eq!(vp.height_px, 80);
@@ -644,8 +646,10 @@ mod tests {
         let viewports = compute_viewports(&root, PhysicalSize::new(100, 120), cell());
 
         assert_eq!(viewports[&PaneId(0)].rows, 2);
+        assert_eq!(viewports[&PaneId(0)].row_offset, 0);
         assert_eq!(viewports[&PaneId(0)].y_px, 0);
         assert_eq!(viewports[&PaneId(1)].rows, 2);
+        assert_eq!(viewports[&PaneId(1)].row_offset, 3);
         assert_eq!(viewports[&PaneId(1)].y_px, 60);
     }
 
@@ -668,6 +672,7 @@ mod tests {
         assert_eq!(viewports[&PaneId(0)].cols, 5);
         assert_eq!(viewports[&PaneId(1)].col_offset, 6);
         assert_eq!(viewports[&PaneId(2)].col_offset, 6);
+        assert!(viewports[&PaneId(2)].row_offset > viewports[&PaneId(1)].row_offset);
         assert!(viewports[&PaneId(2)].y_px > viewports[&PaneId(1)].y_px);
     }
 
