@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
-use event::{PaneId, UserEvent};
+use event::{PaneId, SessionId, UserEvent};
 
 const FONT_SIZE: f32 = 14.0;
 const CURSOR_BLINK_MS: u64 = 500;
@@ -264,6 +264,9 @@ struct AppState {
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
     pending_resize: Option<PhysicalSize<u32>>,
+    /// M12-1: 재사용 금지 monotonic counter. M12-3에서 Session 추출 시 활용.
+    next_pane_id: u64,
+    next_session_id: u64,
 }
 
 impl App {
@@ -605,7 +608,7 @@ impl ApplicationHandler<UserEvent> for App {
                 log::info!("pane {} child exited (code={code})", pane.0);
                 if let Some(state) = &mut self.state {
                     state.emit_lifecycle(LifecycleEvent::SessionExited {
-                        session: pane.0,
+                        session: pane.0 as usize,
                         code,
                     });
                     if state.panes.len() <= 1 {
@@ -785,8 +788,12 @@ impl AppState {
         let hooks = config.hooks.clone();
         let sessions = config.pane_specs()?;
         let layouts = pane_layouts(size, renderer.cell_metrics(), sessions.len());
+        let mut next_pane_id: u64 = 0;
         for (idx, session) in sessions.into_iter().enumerate() {
-            let id = PaneId(idx);
+            let id = PaneId(next_pane_id);
+            next_pane_id = next_pane_id
+                .checked_add(1)
+                .expect("pane id overflow (u64 exhausted)");
             let layout = layouts[idx];
             let term = Arc::new(Mutex::new(Term::new(layout.cols, layout.rows)));
             let shell = session.command.resolve();
@@ -842,7 +849,30 @@ impl AppState {
             modifiers: ModifiersState::empty(),
             last_mouse_pos: None,
             pending_resize: None,
+            next_pane_id,
+            next_session_id: 0,
         })
+    }
+
+    /// M12-1: 재사용 금지 monotonic counter. M12-3에서 Session 추출 시 활용.
+    #[allow(dead_code)]
+    fn allocate_pane_id(&mut self) -> PaneId {
+        let id = PaneId(self.next_pane_id);
+        self.next_pane_id = self
+            .next_pane_id
+            .checked_add(1)
+            .expect("pane id overflow (u64 exhausted)");
+        id
+    }
+
+    #[allow(dead_code)]
+    fn allocate_session_id(&mut self) -> SessionId {
+        let id = SessionId(self.next_session_id);
+        self.next_session_id = self
+            .next_session_id
+            .checked_add(1)
+            .expect("session id overflow (u64 exhausted)");
+        id
     }
 
     /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
