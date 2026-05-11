@@ -122,8 +122,14 @@ pub trait LifecycleSink: Send + Sync {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleEvent {
-    SessionStarted { session_id: SessionId, title: String },
-    SessionExited { session_id: SessionId, code: i32 },
+    SessionStarted {
+        session_id: SessionId,
+        title: String,
+    },
+    SessionExited {
+        session_id: SessionId,
+        code: i32,
+    },
 }
 
 /// Hook trait objects are intentionally ignored for equality. This keeps CLI
@@ -354,10 +360,27 @@ fn compute_viewports(
 
     let status_row = (raw_rows > 1).then_some(raw_rows - 1);
     let rows = status_row.unwrap_or(raw_rows);
-    let total_cols = (size.width / cell.width).max(3) as usize;
-    let divider_cols = 1usize;
-    let left_cols = (total_cols / 2).max(1);
-    let right_cols = total_cols.saturating_sub(left_cols + divider_cols).max(1);
+    let physical_cols = (size.width / cell.width) as usize;
+    let total_cols = physical_cols.max(1);
+    let divider_cols = usize::from(total_cols >= 3);
+    let content_cols = total_cols.saturating_sub(divider_cols);
+    let left_cols = content_cols.div_ceil(2).max(1);
+    let right_cols = content_cols.saturating_sub(left_cols).max(1);
+    let right_offset = if physical_cols <= 1 {
+        0
+    } else {
+        left_cols + divider_cols
+    };
+    let left_width_px = if physical_cols == 0 {
+        size.width
+    } else {
+        left_cols as u32 * cell.width
+    };
+    let right_width_px = if physical_cols == 0 {
+        size.width
+    } else {
+        right_cols as u32 * cell.width
+    };
     let row_height_px = rows as u32 * cell.height;
     vec![
         PaneViewport {
@@ -367,17 +390,17 @@ fn compute_viewports(
             status_row,
             x_px: 0,
             y_px: 0,
-            width_px: left_cols as u32 * cell.width,
+            width_px: left_width_px,
             height_px: row_height_px,
         },
         PaneViewport {
             cols: right_cols,
             rows,
-            col_offset: left_cols + divider_cols,
+            col_offset: right_offset,
             status_row,
-            x_px: (left_cols + divider_cols) as u32 * cell.width,
+            x_px: right_offset as u32 * cell.width,
             y_px: 0,
-            width_px: right_cols as u32 * cell.width,
+            width_px: right_width_px,
             height_px: row_height_px,
         },
     ]
@@ -774,7 +797,11 @@ impl AppState {
         let row = (pos.y / cell.height as f64).floor() as usize;
         let sessions = &self.sessions;
         self.panes.iter().position(|pane| {
-            if !sessions.get(&pane.session).map(|s| s.alive).unwrap_or(false) {
+            if !sessions
+                .get(&pane.session)
+                .map(|s| s.alive)
+                .unwrap_or(false)
+            {
                 return false;
             }
             let vp = &pane.viewport;
@@ -815,9 +842,11 @@ impl AppState {
 
     fn set_active(&mut self, id: PaneId) {
         let sessions = &self.sessions;
-        let Some(new_idx) = self.panes.iter().position(|p| {
-            p.id == id && sessions.get(&p.session).map(|s| s.alive).unwrap_or(false)
-        }) else {
+        let Some(new_idx) = self
+            .panes
+            .iter()
+            .position(|p| p.id == id && sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
+        else {
             return;
         };
         if self.active == id {
@@ -989,10 +1018,7 @@ impl AppState {
                 viewport,
             });
             if let Some(sink) = &hooks.lifecycle_sink {
-                sink.on_lifecycle(LifecycleEvent::SessionStarted {
-                    session_id,
-                    title,
-                });
+                sink.on_lifecycle(LifecycleEvent::SessionStarted { session_id, title });
             }
         }
 
@@ -1123,8 +1149,7 @@ impl AppState {
             // col_offset/status_row/pixel 크기는 visual layout/chrome 값이라 이걸 trigger로
             // pty.resize를 보내면 rows/cols가 같아도 SIGWINCH가 발생할 수 있다.
             // split startup 직후 col_offset/status_row 차이가 zsh duplicate prompt 유발.
-            let pty_cell_size_changed =
-                prev.cols != viewport.cols || prev.rows != viewport.rows;
+            let pty_cell_size_changed = prev.cols != viewport.cols || prev.rows != viewport.rows;
             // viewport visual/pixel 값은 surface size 변경 시 달라질 수 있으므로 항상 갱신.
             // M12-5 mutation 단일 진입점 — 전체 struct 교체만 허용.
             self.panes[idx].viewport = viewport;
@@ -1365,10 +1390,30 @@ mod tests {
         assert_eq!(layouts.len(), 2);
         assert_eq!(layouts[0].cols, 1);
         assert_eq!(layouts[1].cols, 1);
+        assert_eq!(layouts[0].col_offset, 0);
+        assert_eq!(layouts[1].col_offset, 0);
+        assert_eq!(layouts[0].x_px, 0);
+        assert_eq!(layouts[1].x_px, 0);
+        assert_eq!(layouts[0].width_px, 1);
+        assert_eq!(layouts[1].width_px, 1);
         assert_eq!(layouts[0].rows, 1);
         assert_eq!(layouts[1].rows, 1);
         assert_eq!(layouts[0].status_row, None);
         assert_eq!(layouts[1].status_row, None);
+    }
+
+    #[test]
+    fn compute_viewports_split_uses_no_divider_when_only_two_columns_fit() {
+        let layouts = compute_viewports(PhysicalSize::new(20, 80), cell(), 2);
+
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].cols, 1);
+        assert_eq!(layouts[0].col_offset, 0);
+        assert_eq!(layouts[1].cols, 1);
+        assert_eq!(layouts[1].col_offset, 1);
+        assert_eq!(layouts[1].x_px, 10);
+        assert_eq!(layouts[0].col_offset + layouts[0].cols, 1);
+        assert_eq!(layouts[1].col_offset + layouts[1].cols, 2);
     }
 
     #[test]
