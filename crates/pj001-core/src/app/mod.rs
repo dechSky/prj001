@@ -559,12 +559,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if let Key::Character(s) = &event.logical_key {
                         let lower = s.to_lowercase();
-                        if lower == "1" {
-                            state.set_active(PaneId(0));
-                            return;
-                        }
-                        if lower == "2" {
-                            state.set_active(PaneId(1));
+                        if let Some(ordinal) = lower
+                            .chars()
+                            .next()
+                            .and_then(|ch| ch.to_digit(10))
+                            .filter(|digit| (1..=9).contains(digit))
+                        {
+                            state.focus_pane_by_ordinal(ordinal as usize);
                             return;
                         }
                         if lower == "[" {
@@ -1078,6 +1079,17 @@ impl AppState {
                 return;
             }
         }
+    }
+
+    fn focus_pane_by_ordinal(&mut self, ordinal: usize) {
+        if ordinal == 0 {
+            return;
+        }
+        let order = self.layout_root.pane_order();
+        let Some(candidate) = order.get(ordinal - 1).copied() else {
+            return;
+        };
+        self.set_active(candidate);
     }
 
     fn adjust_active_split(&mut self, axis: SplitAxis, direction: RatioDirection) -> bool {
