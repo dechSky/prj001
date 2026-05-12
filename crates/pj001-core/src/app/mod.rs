@@ -325,6 +325,10 @@ fn tab_text(title: &str, cols: usize) -> String {
     }
 }
 
+fn tab_label(index: usize, title: &str) -> String {
+    format!("{} {}", index + 1, title)
+}
+
 fn ordinal_from_digit_key(
     lower: Option<&str>,
     physical_code: Option<winit::keyboard::KeyCode>,
@@ -1109,6 +1113,10 @@ impl AppState {
             .position(|tab| tab.panes.iter().any(|pane| pane.session == session_id))
     }
 
+    fn sync_active_tab_title(&mut self, title: String) {
+        self.active_tab_mut().title = title;
+    }
+
     fn set_active(&mut self, id: PaneId) {
         let sessions = &self.sessions;
         let Some(new_idx) =
@@ -1130,6 +1138,7 @@ impl AppState {
 
         let title = self.session_for_pane_idx(new_idx).title.clone();
         self.active_tab_mut().active = id;
+        self.sync_active_tab_title(title.clone());
         self.window.set_title(&format!("{} — pj001", title));
         self.cursor_visible = true;
         self.last_ime_cursor = None;
@@ -1281,10 +1290,9 @@ impl AppState {
         let viewport = layouts[&pane_id];
         let previous_tab = self.active_tab;
         let previous_idx = self.active_index();
-        let title = format!("{}", self.tabs.len() + 1);
         self.tabs.push(Tab {
             id: tab_id,
-            title,
+            title: "shell".to_string(),
             panes: Vec::new(),
             root,
             active: pane_id,
@@ -1311,6 +1319,7 @@ impl AppState {
         }
         self.update_min_inner_size();
         let title = self.session_for_pane_idx(0).title.clone();
+        self.sync_active_tab_title(title.clone());
         self.window.set_title(&format!("{} — pj001", title));
         self.cursor_visible = true;
         self.last_ime_cursor = None;
@@ -1337,6 +1346,7 @@ impl AppState {
             self.send_focus_report(new_idx, true);
         }
         let title = self.session_for_pane_idx(new_idx).title.clone();
+        self.sync_active_tab_title(title.clone());
         self.window.set_title(&format!("{} — pj001", title));
         self.cursor_visible = true;
         self.last_ime_cursor = None;
@@ -1381,6 +1391,7 @@ impl AppState {
         self.update_min_inner_size();
         let active_idx = self.active_index();
         let title = self.session_for_pane_idx(active_idx).title.clone();
+        self.sync_active_tab_title(title.clone());
         self.window.set_title(&format!("{} — pj001", title));
         self.cursor_visible = true;
         self.last_ime_cursor = None;
@@ -1659,7 +1670,11 @@ impl AppState {
         let tab_id = ids.new_tab();
         let tab = Tab {
             id: tab_id,
-            title: "1".to_string(),
+            title: panes
+                .first()
+                .and_then(|pane| sessions.get(&pane.session))
+                .map(|session| session.title.clone())
+                .unwrap_or_else(|| "shell".to_string()),
             panes,
             root: layout_root,
             active: PaneId::first(),
@@ -1951,6 +1966,10 @@ impl AppState {
                 if is_active {
                     self.cursor_blinking_cache = cur.blinking;
                     if let Some(t) = term.take_title_if_changed() {
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.title = t.clone();
+                        }
+                        self.sync_active_tab_title(t.clone());
                         self.window.set_title(&format!("{} — pj001", t));
                     }
                 }
@@ -2038,7 +2057,8 @@ impl AppState {
             } else {
                 TAB_INACTIVE_BG
             };
-            let text = tab_text(&tab.title, segment_cols);
+            let label = tab_label(idx, &tab.title);
+            let text = tab_text(&label, segment_cols);
             self.renderer.append_text_line(
                 &self.queue,
                 &text,
@@ -2248,6 +2268,12 @@ mod tests {
         assert_eq!(tab_text("1", 3), " 1 ");
         assert_eq!(tab_text("10", 3), " 1");
         assert_eq!(tab_text("10", 1), "");
+    }
+
+    #[test]
+    fn tab_label_prefixes_one_based_index() {
+        assert_eq!(tab_label(0, "shell"), "1 shell");
+        assert_eq!(tab_label(2, "Codex"), "3 Codex");
     }
 
     #[test]
