@@ -20,12 +20,16 @@ impl PaneId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TabId(pub u64);
+
 /// M12-6: design §2.1 정합. ID 재사용 금지 monotonic counter.
 /// AppState가 보유하던 raw next_*_id 필드 + allocate_* 메서드를 한 struct로 묶음.
 #[derive(Debug, Default)]
 pub struct IdAllocator {
     next_pane: u64,
     next_session: u64,
+    next_tab: u64,
 }
 
 impl IdAllocator {
@@ -46,6 +50,15 @@ impl IdAllocator {
             .expect("session id overflow (u64 exhausted)");
         id
     }
+
+    pub fn new_tab(&mut self) -> TabId {
+        let id = TabId(self.next_tab);
+        self.next_tab = self
+            .next_tab
+            .checked_add(1)
+            .expect("tab id overflow (u64 exhausted)");
+        id
+    }
 }
 
 #[cfg(test)]
@@ -57,6 +70,7 @@ mod tests {
         let mut ids = IdAllocator::default();
         assert_eq!(ids.new_pane(), PaneId(0));
         assert_eq!(ids.new_session(), SessionId(0));
+        assert_eq!(ids.new_tab(), TabId(0));
     }
 
     #[test]
@@ -71,6 +85,9 @@ mod tests {
         // session counter는 pane counter와 독립.
         assert_eq!(ids.new_session(), SessionId(0));
         assert_eq!(ids.new_session(), SessionId(1));
+        // tab counter도 독립.
+        assert_eq!(ids.new_tab(), TabId(0));
+        assert_eq!(ids.new_tab(), TabId(1));
     }
 
     #[test]
@@ -84,6 +101,10 @@ mod tests {
         for _ in 0..1024 {
             assert!(seen.insert(ids.new_session()));
         }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            assert!(seen.insert(ids.new_tab()));
+        }
     }
 
     #[test]
@@ -92,5 +113,9 @@ mod tests {
         let mut v = vec![SessionId(3), SessionId(1), SessionId(2)];
         v.sort();
         assert_eq!(v, vec![SessionId(1), SessionId(2), SessionId(3)]);
+
+        let mut v = vec![TabId(3), TabId(1), TabId(2)];
+        v.sort();
+        assert_eq!(v, vec![TabId(1), TabId(2), TabId(3)]);
     }
 }

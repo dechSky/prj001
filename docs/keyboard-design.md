@@ -449,10 +449,15 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | 조합 | 정책 | 이유 |
 |---|---|---|
 | **Cmd+Q** | 앱 종료 (`event_loop.exit()`) | macOS 표준 |
-| **Cmd+W** | 앱 종료 (single-window 앱이라 같은 의미) | macOS 표준. 추후 multi-window 시 분리 |
+| **Cmd+W** | active pane 닫기. active tab에 pane이 1개면 tab 닫기. 마지막 tab이면 앱 종료 | M14 tabs 정책 |
+| **Cmd+Shift+W** | 현재 tab 강제 닫기. 마지막 tab이면 앱 종료 | M14 tabs 정책 |
 | **Cmd+C** | swallow (PTY 안 보냄). clipboard 미구현 명시 | M11+ clipboard task |
 | **Cmd+V** | **clipboard paste** (arboard로 읽어 PTY 송신, bracketed paste mode면 `\e[200~`...`\e[201~` wrap). M10-6에서 구현 (2026-05-08) | 일상 사용 필수 |
-| **Cmd+T** | swallow. tab 미구현 | 미지원 |
+| **Cmd+T** | 새 tab 생성 | M14 tabs |
+| **Cmd+1..9** | n번째 tab 전환 | M14 tabs |
+| **Cmd+Option+1..9** | active tab 안 n번째 pane 전환 | `Cmd+Shift+숫자`는 macOS/global shortcut 충돌 가능성이 있어 제외 |
+| **Cmd+[ / Cmd+]** | active tab 안 이전/다음 pane 전환 | M13 layout |
+| **Cmd+Shift+[ / Cmd+Shift+]** | 이전/다음 tab 전환 | M14 tabs |
 | **Cmd+N** | swallow. multi-window 미구현 | 미지원 |
 | **그 외 Cmd+key** | swallow (안전 기본값) | shell이 Cmd modifier 의미 가질 가능성 0에 가까움. PTY 보내면 의도 없는 byte |
 

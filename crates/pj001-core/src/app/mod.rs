@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::grid::Term;
 use crate::pty::PtyHandle;
 use crate::render::{CursorRender, Renderer};
-use event::{IdAllocator, PaneId, SessionId, UserEvent};
+use event::{IdAllocator, PaneId, SessionId, TabId, UserEvent};
 #[cfg(test)]
 use layout::SplitRatio;
 use layout::{Layout, RatioDirection, SplitAxis};
@@ -32,7 +32,11 @@ const MIN_WINDOW_WIDTH: u32 = 720;
 const MIN_WINDOW_HEIGHT: u32 = 420;
 const MIN_PANE_COLS: usize = 30;
 const MIN_PANE_ROWS: usize = 5;
+const TAB_BAR_ROWS: usize = 1;
 const CURSOR_BLINK_MS: u64 = 500;
+const TAB_BAR_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
+const TAB_ACTIVE_BG: [f32; 4] = [0.18, 0.32, 0.42, 1.0];
+const TAB_INACTIVE_BG: [f32; 4] = [0.15, 0.16, 0.18, 1.0];
 const STATUS_FG: [f32; 4] = [0.92, 0.94, 0.96, 1.0];
 const STATUS_ACTIVE_BG: [f32; 4] = [0.14, 0.30, 0.42, 1.0];
 const STATUS_INACTIVE_BG: [f32; 4] = [0.12, 0.13, 0.15, 1.0];
@@ -254,6 +258,14 @@ struct Pane {
     viewport: PaneViewport,
 }
 
+struct Tab {
+    id: TabId,
+    title: String,
+    panes: Vec<Pane>,
+    root: Layout,
+    active: PaneId,
+}
+
 /// M12-5: pane이 점유하는 시각 영역. cell 단위(cols/rows/col_offset/status_row)와
 /// pixel 단위(x_px/y_px/width_px/height_px) 양쪽 보유. 직접 mutation 금지 정책 —
 /// `compute_viewports`만이 새 PaneViewport를 생성. M13 BSP 진입 시 동일 struct를
@@ -302,6 +314,73 @@ fn status_text(state: &str, title: &str, cols: usize) -> String {
     }
 }
 
+fn tab_text(title: &str, cols: usize) -> String {
+    let title_width = UnicodeWidthStr::width(title);
+    if cols >= title_width + 2 {
+        format!(" {title} ")
+    } else if cols >= 2 {
+        format!(" {}", title.chars().next().unwrap_or(' '))
+    } else {
+        String::new()
+    }
+}
+
+fn ordinal_from_digit_key(
+    lower: Option<&str>,
+    physical_code: Option<winit::keyboard::KeyCode>,
+) -> Option<usize> {
+    use winit::keyboard::KeyCode;
+
+    if let Some(ordinal) = match physical_code {
+        Some(KeyCode::Digit1) => Some(1),
+        Some(KeyCode::Digit2) => Some(2),
+        Some(KeyCode::Digit3) => Some(3),
+        Some(KeyCode::Digit4) => Some(4),
+        Some(KeyCode::Digit5) => Some(5),
+        Some(KeyCode::Digit6) => Some(6),
+        Some(KeyCode::Digit7) => Some(7),
+        Some(KeyCode::Digit8) => Some(8),
+        Some(KeyCode::Digit9) => Some(9),
+        _ => None,
+    } {
+        return Some(ordinal);
+    }
+
+    lower
+        .and_then(|s| s.chars().next())
+        .and_then(|ch| ch.to_digit(10))
+        .filter(|digit| (1..=9).contains(digit))
+        .map(|digit| digit as usize)
+}
+
+fn compute_tab_viewports(
+    root: &Layout,
+    size: PhysicalSize<u32>,
+    cell: crate::render::CellMetrics,
+) -> HashMap<PaneId, PaneViewport> {
+    let content_size = tab_content_size(size, cell);
+    let mut layouts = layout::compute_viewports(root, content_size, cell);
+    for viewport in layouts.values_mut() {
+        viewport.row_offset += TAB_BAR_ROWS;
+        viewport.status_row = viewport.status_row.map(|row| row + TAB_BAR_ROWS);
+        viewport.y_px = viewport
+            .y_px
+            .saturating_add(cell.height * TAB_BAR_ROWS as u32);
+    }
+    layouts
+}
+
+fn tab_content_size(
+    size: PhysicalSize<u32>,
+    cell: crate::render::CellMetrics,
+) -> PhysicalSize<u32> {
+    PhysicalSize::new(
+        size.width,
+        size.height
+            .saturating_sub(cell.height * TAB_BAR_ROWS as u32),
+    )
+}
+
 struct AppState {
     window: Arc<Window>,
     proxy: EventLoopProxy<UserEvent>,
@@ -311,10 +390,9 @@ struct AppState {
     queue: wgpu::Queue,
     /// M12-3: PTY 프로세스 보관. Pane은 SessionId로 참조.
     sessions: HashMap<SessionId, Session>,
-    panes: Vec<Pane>,
-    /// M13-2: active tab 도입 전 단일 BSP root. M13 dynamic split/close가 이 tree를 mutate.
-    layout_root: Layout,
-    active: PaneId,
+    /// M14-1: 각 tab은 독립 panes + BSP root + active pane을 보유한다.
+    tabs: Vec<Tab>,
+    active_tab: TabId,
     renderer: Renderer,
     hooks: Hooks,
     last_ime_cursor: Option<(usize, usize)>,
@@ -506,6 +584,10 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => match button_state {
                 ElementState::Pressed => {
+                    if let Some(tab_id) = state.tab_at_mouse() {
+                        state.set_active_tab(tab_id);
+                        return;
+                    }
                     if let Some(hit) = state.divider_hit_at_mouse() {
                         state.dragging_divider = Some(hit);
                         state.update_mouse_cursor();
@@ -622,16 +704,29 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Character(s) => Some(s.to_lowercase()),
                         _ => None,
                     };
-                    if let Some(lower) = &lower {
-                        if let Some(ordinal) = lower
-                            .chars()
-                            .next()
-                            .and_then(|ch| ch.to_digit(10))
-                            .filter(|digit| (1..=9).contains(digit))
-                        {
-                            state.focus_pane_by_ordinal(ordinal as usize);
-                            return;
+                    if let Some(ordinal) = ordinal_from_digit_key(lower.as_deref(), physical_code) {
+                        if state.modifiers.alt_key() {
+                            state.focus_pane_by_ordinal(ordinal);
+                        } else if !state.modifiers.shift_key() {
+                            state.focus_tab_by_ordinal(ordinal);
                         }
+                        return;
+                    }
+                    if state.modifiers.shift_key()
+                        && (physical_code == Some(KeyCode::BracketLeft)
+                            || lower.as_deref() == Some("{"))
+                    {
+                        state.focus_adjacent_tab(false);
+                        return;
+                    }
+                    if state.modifiers.shift_key()
+                        && (physical_code == Some(KeyCode::BracketRight)
+                            || lower.as_deref() == Some("}"))
+                    {
+                        state.focus_adjacent_tab(true);
+                        return;
+                    }
+                    if let Some(lower) = &lower {
                         if lower == "[" {
                             state.focus_adjacent_pane(false);
                             return;
@@ -652,10 +747,27 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    if lower.as_deref() == Some("t") || physical_code == Some(KeyCode::KeyT) {
+                        if let Err(e) = state.create_tab() {
+                            log::warn!("cmd+t new tab failed: {e}");
+                        }
+                        return;
+                    }
                     if lower.as_deref() == Some("w") || physical_code == Some(KeyCode::KeyW) {
-                        if state.panes.len() <= 1 {
-                            log::info!("cmd+w: exit last pane");
-                            event_loop.exit();
+                        if state.modifiers.shift_key() {
+                            if state.tabs.len() <= 1 {
+                                log::info!("cmd+shift+w: exit last tab");
+                                event_loop.exit();
+                            } else {
+                                state.close_active_tab();
+                            }
+                        } else if state.active_tab().panes.len() <= 1 {
+                            if state.tabs.len() <= 1 {
+                                log::info!("cmd+w: exit last tab");
+                                event_loop.exit();
+                            } else {
+                                state.close_active_tab();
+                            }
                         } else {
                             state.close_active_pane();
                         }
@@ -797,7 +909,12 @@ impl ApplicationHandler<UserEvent> for App {
                         );
                         return;
                     }
-                    if state.panes.iter().any(|p| p.session == session_id) {
+                    if state
+                        .active_tab()
+                        .panes
+                        .iter()
+                        .any(|p| p.session == session_id)
+                    {
                         state.window.request_redraw();
                     }
                 }
@@ -818,17 +935,32 @@ impl ApplicationHandler<UserEvent> for App {
                         session_id: id,
                         code,
                     });
-                    if state.panes.len() <= 1 {
+                    if state.all_sessions_dead() {
                         event_loop.exit();
-                    } else {
+                        return;
+                    }
+                    let Some(tab_idx) = state.tab_index_for_session(id) else {
+                        state.window.request_redraw();
+                        return;
+                    };
+                    let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
+                    if state.tabs[tab_idx].panes.len() <= 1 {
+                        if state.tabs.len() <= 1 {
+                            event_loop.exit();
+                        } else if tab_is_active {
+                            state.close_active_tab();
+                        } else {
+                            state.remove_tab_at(tab_idx);
+                            state.window.request_redraw();
+                        }
+                    } else if tab_is_active {
                         let active_session = state
+                            .active_tab()
                             .panes
                             .iter()
-                            .find(|p| p.id == state.active)
+                            .find(|p| p.id == state.active_tab().active)
                             .map(|p| p.session);
-                        if state.all_sessions_dead() {
-                            event_loop.exit();
-                        } else if active_session == Some(id) {
+                        if active_session == Some(id) {
                             if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
@@ -848,17 +980,32 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(s) = state.sessions.get_mut(&id) {
                         s.alive = false;
                     }
-                    if state.panes.len() <= 1 {
+                    if state.all_sessions_dead() {
                         event_loop.exit();
-                    } else {
+                        return;
+                    }
+                    let Some(tab_idx) = state.tab_index_for_session(id) else {
+                        state.window.request_redraw();
+                        return;
+                    };
+                    let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
+                    if state.tabs[tab_idx].panes.len() <= 1 {
+                        if state.tabs.len() <= 1 {
+                            event_loop.exit();
+                        } else if tab_is_active {
+                            state.close_active_tab();
+                        } else {
+                            state.remove_tab_at(tab_idx);
+                            state.window.request_redraw();
+                        }
+                    } else if tab_is_active {
                         let active_session = state
+                            .active_tab()
                             .panes
                             .iter()
-                            .find(|p| p.id == state.active)
+                            .find(|p| p.id == state.active_tab().active)
                             .map(|p| p.session);
-                        if state.all_sessions_dead() {
-                            event_loop.exit();
-                        } else if active_session == Some(id) {
+                        if active_session == Some(id) {
                             if let Some(next) = state.next_alive_pane_id() {
                                 state.set_active(next);
                             }
@@ -872,10 +1019,27 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl AppState {
-    fn active_index(&self) -> usize {
-        self.panes
+    fn active_tab_index(&self) -> usize {
+        self.tabs
             .iter()
-            .position(|p| p.id == self.active)
+            .position(|tab| tab.id == self.active_tab)
+            .unwrap_or(0)
+    }
+
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab_index()]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        let idx = self.active_tab_index();
+        &mut self.tabs[idx]
+    }
+
+    fn active_index(&self) -> usize {
+        self.active_tab()
+            .panes
+            .iter()
+            .position(|p| p.id == self.active_tab().active)
             .unwrap_or(0)
     }
 
@@ -889,7 +1053,7 @@ impl AppState {
         let col = (pos.x / cell.width as f64).floor() as usize;
         let row = (pos.y / cell.height as f64).floor() as usize;
         let sessions = &self.sessions;
-        self.panes.iter().position(|pane| {
+        self.active_tab().panes.iter().position(|pane| {
             if !sessions
                 .get(&pane.session)
                 .map(|s| s.alive)
@@ -912,15 +1076,17 @@ impl AppState {
     /// M12-3: 모든 session이 dead면 true.
     fn all_sessions_dead(&self) -> bool {
         let sessions = &self.sessions;
-        self.panes
+        self.tabs
             .iter()
+            .flat_map(|tab| tab.panes.iter())
             .all(|p| !sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
     }
 
     /// M12-3: 다음 alive pane을 찾음.
     fn next_alive_pane_id(&self) -> Option<PaneId> {
         let sessions = &self.sessions;
-        self.panes
+        self.active_tab()
+            .panes
             .iter()
             .find(|p| sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
             .map(|p| p.id)
@@ -930,19 +1096,29 @@ impl AppState {
     /// traversal에서 PaneId 기반 lookup에 다시 활용 예정.
     #[allow(dead_code)]
     fn session_id_for_pane(&self, pane: PaneId) -> Option<SessionId> {
-        self.panes.iter().find(|p| p.id == pane).map(|p| p.session)
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .find(|p| p.id == pane)
+            .map(|p| p.session)
+    }
+
+    fn tab_index_for_session(&self, session_id: SessionId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.panes.iter().any(|pane| pane.session == session_id))
     }
 
     fn set_active(&mut self, id: PaneId) {
         let sessions = &self.sessions;
-        let Some(new_idx) = self
-            .panes
-            .iter()
-            .position(|p| p.id == id && sessions.get(&p.session).map(|s| s.alive).unwrap_or(false))
+        let Some(new_idx) =
+            self.active_tab().panes.iter().position(|p| {
+                p.id == id && sessions.get(&p.session).map(|s| s.alive).unwrap_or(false)
+            })
         else {
             return;
         };
-        if self.active == id {
+        if self.active_tab().active == id {
             return;
         }
 
@@ -953,7 +1129,7 @@ impl AppState {
         }
 
         let title = self.session_for_pane_idx(new_idx).title.clone();
-        self.active = id;
+        self.active_tab_mut().active = id;
         self.window.set_title(&format!("{} — pj001", title));
         self.cursor_visible = true;
         self.last_ime_cursor = None;
@@ -962,7 +1138,7 @@ impl AppState {
     }
 
     fn send_focus_report(&mut self, idx: usize, focused: bool) {
-        if idx >= self.panes.len() {
+        if idx >= self.active_tab().panes.len() {
             return;
         }
         let session = self.session_for_pane_idx_mut(idx);
@@ -1021,7 +1197,7 @@ impl AppState {
                 created_at: Instant::now(),
             },
         );
-        self.panes.push(Pane {
+        self.active_tab_mut().panes.push(Pane {
             id: pane_id,
             session: session_id,
             viewport,
@@ -1036,17 +1212,18 @@ impl AppState {
     }
 
     fn apply_layout_viewports_for_size(&mut self, size: PhysicalSize<u32>) {
-        let layouts =
-            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
-        for idx in 0..self.panes.len() {
-            let pane_id = self.panes[idx].id;
+        let root = self.active_tab().root.clone();
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
+        let pane_count = self.active_tab().panes.len();
+        for idx in 0..pane_count {
+            let pane_id = self.active_tab().panes[idx].id;
             let Some(viewport) = layouts.get(&pane_id).copied() else {
                 log::warn!("layout missing viewport for pane {}", pane_id.0);
                 continue;
             };
-            let prev = self.panes[idx].viewport;
+            let prev = self.active_tab().panes[idx].viewport;
             let pty_cell_size_changed = prev.cols != viewport.cols || prev.rows != viewport.rows;
-            self.panes[idx].viewport = viewport;
+            self.active_tab_mut().panes[idx].viewport = viewport;
             if pty_cell_size_changed {
                 let session = self.session_for_pane_idx_mut(idx);
                 if let Ok(mut term) = session.term.lock() {
@@ -1064,19 +1241,20 @@ impl AppState {
 
     fn split_active(&mut self, axis: SplitAxis) -> Result<()> {
         let new_pane = self.ids.new_pane();
-        let mut next_layout = self.layout_root.clone();
-        if !next_layout.split_pane(self.active, axis, new_pane) {
-            log::warn!("split requested for missing active pane {}", self.active.0);
+        let active = self.active_tab().active;
+        let mut next_layout = self.active_tab().root.clone();
+        if !next_layout.split_pane(active, axis, new_pane) {
+            log::warn!("split requested for missing active pane {}", active.0);
             return Ok(());
         }
-        self.layout_root = next_layout;
+        self.active_tab_mut().root = next_layout;
         self.update_min_inner_size();
         let size = self.target_inner_size_for_layout();
         if size.width > self.surface_config.width || size.height > self.surface_config.height {
             let _ = self.window.request_inner_size(size);
         }
         let layouts =
-            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
+            compute_tab_viewports(&self.active_tab().root, size, self.renderer.cell_metrics());
         let Some(viewport) = layouts.get(&new_pane).copied() else {
             log::warn!("split produced no viewport for new pane {}", new_pane.0);
             return Ok(());
@@ -1094,30 +1272,168 @@ impl AppState {
         Ok(())
     }
 
-    fn close_active_pane(&mut self) {
-        if self.panes.len() <= 1 {
+    fn create_tab(&mut self) -> Result<()> {
+        let tab_id = self.ids.new_tab();
+        let pane_id = self.ids.new_pane();
+        let root = Layout::Pane(pane_id);
+        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
+        let viewport = layouts[&pane_id];
+        let previous_tab = self.active_tab;
+        let previous_idx = self.active_index();
+        let title = format!("{}", self.tabs.len() + 1);
+        self.tabs.push(Tab {
+            id: tab_id,
+            title,
+            panes: Vec::new(),
+            root,
+            active: pane_id,
+        });
+        self.active_tab = tab_id;
+        let spawn = self.spawn_session_for_pane(
+            pane_id,
+            SessionSpec {
+                title: "shell".to_string(),
+                command: CommandSpec::Shell,
+            },
+            viewport,
+        );
+        if spawn.is_err() {
+            self.tabs.retain(|tab| tab.id != tab_id);
+            self.active_tab = previous_tab;
+            return spawn;
+        }
+        if self.focused {
+            self.active_tab = previous_tab;
+            self.send_focus_report(previous_idx, false);
+            self.active_tab = tab_id;
+            self.send_focus_report(0, true);
+        }
+        self.update_min_inner_size();
+        let title = self.session_for_pane_idx(0).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.cursor_visible = true;
+        self.last_ime_cursor = None;
+        self.preedit = None;
+        self.window.request_redraw();
+        Ok(())
+    }
+
+    fn set_active_tab(&mut self, id: TabId) {
+        if self.active_tab == id || !self.tabs.iter().any(|tab| tab.id == id) {
             return;
         }
-        let closing = self.active;
-        if !self.layout_root.close_pane(closing) {
+
+        let old_idx = self.active_index();
+        if self.focused {
+            self.send_focus_report(old_idx, false);
+        }
+        self.active_tab = id;
+        self.apply_layout_viewports();
+        self.update_min_inner_size();
+
+        let new_idx = self.active_index();
+        if self.focused {
+            self.send_focus_report(new_idx, true);
+        }
+        let title = self.session_for_pane_idx(new_idx).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.cursor_visible = true;
+        self.last_ime_cursor = None;
+        self.preedit = None;
+        self.window.request_redraw();
+    }
+
+    fn focus_tab_by_ordinal(&mut self, ordinal: usize) {
+        if ordinal == 0 {
+            return;
+        }
+        let Some(tab) = self.tabs.get(ordinal - 1) else {
+            return;
+        };
+        self.set_active_tab(tab.id);
+    }
+
+    fn focus_adjacent_tab(&mut self, next: bool) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let current_idx = self.active_tab_index();
+        let len = self.tabs.len();
+        let next_idx = if next {
+            (current_idx + 1) % len
+        } else {
+            (current_idx + len - 1) % len
+        };
+        self.set_active_tab(self.tabs[next_idx].id);
+    }
+
+    fn close_active_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let closing_tab = self.active_tab;
+        let Some(closing_idx) = self.tabs.iter().position(|tab| tab.id == closing_tab) else {
+            return;
+        };
+        self.remove_tab_at(closing_idx);
+        self.apply_layout_viewports();
+        self.update_min_inner_size();
+        let active_idx = self.active_index();
+        let title = self.session_for_pane_idx(active_idx).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.cursor_visible = true;
+        self.last_ime_cursor = None;
+        self.preedit = None;
+        self.window.request_redraw();
+    }
+
+    fn remove_tab_at(&mut self, closing_idx: usize) {
+        if self.tabs.len() <= 1 || closing_idx >= self.tabs.len() {
+            return;
+        }
+        let closing_was_active = self.tabs[closing_idx].id == self.active_tab;
+        let sessions = self.tabs[closing_idx]
+            .panes
+            .iter()
+            .map(|pane| pane.session)
+            .collect::<Vec<_>>();
+        for session_id in sessions {
+            self.sessions.remove(&session_id);
+        }
+        self.tabs.remove(closing_idx);
+        if closing_was_active {
+            let next_idx = closing_idx.min(self.tabs.len() - 1);
+            self.active_tab = self.tabs[next_idx].id;
+        }
+    }
+
+    fn close_active_pane(&mut self) {
+        if self.active_tab().panes.len() <= 1 {
+            return;
+        }
+        let closing = self.active_tab().active;
+        let mut next_root = self.active_tab().root.clone();
+        if !next_root.close_pane(closing) {
             log::warn!("close requested for missing active pane {}", closing.0);
             return;
         }
-        let Some(idx) = self.panes.iter().position(|p| p.id == closing) else {
+        self.active_tab_mut().root = next_root;
+        let Some(idx) = self.active_tab().panes.iter().position(|p| p.id == closing) else {
             log::warn!("close requested for missing pane {}", closing.0);
             return;
         };
-        let closing_session = self.panes[idx].session;
-        self.panes.remove(idx);
+        let closing_session = self.active_tab().panes[idx].session;
+        self.active_tab_mut().panes.remove(idx);
         self.sessions.remove(&closing_session);
         self.apply_layout_viewports();
         self.update_min_inner_size();
         if let Some(next) = self.next_alive_pane_id() {
-            self.active = next;
+            self.active_tab_mut().active = next;
             self.cursor_visible = true;
             self.last_ime_cursor = None;
             self.preedit = None;
-            if let Some(next_idx) = self.panes.iter().position(|p| p.id == next) {
+            if let Some(next_idx) = self.active_tab().panes.iter().position(|p| p.id == next) {
                 if self.focused {
                     self.send_focus_report(next_idx, true);
                 }
@@ -1129,11 +1445,11 @@ impl AppState {
     }
 
     fn focus_adjacent_pane(&mut self, next: bool) {
-        let order = self.layout_root.pane_order();
+        let order = self.active_tab().root.pane_order();
         if order.len() <= 1 {
             return;
         }
-        let Some(current_idx) = order.iter().position(|id| *id == self.active) else {
+        let Some(current_idx) = order.iter().position(|id| *id == self.active_tab().active) else {
             return;
         };
         let len = order.len();
@@ -1160,7 +1476,7 @@ impl AppState {
         if ordinal == 0 {
             return;
         }
-        let order = self.layout_root.pane_order();
+        let order = self.active_tab().root.pane_order();
         let Some(candidate) = order.get(ordinal - 1).copied() else {
             return;
         };
@@ -1168,9 +1484,11 @@ impl AppState {
     }
 
     fn adjust_active_split(&mut self, axis: SplitAxis, direction: RatioDirection) -> bool {
+        let active = self.active_tab().active;
         if self
-            .layout_root
-            .adjust_split_for_pane(self.active, axis, direction)
+            .active_tab_mut()
+            .root
+            .adjust_split_for_pane(active, axis, direction)
         {
             self.apply_layout_viewports();
             self.window.request_redraw();
@@ -1182,10 +1500,13 @@ impl AppState {
 
     fn minimum_inner_size(&self) -> PhysicalSize<u32> {
         let cell = self.renderer.cell_metrics();
-        let (cols, rows) = self.layout_root.minimum_size(MIN_PANE_COLS, MIN_PANE_ROWS);
+        let (cols, rows) = self
+            .active_tab()
+            .root
+            .minimum_size(MIN_PANE_COLS, MIN_PANE_ROWS);
         PhysicalSize::new(
             (cols as u32 * cell.width).max(MIN_WINDOW_WIDTH),
-            (rows as u32 * cell.height).max(MIN_WINDOW_HEIGHT),
+            ((rows + TAB_BAR_ROWS) as u32 * cell.height).max(MIN_WINDOW_HEIGHT),
         )
     }
 
@@ -1278,7 +1599,7 @@ impl AppState {
             .map(|_| ids.new_pane())
             .collect::<Vec<_>>();
         let layout_root = Layout::from_initial_panes(&pane_ids);
-        let layouts = layout::compute_viewports(&layout_root, size, renderer.cell_metrics());
+        let layouts = compute_tab_viewports(&layout_root, size, renderer.cell_metrics());
         log::info!(
             "startup spawn size={}x{} cell={}x{} panes={} layouts={:?}",
             size.width,
@@ -1335,6 +1656,14 @@ impl AppState {
                 sink.on_lifecycle(LifecycleEvent::SessionStarted { session_id, title });
             }
         }
+        let tab_id = ids.new_tab();
+        let tab = Tab {
+            id: tab_id,
+            title: "1".to_string(),
+            panes,
+            root: layout_root,
+            active: PaneId::first(),
+        };
 
         let state = Self {
             window,
@@ -1344,9 +1673,8 @@ impl AppState {
             device,
             queue,
             sessions,
-            panes,
-            layout_root,
-            active: PaneId::first(),
+            tabs: vec![tab],
+            active_tab: tab_id,
             renderer,
             hooks,
             last_ime_cursor: None,
@@ -1367,7 +1695,7 @@ impl AppState {
 
     /// M12-3: pane index → Session lookup. borrow scope 짧게 유지하기 위해 SessionId만 복사.
     fn session_id_for_pane_idx(&self, idx: usize) -> SessionId {
-        self.panes[idx].session
+        self.active_tab().panes[idx].session
     }
 
     /// M12-3: pane index → Session (immutable).
@@ -1387,7 +1715,7 @@ impl AppState {
     /// M12-6 design §5: 마우스 hit-test로 PaneId 반환. click site에서 idx 거치지 않고 사용.
     fn pane_at_mouse(&self, include_status_row: bool) -> Option<PaneId> {
         self.pane_index_at_mouse(include_status_row)
-            .map(|idx| self.panes[idx].id)
+            .map(|idx| self.active_tab().panes[idx].id)
     }
 
     fn mouse_cell(&self) -> Option<(usize, usize)> {
@@ -1402,13 +1730,27 @@ impl AppState {
         ))
     }
 
+    fn tab_at_mouse(&self) -> Option<TabId> {
+        let (col, row) = self.mouse_cell()?;
+        if row != 0 || self.tabs.is_empty() {
+            return None;
+        }
+        let total_cols =
+            (self.surface_config.width / self.renderer.cell_metrics().width).max(1) as usize;
+        let tab_width = (total_cols / self.tabs.len()).max(1);
+        let idx = (col / tab_width).min(self.tabs.len() - 1);
+        Some(self.tabs[idx].id)
+    }
+
     fn divider_hit_at_mouse(&self) -> Option<layout::DividerHit> {
         let (col, row) = self.mouse_cell()?;
+        let row = row.checked_sub(TAB_BAR_ROWS)?;
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        let cell = self.renderer.cell_metrics();
         layout::divider_hit_at(
-            &self.layout_root,
-            size,
-            self.renderer.cell_metrics(),
+            &self.active_tab().root,
+            tab_content_size(size, cell),
+            cell,
             col,
             row,
         )
@@ -1435,12 +1777,16 @@ impl AppState {
         let Some((col, row)) = self.mouse_cell() else {
             return;
         };
+        let Some(row) = row.checked_sub(TAB_BAR_ROWS) else {
+            return;
+        };
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        let cell = self.renderer.cell_metrics();
         if layout::set_split_ratio_at_cell(
-            &mut self.layout_root,
+            &mut self.active_tab_mut().root,
             &hit,
-            size,
-            self.renderer.cell_metrics(),
+            tab_content_size(size, cell),
+            cell,
             col,
             row,
             MIN_PANE_COLS,
@@ -1455,7 +1801,7 @@ impl AppState {
     #[allow(dead_code)]
     fn session_at_mouse(&self, include_status_row: bool) -> Option<SessionId> {
         self.pane_index_at_mouse(include_status_row)
-            .map(|idx| self.panes[idx].session)
+            .map(|idx| self.active_tab().panes[idx].session)
     }
 
     /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
@@ -1509,8 +1855,8 @@ impl AppState {
         self.surface.configure(&self.device, &self.surface_config);
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
-        let layouts =
-            layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
+        let root = self.active_tab().root.clone();
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
         log::info!(
             "resize event size={}x{} cell={}x{} layouts={:?}",
             size.width,
@@ -1522,10 +1868,11 @@ impl AppState {
                 .map(|v| (v.cols, v.rows, v.col_offset, v.status_row))
                 .collect::<Vec<_>>(),
         );
-        for idx in 0..self.panes.len() {
-            let pane_id = self.panes[idx].id;
+        let pane_count = self.active_tab().panes.len();
+        for idx in 0..pane_count {
+            let pane_id = self.active_tab().panes[idx].id;
             let viewport = layouts[&pane_id];
-            let prev = self.panes[idx].viewport;
+            let prev = self.active_tab().panes[idx].viewport;
             // M12-5 회귀 fix (Codex threads 019e164b → 019e1653 가설 K):
             // PTY/Term resize는 실제 terminal cell size(rows/cols)가 바뀔 때만 필요하다.
             // col_offset/status_row/pixel 크기는 visual layout/chrome 값이라 이걸 trigger로
@@ -1534,7 +1881,7 @@ impl AppState {
             let pty_cell_size_changed = prev.cols != viewport.cols || prev.rows != viewport.rows;
             // viewport visual/pixel 값은 surface size 변경 시 달라질 수 있으므로 항상 갱신.
             // M12-5 mutation 단일 진입점 — 전체 struct 교체만 허용.
-            self.panes[idx].viewport = viewport;
+            self.active_tab_mut().panes[idx].viewport = viewport;
             if pty_cell_size_changed {
                 let session = self.session_for_pane_idx_mut(idx);
                 if let Ok(mut term) = session.term.lock() {
@@ -1553,8 +1900,9 @@ impl AppState {
 
     fn render(&mut self) {
         // M10-1: vt가 누적한 응답(DSR/DA 등)을 PTY로 송신. lock 잡고 drain → drop → write.
-        for idx in 0..self.panes.len() {
-            let pane_id = self.panes[idx].id;
+        let pane_count = self.active_tab().panes.len();
+        for idx in 0..pane_count {
+            let pane_id = self.active_tab().panes[idx].id;
             let session = self.session_for_pane_idx_mut(idx);
             let responses: Vec<Vec<u8>> = if let Ok(mut term) = session.term.lock() {
                 term.drain_responses()
@@ -1584,11 +1932,11 @@ impl AppState {
         };
 
         self.renderer.begin_terms();
-        let active = self.active;
-        let pane_count = self.panes.len();
+        let active = self.active_tab().active;
+        let pane_count = self.active_tab().panes.len();
         for idx in 0..pane_count {
             let (pane_id, pane_col_offset, pane_row_offset, session_id) = {
-                let p = &self.panes[idx];
+                let p = &self.active_tab().panes[idx];
                 (
                     p.id,
                     p.viewport.col_offset,
@@ -1654,6 +2002,7 @@ impl AppState {
                 }
             }
         }
+        self.append_tab_bar();
         self.append_split_chrome();
         self.renderer.finish_terms(&self.device, &self.queue);
 
@@ -1670,27 +2019,61 @@ impl AppState {
         frame.present();
     }
 
+    fn append_tab_bar(&mut self) {
+        let cell = self.renderer.cell_metrics();
+        if cell.width == 0 {
+            return;
+        }
+        let total_cols = (self.surface_config.width / cell.width).max(1) as usize;
+        self.renderer.append_fill_row(0, 0, total_cols, TAB_BAR_BG);
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        for idx in 0..self.tabs.len() {
+            let (segment_col, segment_cols) = status_segment(0, total_cols, self.tabs.len(), idx);
+            let tab = &self.tabs[idx];
+            let bg = if tab.id == self.active_tab {
+                TAB_ACTIVE_BG
+            } else {
+                TAB_INACTIVE_BG
+            };
+            let text = tab_text(&tab.title, segment_cols);
+            self.renderer.append_text_line(
+                &self.queue,
+                &text,
+                segment_col,
+                0,
+                segment_cols,
+                STATUS_FG,
+                bg,
+            );
+        }
+    }
+
     fn append_split_chrome(&mut self) {
-        if self.panes.len() < 2 {
+        if self.active_tab().panes.len() < 2 {
             return;
         }
 
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
-        for divider in
-            layout::vertical_dividers(&self.layout_root, size, self.renderer.cell_metrics())
-        {
+        let cell = self.renderer.cell_metrics();
+        let content_size = tab_content_size(size, cell);
+        let root = self.active_tab().root.clone();
+        for mut divider in layout::vertical_dividers(&root, content_size, cell) {
+            divider.row += TAB_BAR_ROWS;
             self.renderer
                 .append_fill_column(divider.col, divider.row, divider.height, DIVIDER_BG);
         }
-        for divider in
-            layout::horizontal_dividers(&self.layout_root, size, self.renderer.cell_metrics())
-        {
+        for mut divider in layout::horizontal_dividers(&root, content_size, cell) {
+            divider.row += TAB_BAR_ROWS;
             self.renderer
                 .append_fill_row(divider.col, divider.row, divider.width, DIVIDER_BG);
         }
 
         let mut status_items = Vec::new();
-        for pane in &self.panes {
+        let active = self.active_tab().active;
+        for pane in &self.active_tab().panes {
             let Some(status_row) = pane.viewport.status_row else {
                 continue;
             };
@@ -1698,14 +2081,14 @@ impl AppState {
             let alive = session.alive;
             let state = if !alive {
                 "DEAD"
-            } else if pane.id == self.active {
+            } else if pane.id == active {
                 "ACTIVE"
             } else {
                 "READY"
             };
             let bg = if !alive {
                 STATUS_DEAD_BG
-            } else if pane.id == self.active {
+            } else if pane.id == active {
                 STATUS_ACTIVE_BG
             } else {
                 STATUS_INACTIVE_BG
@@ -1858,6 +2241,32 @@ mod tests {
     fn status_text_uses_display_width_for_wide_titles() {
         assert_eq!(status_text("READY", "셸", 10), " READY 셸 ");
         assert_eq!(status_text("READY", "셸", 9), " READY ");
+    }
+
+    #[test]
+    fn tab_text_fits_available_columns() {
+        assert_eq!(tab_text("1", 3), " 1 ");
+        assert_eq!(tab_text("10", 3), " 1");
+        assert_eq!(tab_text("10", 1), "");
+    }
+
+    #[test]
+    fn ordinal_from_digit_key_prefers_physical_digit_for_modified_symbols() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            ordinal_from_digit_key(Some("!"), Some(KeyCode::Digit1)),
+            Some(1)
+        );
+        assert_eq!(
+            ordinal_from_digit_key(Some("@"), Some(KeyCode::Digit2)),
+            Some(2)
+        );
+        assert_eq!(ordinal_from_digit_key(Some("2"), None), Some(2));
+        assert_eq!(
+            ordinal_from_digit_key(Some("0"), Some(KeyCode::Digit0)),
+            None
+        );
     }
 
     #[test]
