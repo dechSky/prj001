@@ -357,6 +357,107 @@ fn ordinal_from_digit_key(
         .map(|digit| digit as usize)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CmdShortcut {
+    TabOrdinal(usize),
+    PaneOrdinal(usize),
+    PrevTab,
+    NextTab,
+    PrevPane,
+    NextPane,
+    SplitVertical,
+    SplitHorizontal,
+    NewTab,
+    ClosePaneOrTab,
+    CloseTab,
+    Quit,
+    Paste,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseDecision {
+    ClosePane,
+    CloseTab,
+    Exit,
+}
+
+fn close_decision(shortcut: CmdShortcut, pane_count: usize, tab_count: usize) -> CloseDecision {
+    match shortcut {
+        CmdShortcut::CloseTab => {
+            if tab_count <= 1 {
+                CloseDecision::Exit
+            } else {
+                CloseDecision::CloseTab
+            }
+        }
+        CmdShortcut::ClosePaneOrTab => {
+            if pane_count > 1 {
+                CloseDecision::ClosePane
+            } else if tab_count > 1 {
+                CloseDecision::CloseTab
+            } else {
+                CloseDecision::Exit
+            }
+        }
+        _ => unreachable!("close_decision only accepts close shortcuts"),
+    }
+}
+
+fn cmd_shortcut(
+    lower: Option<&str>,
+    physical_code: Option<winit::keyboard::KeyCode>,
+    shift: bool,
+    alt: bool,
+) -> Option<CmdShortcut> {
+    use winit::keyboard::KeyCode;
+
+    if let Some(ordinal) = ordinal_from_digit_key(lower, physical_code) {
+        return if alt {
+            Some(CmdShortcut::PaneOrdinal(ordinal))
+        } else if !shift {
+            Some(CmdShortcut::TabOrdinal(ordinal))
+        } else {
+            None
+        };
+    }
+    if shift && (physical_code == Some(KeyCode::BracketLeft) || lower == Some("{")) {
+        return Some(CmdShortcut::PrevTab);
+    }
+    if shift && (physical_code == Some(KeyCode::BracketRight) || lower == Some("}")) {
+        return Some(CmdShortcut::NextTab);
+    }
+    if lower == Some("[") {
+        return Some(CmdShortcut::PrevPane);
+    }
+    if lower == Some("]") {
+        return Some(CmdShortcut::NextPane);
+    }
+    if lower == Some("d") || physical_code == Some(KeyCode::KeyD) {
+        return Some(if shift {
+            CmdShortcut::SplitHorizontal
+        } else {
+            CmdShortcut::SplitVertical
+        });
+    }
+    if lower == Some("t") || physical_code == Some(KeyCode::KeyT) {
+        return Some(CmdShortcut::NewTab);
+    }
+    if lower == Some("w") || physical_code == Some(KeyCode::KeyW) {
+        return Some(if shift {
+            CmdShortcut::CloseTab
+        } else {
+            CmdShortcut::ClosePaneOrTab
+        });
+    }
+    if lower == Some("q") || physical_code == Some(KeyCode::KeyQ) {
+        return Some(CmdShortcut::Quit);
+    }
+    if lower == Some("v") || physical_code == Some(KeyCode::KeyV) {
+        return Some(CmdShortcut::Paste);
+    }
+    None
+}
+
 fn compute_tab_viewports(
     root: &Layout,
     size: PhysicalSize<u32>,
@@ -671,7 +772,7 @@ impl ApplicationHandler<UserEvent> for App {
                     event.logical_key,
                     event.text
                 );
-                use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+                use winit::keyboard::{Key, NamedKey, PhysicalKey};
                 // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
                     let physical_code = match event.physical_key {
@@ -708,84 +809,88 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Character(s) => Some(s.to_lowercase()),
                         _ => None,
                     };
-                    if let Some(ordinal) = ordinal_from_digit_key(lower.as_deref(), physical_code) {
-                        if state.modifiers.alt_key() {
-                            state.focus_pane_by_ordinal(ordinal);
-                        } else if !state.modifiers.shift_key() {
+                    match cmd_shortcut(
+                        lower.as_deref(),
+                        physical_code,
+                        state.modifiers.shift_key(),
+                        state.modifiers.alt_key(),
+                    ) {
+                        Some(CmdShortcut::TabOrdinal(ordinal)) => {
                             state.focus_tab_by_ordinal(ordinal);
+                            return;
                         }
-                        return;
-                    }
-                    if state.modifiers.shift_key()
-                        && (physical_code == Some(KeyCode::BracketLeft)
-                            || lower.as_deref() == Some("{"))
-                    {
-                        state.focus_adjacent_tab(false);
-                        return;
-                    }
-                    if state.modifiers.shift_key()
-                        && (physical_code == Some(KeyCode::BracketRight)
-                            || lower.as_deref() == Some("}"))
-                    {
-                        state.focus_adjacent_tab(true);
-                        return;
-                    }
-                    if let Some(lower) = &lower {
-                        if lower == "[" {
+                        Some(CmdShortcut::PaneOrdinal(ordinal)) => {
+                            state.focus_pane_by_ordinal(ordinal);
+                            return;
+                        }
+                        Some(CmdShortcut::PrevTab) => {
+                            state.focus_adjacent_tab(false);
+                            return;
+                        }
+                        Some(CmdShortcut::NextTab) => {
+                            state.focus_adjacent_tab(true);
+                            return;
+                        }
+                        Some(CmdShortcut::PrevPane) => {
                             state.focus_adjacent_pane(false);
                             return;
                         }
-                        if lower == "]" {
+                        Some(CmdShortcut::NextPane) => {
                             state.focus_adjacent_pane(true);
                             return;
                         }
-                    }
-                    if lower.as_deref() == Some("d") || physical_code == Some(KeyCode::KeyD) {
-                        let axis = if state.modifiers.shift_key() {
-                            SplitAxis::Horizontal
-                        } else {
-                            SplitAxis::Vertical
-                        };
-                        if let Err(e) = state.split_active(axis) {
-                            log::warn!("cmd+d split failed: {e}");
-                        }
-                        return;
-                    }
-                    if lower.as_deref() == Some("t") || physical_code == Some(KeyCode::KeyT) {
-                        if let Err(e) = state.create_tab() {
-                            log::warn!("cmd+t new tab failed: {e}");
-                        }
-                        return;
-                    }
-                    if lower.as_deref() == Some("w") || physical_code == Some(KeyCode::KeyW) {
-                        if state.modifiers.shift_key() {
-                            if state.tabs.len() <= 1 {
-                                log::info!("cmd+shift+w: exit last tab");
-                                event_loop.exit();
-                            } else {
-                                state.close_active_tab();
+                        Some(CmdShortcut::SplitVertical) => {
+                            if let Err(e) = state.split_active(SplitAxis::Vertical) {
+                                log::warn!("cmd+d split failed: {e}");
                             }
-                        } else if state.active_tab().panes.len() <= 1 {
-                            if state.tabs.len() <= 1 {
-                                log::info!("cmd+w: exit last tab");
-                                event_loop.exit();
-                            } else {
-                                state.close_active_tab();
-                            }
-                        } else {
-                            state.close_active_pane();
+                            return;
                         }
-                        return;
-                    }
-                    if lower.as_deref() == Some("q") || physical_code == Some(KeyCode::KeyQ) {
-                        log::info!("cmd+q: exit");
-                        event_loop.exit();
-                        return;
-                    }
-                    if lower.as_deref() == Some("v") || physical_code == Some(KeyCode::KeyV) {
-                        // M10-6: clipboard paste. bracketed_paste mode면 \e[200~/\e[201~ 래핑.
-                        state.handle_paste();
-                        return;
+                        Some(CmdShortcut::SplitHorizontal) => {
+                            if let Err(e) = state.split_active(SplitAxis::Horizontal) {
+                                log::warn!("cmd+d split failed: {e}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::NewTab) => {
+                            if let Err(e) = state.create_tab() {
+                                log::warn!("cmd+t new tab failed: {e}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::CloseTab) => {
+                            state.apply_close_decision(
+                                event_loop,
+                                close_decision(
+                                    CmdShortcut::CloseTab,
+                                    state.active_tab().panes.len(),
+                                    state.tabs.len(),
+                                ),
+                                "cmd+shift+w",
+                            );
+                            return;
+                        }
+                        Some(CmdShortcut::ClosePaneOrTab) => {
+                            state.apply_close_decision(
+                                event_loop,
+                                close_decision(
+                                    CmdShortcut::ClosePaneOrTab,
+                                    state.active_tab().panes.len(),
+                                    state.tabs.len(),
+                                ),
+                                "cmd+w",
+                            );
+                            return;
+                        }
+                        Some(CmdShortcut::Quit) => {
+                            log::info!("cmd+q: exit");
+                            event_loop.exit();
+                            return;
+                        }
+                        Some(CmdShortcut::Paste) => {
+                            state.handle_paste();
+                            return;
+                        }
+                        None => {}
                     }
                     // 그 외 Cmd+key: swallow (PTY 안 보냄).
                     log::debug!("swallowed Cmd+key: {:?}", event.logical_key);
@@ -1160,6 +1265,22 @@ impl AppState {
             let bytes: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
             if let Err(e) = session.pty.write(bytes) {
                 log::warn!("focus report write (session {}): {e}", session.id.0);
+            }
+        }
+    }
+
+    fn apply_close_decision(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        decision: CloseDecision,
+        label: &str,
+    ) {
+        match decision {
+            CloseDecision::ClosePane => self.close_active_pane(),
+            CloseDecision::CloseTab => self.close_active_tab(),
+            CloseDecision::Exit => {
+                log::info!("{label}: exit last tab");
+                event_loop.exit();
             }
         }
     }
@@ -2292,6 +2413,82 @@ mod tests {
         assert_eq!(
             ordinal_from_digit_key(Some("0"), Some(KeyCode::Digit0)),
             None
+        );
+    }
+
+    #[test]
+    fn cmd_shortcut_routes_tab_and_pane_ordinals() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            cmd_shortcut(Some("1"), Some(KeyCode::Digit1), false, false),
+            Some(CmdShortcut::TabOrdinal(1))
+        );
+        assert_eq!(
+            cmd_shortcut(Some("!"), Some(KeyCode::Digit1), false, true),
+            Some(CmdShortcut::PaneOrdinal(1))
+        );
+        assert_eq!(
+            cmd_shortcut(Some("!"), Some(KeyCode::Digit1), true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn cmd_shortcut_routes_panes_tabs_and_closers() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            cmd_shortcut(Some("["), Some(KeyCode::BracketLeft), false, false),
+            Some(CmdShortcut::PrevPane)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("]"), Some(KeyCode::BracketRight), false, false),
+            Some(CmdShortcut::NextPane)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("{"), Some(KeyCode::BracketLeft), true, false),
+            Some(CmdShortcut::PrevTab)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("}"), Some(KeyCode::BracketRight), true, false),
+            Some(CmdShortcut::NextTab)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("w"), Some(KeyCode::KeyW), false, false),
+            Some(CmdShortcut::ClosePaneOrTab)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("w"), Some(KeyCode::KeyW), true, false),
+            Some(CmdShortcut::CloseTab)
+        );
+    }
+
+    #[test]
+    fn close_decision_escalates_cmd_w_from_pane_to_tab_to_exit() {
+        assert_eq!(
+            close_decision(CmdShortcut::ClosePaneOrTab, 2, 1),
+            CloseDecision::ClosePane
+        );
+        assert_eq!(
+            close_decision(CmdShortcut::ClosePaneOrTab, 1, 2),
+            CloseDecision::CloseTab
+        );
+        assert_eq!(
+            close_decision(CmdShortcut::ClosePaneOrTab, 1, 1),
+            CloseDecision::Exit
+        );
+    }
+
+    #[test]
+    fn close_decision_cmd_shift_w_targets_tab_or_exit() {
+        assert_eq!(
+            close_decision(CmdShortcut::CloseTab, 3, 2),
+            CloseDecision::CloseTab
+        );
+        assert_eq!(
+            close_decision(CmdShortcut::CloseTab, 3, 1),
+            CloseDecision::Exit
         );
     }
 
