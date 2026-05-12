@@ -329,6 +329,16 @@ fn tab_label(index: usize, title: &str) -> String {
     format!("{} {}", index + 1, title)
 }
 
+fn tab_index_at_col(total_cols: usize, tab_count: usize, col: usize) -> Option<usize> {
+    if total_cols == 0 || tab_count == 0 || col >= total_cols {
+        return None;
+    }
+    (0..tab_count).find(|idx| {
+        let (segment_col, segment_cols) = status_segment(0, total_cols, tab_count, *idx);
+        col >= segment_col && col < segment_col + segment_cols
+    })
+}
+
 fn ordinal_from_digit_key(
     lower: Option<&str>,
     physical_code: Option<winit::keyboard::KeyCode>,
@@ -1873,8 +1883,7 @@ impl AppState {
         }
         let total_cols =
             (self.surface_config.width / self.renderer.cell_metrics().width).max(1) as usize;
-        let tab_width = (total_cols / self.tabs.len()).max(1);
-        let idx = (col / tab_width).min(self.tabs.len() - 1);
+        let idx = tab_index_at_col(total_cols, self.tabs.len(), col)?;
         Some(self.tabs[idx].id)
     }
 
@@ -2362,6 +2371,53 @@ mod tests {
     }
 
     #[test]
+    fn compute_tab_viewports_reserves_top_tab_row() {
+        let root = Layout::Pane(PaneId(0));
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell());
+        let viewport = layouts[&PaneId(0)];
+
+        assert_eq!(viewport.cols, 10);
+        assert_eq!(viewport.rows, 3);
+        assert_eq!(viewport.col_offset, 0);
+        assert_eq!(viewport.row_offset, 1);
+        assert_eq!(viewport.status_row, None);
+        assert_eq!(viewport.x_px, 0);
+        assert_eq!(viewport.y_px, 20);
+        assert_eq!(viewport.width_px, 100);
+        assert_eq!(viewport.height_px, 60);
+    }
+
+    #[test]
+    fn compute_tab_viewports_shifts_split_status_rows_below_tab_bar() {
+        let root = Layout::from_initial_panes(&[PaneId(0), PaneId(1)]);
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell());
+        let left = layouts[&PaneId(0)];
+        let right = layouts[&PaneId(1)];
+
+        assert_eq!(left.rows, 2);
+        assert_eq!(right.rows, 2);
+        assert_eq!(left.row_offset, 1);
+        assert_eq!(right.row_offset, 1);
+        assert_eq!(left.status_row, Some(3));
+        assert_eq!(right.status_row, Some(3));
+        assert_eq!(left.y_px, 20);
+        assert_eq!(right.y_px, 20);
+    }
+
+    #[test]
+    fn compute_tab_viewports_keeps_one_content_row_when_tab_bar_consumes_height() {
+        let root = Layout::Pane(PaneId(0));
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 10), cell());
+        let viewport = layouts[&PaneId(0)];
+
+        assert_eq!(viewport.cols, 10);
+        assert_eq!(viewport.rows, 1);
+        assert_eq!(viewport.row_offset, 1);
+        assert_eq!(viewport.status_row, None);
+        assert_eq!(viewport.y_px, 20);
+    }
+
+    #[test]
     fn status_segment_divides_shared_status_region() {
         assert_eq!(status_segment(0, 10, 2, 0), (0, 5));
         assert_eq!(status_segment(0, 10, 2, 1), (5, 5));
@@ -2395,6 +2451,26 @@ mod tests {
     fn tab_label_prefixes_one_based_index() {
         assert_eq!(tab_label(0, "shell"), "1 shell");
         assert_eq!(tab_label(2, "Codex"), "3 Codex");
+    }
+
+    #[test]
+    fn tab_index_at_col_matches_status_segment_boundaries() {
+        assert_eq!(tab_index_at_col(5, 3, 0), Some(0));
+        assert_eq!(tab_index_at_col(5, 3, 1), Some(1));
+        assert_eq!(tab_index_at_col(5, 3, 2), Some(1));
+        assert_eq!(tab_index_at_col(5, 3, 3), Some(2));
+        assert_eq!(tab_index_at_col(5, 3, 4), Some(2));
+        assert_eq!(tab_index_at_col(5, 3, 5), None);
+    }
+
+    #[test]
+    fn tab_index_at_col_handles_tight_tab_bars() {
+        assert_eq!(tab_index_at_col(4, 3, 0), Some(0));
+        assert_eq!(tab_index_at_col(4, 3, 1), Some(1));
+        assert_eq!(tab_index_at_col(4, 3, 2), Some(2));
+        assert_eq!(tab_index_at_col(4, 3, 3), Some(2));
+        assert_eq!(tab_index_at_col(0, 3, 0), None);
+        assert_eq!(tab_index_at_col(4, 0, 0), None);
     }
 
     #[test]
