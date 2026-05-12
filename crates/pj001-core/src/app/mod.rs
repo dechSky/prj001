@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::PtySize;
+use unicode_width::UnicodeWidthStr;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{ImePurpose, Window, WindowId};
+use winit::window::{CursorIcon, ImePurpose, Window, WindowId};
 
 use crate::error::{Error, Result};
 use crate::grid::Term;
@@ -27,6 +28,10 @@ use layout::{Layout, RatioDirection, SplitAxis};
 use session::Session;
 
 const FONT_SIZE: f32 = 14.0;
+const MIN_WINDOW_WIDTH: u32 = 720;
+const MIN_WINDOW_HEIGHT: u32 = 420;
+const MIN_PANE_COLS: usize = 30;
+const MIN_PANE_ROWS: usize = 5;
 const CURSOR_BLINK_MS: u64 = 500;
 const STATUS_FG: [f32; 4] = [0.92, 0.94, 0.96, 1.0];
 const STATUS_ACTIVE_BG: [f32; 4] = [0.14, 0.30, 0.42, 1.0];
@@ -283,6 +288,20 @@ fn status_segment(
     (start, end.saturating_sub(start).max(1))
 }
 
+fn status_text(state: &str, title: &str, cols: usize) -> String {
+    let state_width = UnicodeWidthStr::width(state);
+    let title_width = UnicodeWidthStr::width(title);
+    if cols >= state_width + title_width + 3 {
+        format!(" {state} {title} ")
+    } else if cols >= state_width + 2 {
+        format!(" {state} ")
+    } else if cols >= 3 {
+        format!(" {} ", state.chars().next().unwrap_or(' '))
+    } else {
+        String::new()
+    }
+}
+
 struct AppState {
     window: Arc<Window>,
     proxy: EventLoopProxy<UserEvent>,
@@ -405,8 +424,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("pj001")
-            .with_inner_size(PhysicalSize::new(960u32, 600u32));
+            .with_inner_size(PhysicalSize::new(960u32, 600u32))
+            .with_min_inner_size(PhysicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT));
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+        window.set_min_inner_size(Some(PhysicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)));
         // PTY spawn은 첫 Resized에서. window는 pending에 보관.
         self.pending_window = Some(window);
         self.startup_waited_once = false;
@@ -472,10 +493,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.dragging_divider.is_some() {
                     state.drag_divider_to_mouse();
                 }
+                state.update_mouse_cursor();
             }
             WindowEvent::CursorLeft { .. } => {
                 state.last_mouse_pos = None;
                 state.dragging_divider = None;
+                state.window.set_cursor(CursorIcon::Default);
             }
             WindowEvent::MouseInput {
                 state: button_state,
@@ -485,6 +508,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ElementState::Pressed => {
                     if let Some(hit) = state.divider_hit_at_mouse() {
                         state.dragging_divider = Some(hit);
+                        state.update_mouse_cursor();
                         return;
                     }
                     if let Some(pane_id) = state.pane_at_mouse(true) {
@@ -493,6 +517,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 ElementState::Released => {
                     state.dragging_divider = None;
+                    state.update_mouse_cursor();
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {
@@ -560,9 +585,13 @@ impl ApplicationHandler<UserEvent> for App {
                     event.logical_key,
                     event.text
                 );
-                use winit::keyboard::{Key, NamedKey};
+                use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
                 // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
+                    let physical_code = match event.physical_key {
+                        PhysicalKey::Code(code) => Some(code),
+                        PhysicalKey::Unidentified(_) => None,
+                    };
                     if state.modifiers.shift_key() {
                         if let Key::Named(named) = &event.logical_key {
                             let handled = match named {
@@ -589,8 +618,11 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    if let Key::Character(s) = &event.logical_key {
-                        let lower = s.to_lowercase();
+                    let lower = match &event.logical_key {
+                        Key::Character(s) => Some(s.to_lowercase()),
+                        _ => None,
+                    };
+                    if let Some(lower) = &lower {
                         if let Some(ordinal) = lower
                             .chars()
                             .next()
@@ -608,36 +640,36 @@ impl ApplicationHandler<UserEvent> for App {
                             state.focus_adjacent_pane(true);
                             return;
                         }
-                        if lower == "d" {
-                            let axis = if state.modifiers.shift_key() {
-                                SplitAxis::Horizontal
-                            } else {
-                                SplitAxis::Vertical
-                            };
-                            if let Err(e) = state.split_active(axis) {
-                                log::warn!("cmd+d split failed: {e}");
-                            }
-                            return;
+                    }
+                    if lower.as_deref() == Some("d") || physical_code == Some(KeyCode::KeyD) {
+                        let axis = if state.modifiers.shift_key() {
+                            SplitAxis::Horizontal
+                        } else {
+                            SplitAxis::Vertical
+                        };
+                        if let Err(e) = state.split_active(axis) {
+                            log::warn!("cmd+d split failed: {e}");
                         }
-                        if lower == "w" {
-                            if state.panes.len() <= 1 {
-                                log::info!("cmd+w: exit last pane");
-                                event_loop.exit();
-                            } else {
-                                state.close_active_pane();
-                            }
-                            return;
-                        }
-                        if lower == "q" {
-                            log::info!("cmd+{lower}: exit");
+                        return;
+                    }
+                    if lower.as_deref() == Some("w") || physical_code == Some(KeyCode::KeyW) {
+                        if state.panes.len() <= 1 {
+                            log::info!("cmd+w: exit last pane");
                             event_loop.exit();
-                            return;
+                        } else {
+                            state.close_active_pane();
                         }
-                        if lower == "v" {
-                            // M10-6: clipboard paste. bracketed_paste mode면 \e[200~/\e[201~ 래핑.
-                            state.handle_paste();
-                            return;
-                        }
+                        return;
+                    }
+                    if lower.as_deref() == Some("q") || physical_code == Some(KeyCode::KeyQ) {
+                        log::info!("cmd+q: exit");
+                        event_loop.exit();
+                        return;
+                    }
+                    if lower.as_deref() == Some("v") || physical_code == Some(KeyCode::KeyV) {
+                        // M10-6: clipboard paste. bracketed_paste mode면 \e[200~/\e[201~ 래핑.
+                        state.handle_paste();
+                        return;
                     }
                     // 그 외 Cmd+key: swallow (PTY 안 보냄).
                     log::debug!("swallowed Cmd+key: {:?}", event.logical_key);
@@ -1000,6 +1032,10 @@ impl AppState {
 
     fn apply_layout_viewports(&mut self) {
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        self.apply_layout_viewports_for_size(size);
+    }
+
+    fn apply_layout_viewports_for_size(&mut self, size: PhysicalSize<u32>) {
         let layouts =
             layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
         for idx in 0..self.panes.len() {
@@ -1028,11 +1064,17 @@ impl AppState {
 
     fn split_active(&mut self, axis: SplitAxis) -> Result<()> {
         let new_pane = self.ids.new_pane();
-        if !self.layout_root.split_pane(self.active, axis, new_pane) {
+        let mut next_layout = self.layout_root.clone();
+        if !next_layout.split_pane(self.active, axis, new_pane) {
             log::warn!("split requested for missing active pane {}", self.active.0);
             return Ok(());
         }
-        let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
+        self.layout_root = next_layout;
+        self.update_min_inner_size();
+        let size = self.target_inner_size_for_layout();
+        if size.width > self.surface_config.width || size.height > self.surface_config.height {
+            let _ = self.window.request_inner_size(size);
+        }
         let layouts =
             layout::compute_viewports(&self.layout_root, size, self.renderer.cell_metrics());
         let Some(viewport) = layouts.get(&new_pane).copied() else {
@@ -1047,7 +1089,7 @@ impl AppState {
             },
             viewport,
         )?;
-        self.apply_layout_viewports();
+        self.apply_layout_viewports_for_size(size);
         self.set_active(new_pane);
         Ok(())
     }
@@ -1069,6 +1111,7 @@ impl AppState {
         self.panes.remove(idx);
         self.sessions.remove(&closing_session);
         self.apply_layout_viewports();
+        self.update_min_inner_size();
         if let Some(next) = self.next_alive_pane_id() {
             self.active = next;
             self.cursor_visible = true;
@@ -1135,6 +1178,28 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    fn minimum_inner_size(&self) -> PhysicalSize<u32> {
+        let cell = self.renderer.cell_metrics();
+        let (cols, rows) = self.layout_root.minimum_size(MIN_PANE_COLS, MIN_PANE_ROWS);
+        PhysicalSize::new(
+            (cols as u32 * cell.width).max(MIN_WINDOW_WIDTH),
+            (rows as u32 * cell.height).max(MIN_WINDOW_HEIGHT),
+        )
+    }
+
+    fn target_inner_size_for_layout(&self) -> PhysicalSize<u32> {
+        let min = self.minimum_inner_size();
+        PhysicalSize::new(
+            self.surface_config.width.max(min.width),
+            self.surface_config.height.max(min.height),
+        )
+    }
+
+    fn update_min_inner_size(&self) {
+        self.window
+            .set_min_inner_size(Some(self.minimum_inner_size()));
     }
 
     /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는
@@ -1271,7 +1336,7 @@ impl AppState {
             }
         }
 
-        Ok(Self {
+        let state = Self {
             window,
             proxy,
             surface,
@@ -1295,7 +1360,9 @@ impl AppState {
             dragging_divider: None,
             pending_resize: None,
             ids,
-        })
+        };
+        state.update_min_inner_size();
+        Ok(state)
     }
 
     /// M12-3: pane index → Session lookup. borrow scope 짧게 유지하기 위해 SessionId만 복사.
@@ -1347,6 +1414,20 @@ impl AppState {
         )
     }
 
+    fn update_mouse_cursor(&self) {
+        let hit = self
+            .dragging_divider
+            .as_ref()
+            .cloned()
+            .or_else(|| self.divider_hit_at_mouse());
+        let icon = match hit.map(|hit| hit.axis()) {
+            Some(SplitAxis::Vertical) => CursorIcon::ColResize,
+            Some(SplitAxis::Horizontal) => CursorIcon::RowResize,
+            None => CursorIcon::Default,
+        };
+        self.window.set_cursor(icon);
+    }
+
     fn drag_divider_to_mouse(&mut self) {
         let Some(hit) = self.dragging_divider.clone() else {
             return;
@@ -1362,6 +1443,8 @@ impl AppState {
             self.renderer.cell_metrics(),
             col,
             row,
+            MIN_PANE_COLS,
+            MIN_PANE_ROWS,
         ) {
             self.apply_layout_viewports();
             self.window.request_redraw();
@@ -1627,7 +1710,7 @@ impl AppState {
             } else {
                 STATUS_INACTIVE_BG
             };
-            let text = format!(" {state} {} ", session.title);
+            let text = status_text(state, &session.title, pane.viewport.cols);
             status_items.push((
                 status_row,
                 pane.viewport.col_offset,
@@ -1761,6 +1844,20 @@ mod tests {
         assert_eq!(status_segment(6, 5, 3, 0), (6, 1));
         assert_eq!(status_segment(6, 5, 3, 1), (7, 2));
         assert_eq!(status_segment(6, 5, 3, 2), (9, 2));
+    }
+
+    #[test]
+    fn status_text_fits_available_columns() {
+        assert_eq!(status_text("READY", "shell", 13), " READY shell ");
+        assert_eq!(status_text("READY", "shell", 12), " READY ");
+        assert_eq!(status_text("READY", "shell", 6), " R ");
+        assert_eq!(status_text("READY", "shell", 2), "");
+    }
+
+    #[test]
+    fn status_text_uses_display_width_for_wide_titles() {
+        assert_eq!(status_text("READY", "셸", 10), " READY 셸 ");
+        assert_eq!(status_text("READY", "셸", 9), " READY ");
     }
 
     #[test]

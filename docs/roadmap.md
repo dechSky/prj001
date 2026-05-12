@@ -1,6 +1,6 @@
 # pj001 — MVP+ 로드맵 (M11~M19)
 
-**상태**: 로드맵 v2 (2026-05-08, historical). 코드/세부 설계 미반영. **2026-05-11부로 정본 이전 — 실제 milestone trajectory는 `archive/docs/architecture/m12-m16-pj001-sessions-tabs-bridge-plan.md` 참조**.
+**상태**: 로드맵 v2 (2026-05-08, historical). 코드/세부 설계 미반영. **2026-05-11부로 정본 이전 — 실제 milestone trajectory는 `archive/docs/architecture/m12-m16-pj001-sessions-tabs-bridge-plan.md` 참조**. 2026-05-12 pull 기준 M12/M13은 코드 완료 상태로 확인.
 **목적**: M7까지 도달한 "표시·실행" 영역 위에, **Mac 터미널 일상 사용 격차**를 메우고 그 위로 확장.
 **스타일**: high-level 1장. 각 단계 진입 직전 별도 `M??-design.md` 작성(M7 cursor / M8 keyboard와 동일 패턴).
 
@@ -10,7 +10,7 @@
 
 ## 2026-05-11 갱신 — 정본 이전 + milestone 번호 재배치
 
-**완료 상태**: M1~M10 + M17(reflow) + **M11 workspace 분리**(commit `396a536`, cargo test 66 → 75) 완료. archive-bridge MVP crate 생성(archive `f18b257`).
+**완료 상태**: M1~M10 + M17(reflow) + **M11 workspace 분리**(commit `396a536`, cargo test 66 → 75) + **M12 Session 추출** + **M13 BSP layout tree**(commits `d716b70`~`ed52803`, 후속 redraw fix `b351f69`~`248a195`) 완료. archive-bridge MVP crate 생성(archive `f18b257`). 2026-05-12 `cargo test` 104개 통과.
 
 **상용 급 OSS 지향 확장**: 학습 목적에서 "macOS 전용 빠르고 정확한 GPU 터미널, Alacritty/Ghostty 하위 80% 사용 사례 통과, AI CLI 깨뜨리지 않는 host terminal"(Codex 정의)로 1차 목표 확장. 광역 웹 분석(Warp/iTerm2/Ghostty/WezTerm/Alacritty/Kitty/Terminal.app) + Codex 2nd opinion 완료.
 
@@ -19,9 +19,9 @@
 | # | 본 로드맵 (v2, deprecated) | 새 번호 (m12-m16 plan) | 주제 |
 |---|---|---|---|
 | ~~M11~~ | VT 인프라 보강 (ICH/DCH/IL/DL/ECH/DECSTR/RIS/G0+DEC line drawing) | **재배치 필요** — 새 trajectory 어디에 들어가는지 미확정 (M13/M14 단계 외부) |
-| M12 (신규) | — | **Session 추출** (PTY ↔ visible slot 분리, refactor only) |
-| M13 (신규) | — | **Layout tree** (BSP, flexible split + divider drag + 3+ pane) |
-| M14 (신규) | — | **Tabs** (tab bar, Cmd+T, Cmd+숫자) |
+| M12 (신규) | — | **Session 추출** (PTY ↔ visible slot 분리, refactor only) — 완료 |
+| M13 (신규) | — | **Layout tree** (BSP, flexible split + divider drag + 3+ pane) — 완료 |
+| M14 (신규) | — | **Tabs** (tab bar, Cmd+T, Cmd+숫자) — 다음 후보 |
 | M15 (신규) | — | **AgentKind + dynamic spawn** |
 | M16 (신규) | — | **Bridge graph** (multi-select N-target routing) |
 
@@ -45,7 +45,7 @@
 
 ### 상용 급 P0~P3 (Codex 합의)
 
-- **P0**: m12-m16 trajectory(M12 layout 일반화 → M13 BSP) + VT 인프라 보강 + 마우스 selection + paste/drop sanitization + fuzzing + crash log local bundle
+- **P0**: m12-m16 trajectory(M14 tabs 이후 M15/M16) + VT 인프라 보강 + 마우스 selection + paste/drop sanitization + fuzzing + crash log local bundle
 - **P1**: OSC 8/133/7 + title stack + config + keybindings + profiles + KKP + mouse reporting + find + buffer clear + font zoom
 - **P2**: Developer ID signing + notarization + release DMG + 보안 정책 문서 + ligature + accessibility minimal tree
 - **P3**: preferences GUI + vibrancy/blur + Sparkle + Quick terminal + Kitty graphics experimental + AppleScript/Shortcuts
