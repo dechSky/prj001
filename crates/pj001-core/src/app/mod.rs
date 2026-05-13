@@ -835,6 +835,10 @@ struct AppState {
     current_scale_factor: f64,
     quick_spawn_presets: Vec<QuickSpawnPreset>,
     pending_quick_spawn: Option<Instant>,
+    /// 슬라이스 6.6b (Codex review B-1): 마우스 버튼 상태 비트마스크.
+    /// bit 0 = Left, bit 1 = Middle, bit 2 = Right. selection.dragging은 reporting이
+    /// press를 흡수하면 false라서 1002 ButtonEvent drag motion이 안 보내짐 → 별도 추적.
+    mouse_buttons_held: u8,
     /// M12-6: design §2.1의 monotonic ID 정책을 IdAllocator로 캡슐화. M15 dynamic spawn에서 활용.
     #[allow(dead_code)]
     ids: IdAllocator,
@@ -845,9 +849,10 @@ struct AppState {
 #[derive(Clone, Debug, Default)]
 struct FindState {
     query: String,
-    /// 마지막 발견된 match의 절대 row (scrollback rows + main grid rows 통합 좌표).
-    /// None = 미발견 / 아직 검색 안 함. 6.5b: next/prev 시작점.
-    last_match_abs: Option<usize>,
+    /// 마지막 발견된 match의 (절대 row, col_start).
+    /// 슬라이스 6.5b → Codex B-2 fix: row만으론 같은 row의 다중 match 순회 불가 →
+    /// (row, col) 튜플로 확장. next는 같은 row의 다음 col → 다음 row → ...로 진행.
+    last_match_abs: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1049,9 +1054,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.dragging_divider.is_some() {
                     state.drag_divider_to_mouse();
                 } else if !state.modifiers.shift_key()
-                    && state.try_report_mouse_motion(
-                        state.selection.as_ref().is_some_and(|s| s.dragging),
-                    )
+                    && state.try_report_mouse_motion(state.mouse_buttons_held != 0)
                 {
                     // 마우스 reporting이 이벤트를 흡수.
                 } else if state.update_selection_to_mouse() {
@@ -1072,11 +1075,11 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                let pressed = matches!(button_state, ElementState::Pressed);
+                // 슬라이스 6.6b: button_held 추적 (reporting 흡수와 무관하게 일관 상태).
+                state.track_mouse_button(pressed, 0);
                 // 슬라이스 6.3c: Cmd+click on hyperlink cell → 브라우저로 OSC 8 URI 열기.
-                if matches!(button_state, ElementState::Pressed)
-                    && state.modifiers.super_key()
-                    && !state.modifiers.shift_key()
-                {
+                if pressed && state.modifiers.super_key() && !state.modifiers.shift_key() {
                     if state.try_open_hyperlink_at_mouse() {
                         return;
                     }
@@ -1084,7 +1087,6 @@ impl ApplicationHandler<UserEvent> for App {
                 // 슬라이스 6.6: mouse reporting 활성 + Shift 미보유 → PTY로 전달.
                 // Shift 보유 시 selection 모드로 우회 (xterm/iterm 표준).
                 if !state.modifiers.shift_key() {
-                    let pressed = matches!(button_state, ElementState::Pressed);
                     if state.try_report_mouse_button(pressed, 0) {
                         return;
                     }
@@ -1123,13 +1125,14 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Right,
                 ..
             } => {
+                let pressed = matches!(button_state, ElementState::Pressed);
+                state.track_mouse_button(pressed, 2);
                 if !state.modifiers.shift_key() {
-                    let pressed = matches!(button_state, ElementState::Pressed);
                     if state.try_report_mouse_button(pressed, 2) {
                         return;
                     }
                 }
-                if matches!(button_state, ElementState::Pressed) {
+                if pressed {
                     if let Some((pane_id, _)) = state.pane_cell_at_mouse() {
                         state.set_active(pane_id);
                         if state.selection.is_some() {
@@ -1144,8 +1147,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Middle,
                 ..
             } => {
+                let pressed = matches!(button_state, ElementState::Pressed);
+                state.track_mouse_button(pressed, 1);
                 if !state.modifiers.shift_key() {
-                    let pressed = matches!(button_state, ElementState::Pressed);
                     let _ = state.try_report_mouse_button(pressed, 1);
                 }
             }
@@ -2019,7 +2023,7 @@ impl AppState {
             find.last_match_abs = None;
             self.window
                 .set_title(&format!("find: {} — pj001", find.query));
-            self.find_apply_current_query(0, true);
+            self.find_apply_current_query(0, 0, true);
             self.window.request_redraw();
         }
     }
@@ -2033,38 +2037,39 @@ impl AppState {
             find.last_match_abs = None;
             self.window
                 .set_title(&format!("find: {} — pj001", find.query));
-            self.find_apply_current_query(0, true);
+            self.find_apply_current_query(0, 0, true);
             self.window.request_redraw();
         }
     }
 
-    /// Enter — 마지막 match 다음 위치부터 forward 검색.
+    /// Enter — 마지막 match 다음 위치(같은 row의 col+1 또는 다음 row)부터 forward.
     fn find_next(&mut self) {
-        let start = self
-            .pending_find
-            .as_ref()
-            .and_then(|f| f.last_match_abs.map(|abs| abs.saturating_add(1)))
-            .unwrap_or(0);
-        self.find_apply_current_query(start, true);
-        self.window.request_redraw();
-    }
-
-    /// Shift+Enter — 마지막 match 이전 위치부터 backward 검색.
-    fn find_prev(&mut self) {
-        let start_from = self
+        let (start_row, start_col) = self
             .pending_find
             .as_ref()
             .and_then(|f| f.last_match_abs)
-            .unwrap_or(0);
-        // backward 검색 — 시작점부터 거꾸로.
-        self.find_apply_current_query(start_from, false);
+            .map(|(r, c)| (r, c.saturating_add(1)))
+            .unwrap_or((0, 0));
+        self.find_apply_current_query(start_row, start_col, true);
         self.window.request_redraw();
     }
 
-    /// 현재 query를 `start_abs`부터 `forward` 방향으로 검색, 발견 시 view에 띄우고
-    /// last_match_abs 갱신, **match cells에 selection highlight 적용**.
-    /// `forward=false`면 start_abs까지 거꾸로(start_abs는 exclusive).
-    fn find_apply_current_query(&mut self, start_abs: usize, forward: bool) {
+    /// Shift+Enter — 마지막 match 이전 위치부터 backward.
+    fn find_prev(&mut self) {
+        let (start_row, start_col) = self
+            .pending_find
+            .as_ref()
+            .and_then(|f| f.last_match_abs)
+            .unwrap_or((0, 0));
+        self.find_apply_current_query(start_row, start_col, false);
+        self.window.request_redraw();
+    }
+
+    /// 현재 query를 `(start_row, start_col)` 부터 `forward` 방향으로 검색, 발견 시
+    /// view에 띄우고 `last_match_abs` 갱신, **match cells에 selection highlight 적용**.
+    /// 같은 row 안에서 start_col 이후/이전 occurrence를 먼저 확인 후 다음/이전 row로 진행.
+    /// `forward=false`면 start_col 이전 occurrence를 거꾸로 검색.
+    fn find_apply_current_query(&mut self, start_row: usize, start_col: usize, forward: bool) {
         let query = match self.pending_find.as_ref() {
             Some(f) if !f.query.is_empty() => f.query.clone(),
             _ => return,
@@ -2083,9 +2088,9 @@ impl AppState {
             return;
         }
         let range: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(start_abs.min(total)..total)
+            Box::new(start_row.min(total)..total)
         } else {
-            Box::new((0..start_abs.min(total)).rev())
+            Box::new((0..=start_row.min(total.saturating_sub(1))).rev())
         };
         let query_chars: Vec<char> = query.chars().collect();
         let qlen = query_chars.len();
@@ -2105,15 +2110,44 @@ impl AppState {
                 let chars: Vec<char> = (0..cols).map(|c| term.cell(row, c).ch).collect();
                 (chars, row)
             };
-            // char-단위 정확 매칭 — col index가 그대로 셀 좌표.
-            if qlen > 0 && qlen <= row_chars.len() {
-                if let Some(col_start) = row_chars
+            if qlen == 0 || qlen > row_chars.len() {
+                continue;
+            }
+            // 같은 row에서는 start_col 기준 적용, 다른 row로 넘어가면 전체 검색.
+            // forward면 같은 start_row일 때 col >= start_col인 첫 매치, 그 외 row는 첫 매치.
+            // backward면 같은 start_row일 때 col < start_col인 마지막 매치, 그 외 row는 마지막 매치.
+            let result = if abs == start_row {
+                if forward {
+                    row_chars
+                        .windows(qlen)
+                        .enumerate()
+                        .skip(start_col)
+                        .find(|(_, w)| *w == query_chars.as_slice())
+                        .map(|(i, _)| i)
+                } else {
+                    row_chars
+                        .windows(qlen)
+                        .enumerate()
+                        .take(start_col)
+                        .filter(|(_, w)| *w == query_chars.as_slice())
+                        .last()
+                        .map(|(i, _)| i)
+                }
+            } else if forward {
+                row_chars
                     .windows(qlen)
                     .position(|w| w == query_chars.as_slice())
-                {
-                    found = Some((abs, col_start, visible_row));
-                    break;
-                }
+            } else {
+                row_chars
+                    .windows(qlen)
+                    .enumerate()
+                    .filter(|(_, w)| *w == query_chars.as_slice())
+                    .last()
+                    .map(|(i, _)| i)
+            };
+            if let Some(col_start) = result {
+                found = Some((abs, col_start, visible_row));
+                break;
             }
         }
         if found.is_none() {
@@ -2142,7 +2176,7 @@ impl AppState {
                 dragging: false,
             });
             if let Some(find) = self.pending_find.as_mut() {
-                find.last_match_abs = Some(abs);
+                find.last_match_abs = Some((abs, col_start));
             }
         } else {
             log::info!("find: no match query=\"{}\"", query);
@@ -2737,6 +2771,7 @@ impl AppState {
             pending_quick_spawn: None,
             ids,
             pending_find: None,
+            mouse_buttons_held: 0,
         };
         state.update_min_inner_size();
         Ok(state)
@@ -2886,6 +2921,22 @@ impl AppState {
             log::warn!("hyperlink open failed: {e}");
         }
         true
+    }
+
+    /// 슬라이스 6.6b (Codex B-1): 마우스 버튼 비트마스크 갱신. reporting이 press를
+    /// 흡수해도 button_held 추적은 일관되도록 모든 MouseInput에서 호출.
+    fn track_mouse_button(&mut self, pressed: bool, button: u8) {
+        let bit: u8 = match button {
+            0 => 0b001, // Left
+            1 => 0b010, // Middle
+            2 => 0b100, // Right
+            _ => return,
+        };
+        if pressed {
+            self.mouse_buttons_held |= bit;
+        } else {
+            self.mouse_buttons_held &= !bit;
+        }
     }
 
     /// 슬라이스 6.6: 마우스 버튼 이벤트를 reporting mode일 때만 PTY로 송신.

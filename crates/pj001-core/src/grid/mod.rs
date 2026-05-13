@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
@@ -196,6 +196,10 @@ impl Grid {
 
 /// 정책 B: scrollback hard cap 10,000 rows.
 const SCROLLBACK_CAP: usize = 10_000;
+
+/// 슬라이스 6.3e (Codex A-1): hyperlink pool이 이 크기 도달 시 GC 트리거. 1024 = 적당히
+/// 큰 길이의 shell session에서도 dedupe만으로 충분히 수용 가능한 hysteresis.
+const HYPERLINK_POOL_GC_THRESHOLD: usize = 1024;
 
 /// M11-4: DEC Special Character and Line Drawing Set 매핑 (xterm 표준).
 /// 7-bit 0x5f..=0x7e 영역만 변환. 그 외 입력은 통과.
@@ -591,7 +595,7 @@ impl Term {
         self.hyperlink_uri.as_deref()
     }
     /// OSC 8 dispatch — URI 지정/해제. Some이면 pool에 등록(또는 기존 인덱스 재사용)하고
-    /// 다음 `print()`부터 cells에 hyperlink_id stamp.
+    /// 다음 `print()`부터 cells에 hyperlink_id stamp. pool이 임계 도달 시 GC.
     pub fn set_hyperlink_uri(&mut self, uri: Option<String>) {
         match uri {
             None => {
@@ -599,24 +603,98 @@ impl Term {
                 self.active_hyperlink_id = 0;
             }
             Some(u) => {
-                // pool에 이미 있으면 인덱스 재사용, 없으면 push.
-                let id = self
-                    .hyperlink_pool
-                    .iter()
-                    .position(|p| p == &u)
-                    .map(|i| (i + 1) as u16)
-                    .unwrap_or_else(|| {
-                        // u16 overflow 방어 — 65535개까지만 등록. 그 이상은 ID 0(링크 없음)으로 fallback.
-                        if self.hyperlink_pool.len() >= u16::MAX as usize - 1 {
-                            return 0;
-                        }
-                        self.hyperlink_pool.push(u.clone());
-                        self.hyperlink_pool.len() as u16
-                    });
-                self.active_hyperlink_id = id;
+                // 이미 있는 URI면 GC 없이 인덱스 재사용.
+                if let Some(idx) = self.hyperlink_pool.iter().position(|p| p == &u) {
+                    self.active_hyperlink_id = (idx + 1) as u16;
+                    self.hyperlink_uri = Some(u);
+                    return;
+                }
+                // 새 URI — 임계 도달 시 GC 먼저.
+                if self.hyperlink_pool.len() >= HYPERLINK_POOL_GC_THRESHOLD {
+                    self.gc_hyperlink_pool();
+                }
+                // 그래도 u16 한계 근접하면 추가 안 함 (ID 0 fallback).
+                if self.hyperlink_pool.len() >= u16::MAX as usize - 1 {
+                    self.active_hyperlink_id = 0;
+                    self.hyperlink_uri = Some(u);
+                    return;
+                }
+                self.hyperlink_pool.push(u.clone());
+                self.active_hyperlink_id = self.hyperlink_pool.len() as u16;
                 self.hyperlink_uri = Some(u);
             }
         }
+    }
+
+    /// 슬라이스 6.3e (Codex A-1): pool에서 미참조 URI 제거 + 살아있는 URI 재할당 + 모든 cells의
+    /// hyperlink_id를 새 인덱스로 remap. 임계 도달 시 자동 호출 + 수동 호출 가능.
+    pub fn gc_hyperlink_pool(&mut self) {
+        if self.hyperlink_pool.is_empty() {
+            return;
+        }
+        // 1. 사용 중인 id 수집 (main + alt + scrollback + active 자체).
+        let mut used: HashSet<u16> = HashSet::new();
+        for cell in &self.main.cells {
+            if cell.hyperlink_id != 0 {
+                used.insert(cell.hyperlink_id);
+            }
+        }
+        for cell in &self.alt.cells {
+            if cell.hyperlink_id != 0 {
+                used.insert(cell.hyperlink_id);
+            }
+        }
+        for sb in &self.scrollback {
+            for cell in &sb.cells {
+                if cell.hyperlink_id != 0 {
+                    used.insert(cell.hyperlink_id);
+                }
+            }
+        }
+        if self.active_hyperlink_id != 0 {
+            used.insert(self.active_hyperlink_id);
+        }
+        // 2. 새 pool + 매핑 빌드.
+        let mut remap: HashMap<u16, u16> = HashMap::new();
+        let mut new_pool: Vec<String> = Vec::with_capacity(used.len());
+        for (idx, uri) in self.hyperlink_pool.iter().enumerate() {
+            let old_id = (idx + 1) as u16;
+            if used.contains(&old_id) {
+                new_pool.push(uri.clone());
+                let new_id = new_pool.len() as u16;
+                remap.insert(old_id, new_id);
+            }
+        }
+        // 3. 모든 cells의 hyperlink_id를 remap (미참조였던 ID는 0으로).
+        for cell in self.main.cells.iter_mut() {
+            if cell.hyperlink_id != 0 {
+                cell.hyperlink_id = remap.get(&cell.hyperlink_id).copied().unwrap_or(0);
+            }
+        }
+        for cell in self.alt.cells.iter_mut() {
+            if cell.hyperlink_id != 0 {
+                cell.hyperlink_id = remap.get(&cell.hyperlink_id).copied().unwrap_or(0);
+            }
+        }
+        for sb in self.scrollback.iter_mut() {
+            for cell in sb.cells.iter_mut() {
+                if cell.hyperlink_id != 0 {
+                    cell.hyperlink_id = remap.get(&cell.hyperlink_id).copied().unwrap_or(0);
+                }
+            }
+        }
+        if self.active_hyperlink_id != 0 {
+            self.active_hyperlink_id = remap
+                .get(&self.active_hyperlink_id)
+                .copied()
+                .unwrap_or(0);
+        }
+        self.hyperlink_pool = new_pool;
+        log::debug!(
+            "hyperlink pool GC: kept {} of {}",
+            self.hyperlink_pool.len(),
+            remap.len()
+        );
     }
 
     /// hyperlink_id로 URI 조회. 0이거나 pool 범위 밖이면 None.

@@ -946,6 +946,39 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_gc_removes_unreferenced_uris() {
+        let mut term = Term::new(10, 2);
+        // 3 distinct URI 등록, 그 중 한 개만 cells에 stamp.
+        run(&mut term, b"\x1b]8;;https://a.com\x1b\\");
+        run(&mut term, b"A");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        // 두 번째 URI는 cells에 안 찍히게 (즉시 close).
+        run(&mut term, b"\x1b]8;;https://b.com\x1b\\");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        // 세 번째 URI도 active만 두고 stamp 없음.
+        run(&mut term, b"\x1b]8;;https://c.com\x1b\\");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        // active=0 상태로 GC 호출 → b/c는 unreferenced, a만 살아남음.
+        assert_eq!(term.hyperlink_pool_len(), 3);
+        term.gc_hyperlink_pool();
+        assert_eq!(term.hyperlink_pool_len(), 1);
+        // 살아남은 URI는 id=1로 remap.
+        assert_eq!(term.hyperlink_uri_by_id(1), Some("https://a.com"));
+        assert_eq!(term.cell(0, 0).hyperlink_id, 1);
+    }
+
+    #[test]
+    fn hyperlink_gc_preserves_active_id() {
+        let mut term = Term::new(10, 1);
+        run(&mut term, b"\x1b]8;;https://x.com\x1b\\");
+        // active=1 상태로 GC (cells에 stamp 없어도 active 보존).
+        assert_eq!(term.hyperlink_pool_len(), 1);
+        term.gc_hyperlink_pool();
+        assert_eq!(term.hyperlink_pool_len(), 1);
+        assert_eq!(term.hyperlink_uri_by_id(1), Some("https://x.com"));
+    }
+
+    #[test]
     fn mouse_mode_1000_button_tracking() {
         let mut term = Term::new(8, 1);
         assert_eq!(term.mouse_protocol(), MouseProtocol::Off);
