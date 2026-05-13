@@ -490,7 +490,7 @@ vte::Perform::osc_dispatch 활성화. 첫 인자(파라미터 ID) 분기. 현재
 ### 13.2 미해결 (사용자 결정 필요)
 
 - **M11 DA/DA2 응답 레벨**: **`xterm-256color`로 잠정 결정** — pty/mod.rs가 이미 `TERM=xterm-256color` env 설정(M8-7). DA/DA2 응답이 env와 일치해야 vim/tmux feature set이 일관. M11 detail design에서 최종 byte 형식 확인.
-- **M15 Cmd+K 컨벤션**: Mac Terminal은 `Cmd+K = Clear to Start`(buffer + scrollback 모두 지움) 가능성 — `Cmd+K=buffer only / Cmd+Shift+K=scrollback only` 분리는 iTerm2 컨벤션일 수 있음. M15 진입 전 web 확인 후 사용자가 학습된 동작과 일치하도록 결정.
+- ~~**M15 Cmd+K 컨벤션**: Mac Terminal은 `Cmd+K = Clear to Start`(buffer + scrollback 모두 지움) 가능성 — `Cmd+K=buffer only / Cmd+Shift+K=scrollback only` 분리는 iTerm2 컨벤션일 수 있음.~~ **확정 (2026-05-13, commit `e1beb2f`/`d112a26` 시점)**: iTerm2 스타일 채택 — `Cmd+K = ClearBuffer` (화면만), `Cmd+Shift+K` 또는 `Cmd+Option+K = ClearScrollback` (scrollback도). 개발자 friendly + 의도적 분리 가능. Apple Terminal "Clear to Start" 한 번에 다 지우는 동작이 필요하면 `Cmd+Shift+K`로 충분.
 - **M18 탭 구현 방식**: 단일 창+자체 탭바(추천) / macOS native tabbing / 멀티 winit 창. 진입 시.
 - **M19 GUI 여부**: config 파일 먼저, 별도 settings 창은 P3. 우클릭/context menu와 keybinding 충돌 대응은 `docs/settings-and-context-menu-plan.md` 기준.
 - **OSC 8 URL 스킴 whitelist**: http/https/mailto만? 진입 시.
