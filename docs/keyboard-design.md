@@ -451,16 +451,22 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | **Cmd+Q** | 앱 종료 (`event_loop.exit()`) | macOS 표준 |
 | **Cmd+W** | active pane 닫기. active tab에 pane이 1개면 tab 닫기. 마지막 tab이면 앱 종료 | M14 tabs 정책 |
 | **Cmd+Shift+W** | 현재 tab 강제 닫기. 마지막 tab이면 앱 종료 | M14 tabs 정책 |
-| **Cmd+C** | swallow (PTY 안 보냄). clipboard 미구현 명시 | M11+ clipboard task |
+| **Cmd+C** | 드래그 선택이 있으면 arboard clipboard에 선택 텍스트 복사. 선택이 없으면 swallow | M12 selection clipboard 첫 slice |
 | **Cmd+V** | **clipboard paste** (arboard로 읽어 PTY 송신, bracketed paste mode면 `\e[200~`...`\e[201~` wrap). M10-6에서 구현 (2026-05-08) | 일상 사용 필수 |
+| **우클릭** | 클릭한 pane 활성화. 선택이 있으면 clipboard copy. paste는 실수 명령 실행 위험 때문에 Cmd+V로 유지 | M12 mouse selection 첫 slice |
+| **Cmd+← / Cmd+→** | shell line editor Home/End byte 송신 (`ESC OH` / `ESC OF`) | macOS text-field convention |
+| **Cmd+↑ / Cmd+↓** | main screen scrollback 맨 위/아래 이동 | macOS terminal convention |
 | **Cmd+T** | 새 tab 생성 | M14 tabs |
 | **Cmd+1..9** | n번째 tab 전환 | M14 tabs |
 | **Cmd+Option+1..9** | active tab 안 n번째 pane 전환 | `Cmd+Shift+숫자`는 macOS/global shortcut 충돌 가능성이 있어 제외 |
 | **Cmd+[ / Cmd+]** | active tab 안 이전/다음 pane 전환 | M13 layout |
 | **Cmd+Shift+[ / Cmd+Shift+]** | 이전/다음 tab 전환 | M14 tabs |
 | **Cmd+N** | active tab에 새 shell pane 추가 (vertical split) | M15 dynamic spawn 첫 slice |
-| **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; bridge mode는 `c=Claude`, `x=Codex` 추가 | M15 dynamic spawn, core는 preset data만 사용 |
+| **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; bridge mode는 `c=Claude`, `x=Codex` 추가. 3초 내 입력 없으면 자동 취소 | M15 dynamic spawn, core는 preset data만 사용 |
 | **Cmd+R** | active pane의 session을 같은 command로 재시작. SessionId는 새로 발급되고 scrollback은 초기화 | M15 respawn 첫 slice |
+| **Cmd+= / Cmd+- / Cmd+0** | 폰트 크기 확대/축소/기본값 복귀. logical font size는 6~72pt로 clamp하고 monitor scale factor는 렌더 직전 적용 | M15 font zoom 첫 slice |
+| **마우스 드래그** | 보이는 active pane 텍스트 셀 선택 하이라이트. Cmd+C로 선택 텍스트 복사 | M12 selection 첫 slice |
+| **더블클릭 / 트리플클릭** | 더블클릭은 단어 선택, 트리플클릭은 줄 선택 | M12 selection UX |
 | **그 외 Cmd+key** | swallow (안전 기본값) | shell이 Cmd modifier 의미 가질 가능성 0에 가까움. PTY 보내면 의도 없는 byte |
 
 구현:

@@ -32,14 +32,22 @@ pub struct CursorRender {
     pub focused: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
 const FG_DEFAULT: [f32; 4] = [0.86, 0.86, 0.86, 1.0];
 const BG_DEFAULT: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
+const SELECTION_BG: [f32; 4] = [0.18, 0.35, 0.50, 1.0];
 
 pub fn build_instances_at(
     term: &Term,
     atlas: &GlyphAtlas,
     baseline: f32,
     cursor: Option<CursorRender>,
+    selection: Option<SelectionRange>,
     col_offset: usize,
     row_offset: usize,
 ) -> Vec<CellInstance> {
@@ -54,7 +62,10 @@ pub fn build_instances_at(
             // cursor 위치 cell도 다른 cell과 동일하게 main 렌더. cursor overlay instance가
             // 그 위에 별도로 shape 영역만 덮음 (Model A — cursor-design.md §5.0).
             let reversed = cell.attrs.contains(Attrs::REVERSE);
-            let (fg, bg) = if reversed {
+            let selected = selection.is_some_and(|selection| selection.contains(r, c));
+            let (fg, bg) = if selected {
+                (FG_DEFAULT, SELECTION_BG)
+            } else if reversed {
                 (resolve(cell.bg, false), resolve(cell.fg, true))
             } else {
                 (resolve(cell.fg, true), resolve(cell.bg, false))
@@ -67,7 +78,7 @@ pub fn build_instances_at(
             };
 
             let bg_is_default = bg == BG_DEFAULT;
-            if entry.is_none() && bg_is_default {
+            if entry.is_none() && bg_is_default && !selected {
                 continue;
             }
 
@@ -169,6 +180,44 @@ pub fn build_instances_at(
     }
 
     out
+}
+
+impl SelectionRange {
+    pub fn new(anchor: (usize, usize), head: (usize, usize)) -> Self {
+        if anchor <= head {
+            Self {
+                start: anchor,
+                end: head,
+            }
+        } else {
+            Self {
+                start: head,
+                end: anchor,
+            }
+        }
+    }
+
+    fn contains(self, row: usize, col: usize) -> bool {
+        (row, col) >= self.start && (row, col) <= self.end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SelectionRange;
+
+    #[test]
+    fn selection_range_normalizes_drag_direction() {
+        let range = SelectionRange::new((3, 8), (1, 2));
+
+        assert_eq!(range.start, (1, 2));
+        assert_eq!(range.end, (3, 8));
+        assert!(range.contains(1, 2));
+        assert!(range.contains(2, 0));
+        assert!(range.contains(3, 8));
+        assert!(!range.contains(1, 1));
+        assert!(!range.contains(3, 9));
+    }
 }
 
 /// IME preedit overlay. Term grid는 건드리지 않고 cursor (start_col, start_row) 위치부터

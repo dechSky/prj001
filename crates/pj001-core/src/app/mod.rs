@@ -20,20 +20,25 @@ use winit::window::{CursorIcon, ImePurpose, Window, WindowId};
 use crate::error::{Error, Result};
 use crate::grid::Term;
 use crate::pty::PtyHandle;
-use crate::render::{CursorRender, Renderer};
+use crate::render::{CursorRender, Renderer, SelectionRange};
 use event::{IdAllocator, PaneId, SessionId, TabId, UserEvent};
 #[cfg(test)]
 use layout::SplitRatio;
 use layout::{Layout, RatioDirection, SplitAxis};
 use session::Session;
 
-const FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+const MIN_FONT_SIZE: f32 = 6.0;
+const MAX_FONT_SIZE: f32 = 72.0;
+const FONT_SIZE_STEP: f32 = 1.0;
 const MIN_WINDOW_WIDTH: u32 = 720;
 const MIN_WINDOW_HEIGHT: u32 = 420;
 const MIN_PANE_COLS: usize = 30;
 const MIN_PANE_ROWS: usize = 5;
 const TAB_BAR_ROWS: usize = 1;
 const CURSOR_BLINK_MS: u64 = 500;
+const QUICK_SPAWN_TIMEOUT_MS: u64 = 3_000;
+const MULTI_CLICK_MS: u64 = 500;
 const TAB_BAR_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
 const TAB_ACTIVE_BG: [f32; 4] = [0.18, 0.32, 0.42, 1.0];
 const TAB_INACTIVE_BG: [f32; 4] = [0.15, 0.16, 0.18, 1.0];
@@ -51,8 +56,16 @@ fn scale_factor_or_default(scale_factor: f64) -> f64 {
     }
 }
 
-fn physical_font_size(font_size: f32, scale_factor: f64) -> f32 {
-    font_size * scale_factor_or_default(scale_factor) as f32
+fn clamp_font_size(font_size: f32) -> f32 {
+    if font_size.is_finite() {
+        font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    } else {
+        DEFAULT_FONT_SIZE
+    }
+}
+
+fn physical_font_size(logical_font_size: f32, scale_factor: f64) -> f32 {
+    clamp_font_size(logical_font_size) * scale_factor_or_default(scale_factor) as f32
 }
 
 /// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
@@ -366,6 +379,79 @@ fn quick_spawn_hint(presets: &[QuickSpawnPreset]) -> String {
     }
 }
 
+fn quick_spawn_elapsed_timed_out(started_at: Instant, now: Instant) -> bool {
+    now.duration_since(started_at) > Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS)
+}
+
+fn selection_text(term: &Term, selection: SelectionRange) -> String {
+    let mut lines = Vec::new();
+    let start_row = selection.start.0.min(term.rows().saturating_sub(1));
+    let end_row = selection.end.0.min(term.rows().saturating_sub(1));
+    for row in start_row..=end_row {
+        let start_col = if row == selection.start.0 {
+            selection.start.1
+        } else {
+            0
+        };
+        let end_col = if row == selection.end.0 {
+            selection.end.1
+        } else {
+            term.cols().saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in start_col.min(term.cols())..=end_col.min(term.cols().saturating_sub(1)) {
+            let cell = term.cell(row, col);
+            if cell.attrs.contains(crate::grid::Attrs::WIDE_CONT) {
+                continue;
+            }
+            line.push(cell.ch);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+fn cmd_named_key_bytes(key: &winit::keyboard::NamedKey) -> Option<&'static [u8]> {
+    match key {
+        // macOS text-field convention: Cmd+Left/Right jump to line start/end.
+        // Use the same Home/End byte sequences this app already sends for zsh compatibility.
+        winit::keyboard::NamedKey::ArrowLeft => Some(b"\x1bOH"),
+        winit::keyboard::NamedKey::ArrowRight => Some(b"\x1bOF"),
+        _ => None,
+    }
+}
+
+fn is_word_selection_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn word_selection_range(term: &Term, row: usize, col: usize) -> Option<SelectionRange> {
+    if row >= term.rows() || col >= term.cols() {
+        return None;
+    }
+    let cell = term.cell(row, col);
+    if !is_word_selection_char(cell.ch) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 {
+        let prev = term.cell(row, start - 1);
+        if !is_word_selection_char(prev.ch) {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < term.cols() {
+        let next = term.cell(row, end + 1);
+        if !is_word_selection_char(next.ch) {
+            break;
+        }
+        end += 1;
+    }
+    Some(SelectionRange::new((row, start), (row, end)))
+}
+
 fn tab_text(title: &str, cols: usize) -> String {
     let title_width = UnicodeWidthStr::width(title);
     if cols >= title_width + 2 {
@@ -433,9 +519,13 @@ enum CmdShortcut {
     NewTab,
     QuickSpawnStart,
     RespawnSession,
+    FontZoomIn,
+    FontZoomOut,
+    FontZoomReset,
     ClosePaneOrTab,
     CloseTab,
     Quit,
+    Copy,
     Paste,
 }
 
@@ -517,6 +607,15 @@ fn cmd_shortcut(
     if lower == Some("r") || physical_code == Some(KeyCode::KeyR) {
         return Some(CmdShortcut::RespawnSession);
     }
+    if !alt && (physical_code == Some(KeyCode::Equal) || lower == Some("=") || lower == Some("+")) {
+        return Some(CmdShortcut::FontZoomIn);
+    }
+    if !alt && (physical_code == Some(KeyCode::Minus) || lower == Some("-") || lower == Some("_")) {
+        return Some(CmdShortcut::FontZoomOut);
+    }
+    if !alt && (physical_code == Some(KeyCode::Digit0) || lower == Some("0")) {
+        return Some(CmdShortcut::FontZoomReset);
+    }
     if lower == Some("w") || physical_code == Some(KeyCode::KeyW) {
         return Some(if shift {
             CmdShortcut::CloseTab
@@ -526,6 +625,9 @@ fn cmd_shortcut(
     }
     if lower == Some("q") || physical_code == Some(KeyCode::KeyQ) {
         return Some(CmdShortcut::Quit);
+    }
+    if lower == Some("c") || physical_code == Some(KeyCode::KeyC) {
+        return Some(CmdShortcut::Copy);
     }
     if lower == Some("v") || physical_code == Some(KeyCode::KeyV) {
         return Some(CmdShortcut::Paste);
@@ -584,10 +686,13 @@ struct AppState {
     modifiers: ModifiersState,
     last_mouse_pos: Option<PhysicalPosition<f64>>,
     dragging_divider: Option<layout::DividerHit>,
+    selection: Option<MouseSelection>,
+    last_click: Option<MouseClick>,
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
     pending_resize: Option<PhysicalSize<u32>>,
-    pending_font_size: Option<f32>,
+    logical_font_size: f32,
+    pending_logical_font_size: Option<f32>,
     preserve_grid_on_next_resize: bool,
     current_scale_factor: f64,
     quick_spawn_presets: Vec<QuickSpawnPreset>,
@@ -595,6 +700,22 @@ struct AppState {
     /// M12-6: design §2.1의 monotonic ID 정책을 IdAllocator로 캡슐화. M15 dynamic spawn에서 활용.
     #[allow(dead_code)]
     ids: IdAllocator,
+}
+
+#[derive(Clone, Debug)]
+struct MouseSelection {
+    pane: PaneId,
+    anchor: (usize, usize),
+    head: (usize, usize),
+    dragging: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MouseClick {
+    pane: PaneId,
+    cell: (usize, usize),
+    count: u8,
+    at: Instant,
 }
 
 impl App {
@@ -779,6 +900,8 @@ impl ApplicationHandler<UserEvent> for App {
                 state.last_mouse_pos = Some(position);
                 if state.dragging_divider.is_some() {
                     state.drag_divider_to_mouse();
+                } else if state.update_selection_to_mouse() {
+                    state.window.request_redraw();
                 }
                 state.update_mouse_cursor();
             }
@@ -794,23 +917,44 @@ impl ApplicationHandler<UserEvent> for App {
             } => match button_state {
                 ElementState::Pressed => {
                     if let Some(tab_id) = state.tab_at_mouse() {
+                        state.selection = None;
                         state.set_active_tab(tab_id);
                         return;
                     }
                     if let Some(hit) = state.divider_hit_at_mouse() {
+                        state.selection = None;
                         state.dragging_divider = Some(hit);
                         state.update_mouse_cursor();
                         return;
                     }
-                    if let Some(pane_id) = state.pane_at_mouse(true) {
+                    if let Some((pane_id, cell)) = state.pane_cell_at_mouse() {
                         state.set_active(pane_id);
+                        state.start_selection_at(pane_id, cell);
+                        state.window.request_redraw();
+                    } else if let Some(pane_id) = state.pane_at_mouse(true) {
+                        state.set_active(pane_id);
+                        state.selection = None;
                     }
                 }
                 ElementState::Released => {
                     state.dragging_divider = None;
+                    state.finish_selection_drag();
                     state.update_mouse_cursor();
                 }
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if let Some((pane_id, _)) = state.pane_cell_at_mouse() {
+                    state.set_active(pane_id);
+                    if state.selection.is_some() {
+                        state.handle_copy();
+                    }
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // trackpad swipe / 마우스 휠로 scrollback 스크롤.
                 // delta y > 0 = 손가락 위로 = scrollback 위로(view_offset 증가).
@@ -925,6 +1069,41 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    if !state.modifiers.alt_key() && !state.modifiers.control_key() {
+                        if let Key::Named(named) = &event.logical_key {
+                            if let Some(bytes) = cmd_named_key_bytes(named) {
+                                let idx = state.active_index();
+                                if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes)
+                                {
+                                    log::warn!("cmd+arrow write failed: {e}");
+                                }
+                                return;
+                            }
+                            match named {
+                                NamedKey::ArrowUp => {
+                                    let idx = state.active_index();
+                                    if let Ok(mut term) =
+                                        state.session_for_pane_idx(idx).term.lock()
+                                    {
+                                        term.scroll_view_by(isize::MAX);
+                                    }
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                                NamedKey::ArrowDown => {
+                                    let idx = state.active_index();
+                                    if let Ok(mut term) =
+                                        state.session_for_pane_idx(idx).term.lock()
+                                    {
+                                        term.snap_to_bottom();
+                                    }
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     let lower = match &event.logical_key {
                         Key::Character(s) => Some(s.to_lowercase()),
                         _ => None,
@@ -993,6 +1172,18 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        Some(CmdShortcut::FontZoomIn) => {
+                            state.set_logical_font_size(state.logical_font_size + FONT_SIZE_STEP);
+                            return;
+                        }
+                        Some(CmdShortcut::FontZoomOut) => {
+                            state.set_logical_font_size(state.logical_font_size - FONT_SIZE_STEP);
+                            return;
+                        }
+                        Some(CmdShortcut::FontZoomReset) => {
+                            state.set_logical_font_size(DEFAULT_FONT_SIZE);
+                            return;
+                        }
                         Some(CmdShortcut::CloseTab) => {
                             state.apply_close_decision(
                                 event_loop,
@@ -1020,6 +1211,10 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(CmdShortcut::Quit) => {
                             log::info!("cmd+q: exit");
                             event_loop.exit();
+                            return;
+                        }
+                        Some(CmdShortcut::Copy) => {
+                            state.handle_copy();
                             return;
                         }
                         Some(CmdShortcut::Paste) => {
@@ -1116,6 +1311,10 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(size) = state.pending_resize.take() {
             state.resize(size);
         }
+        if state.quick_spawn_timed_out() {
+            state.cancel_quick_spawn("timeout");
+        }
+        let quick_spawn_deadline = state.quick_spawn_deadline();
         // 깜빡임 정지 조건:
         // - 창 비활성 (focused=false)
         // - cursor.blinking=false (DECSCUSR steady)
@@ -1125,12 +1324,16 @@ impl ApplicationHandler<UserEvent> for App {
                 state.cursor_visible = true;
                 state.window.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            if let Some(deadline) = quick_spawn_deadline {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
             return;
         }
         let blink = Duration::from_millis(CURSOR_BLINK_MS);
         let now = Instant::now();
-        let next = if now.duration_since(state.last_blink) >= blink {
+        let mut next = if now.duration_since(state.last_blink) >= blink {
             state.cursor_visible = !state.cursor_visible;
             state.last_blink = now;
             state.window.request_redraw();
@@ -1138,6 +1341,9 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             state.last_blink + blink
         };
+        if let Some(deadline) = quick_spawn_deadline {
+            next = next.min(deadline);
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
@@ -1568,7 +1774,7 @@ impl AppState {
             return false;
         };
         self.pending_quick_spawn = None;
-        if started_at.elapsed() > Duration::from_secs(3) {
+        if started_at.elapsed() > Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS) {
             self.cancel_quick_spawn("timeout");
             return true;
         }
@@ -1596,6 +1802,16 @@ impl AppState {
             self.window.set_title(&format!("{} — pj001", title));
         }
         true
+    }
+
+    fn quick_spawn_timed_out(&self) -> bool {
+        self.pending_quick_spawn
+            .is_some_and(|started_at| quick_spawn_elapsed_timed_out(started_at, Instant::now()))
+    }
+
+    fn quick_spawn_deadline(&self) -> Option<Instant> {
+        self.pending_quick_spawn
+            .map(|started_at| started_at + Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS))
     }
 
     fn respawn_active(&mut self) -> Result<()> {
@@ -2007,7 +2223,7 @@ impl AppState {
             &queue,
             format,
             [size.width as f32, size.height as f32],
-            physical_font_size(FONT_SIZE, window.scale_factor()),
+            physical_font_size(DEFAULT_FONT_SIZE, window.scale_factor()),
         );
 
         let hooks = config.hooks.clone();
@@ -2109,8 +2325,11 @@ impl AppState {
             modifiers: ModifiersState::empty(),
             last_mouse_pos: None,
             dragging_divider: None,
+            selection: None,
+            last_click: None,
             pending_resize: None,
-            pending_font_size: None,
+            logical_font_size: DEFAULT_FONT_SIZE,
+            pending_logical_font_size: None,
             preserve_grid_on_next_resize: false,
             current_scale_factor,
             quick_spawn_presets: config.quick_spawn_presets.clone(),
@@ -2144,6 +2363,25 @@ impl AppState {
     fn pane_at_mouse(&self, include_status_row: bool) -> Option<PaneId> {
         self.pane_index_at_mouse(include_status_row)
             .map(|idx| self.active_tab().panes[idx].id)
+    }
+
+    fn pane_cell_at_mouse(&self) -> Option<(PaneId, (usize, usize))> {
+        let (col, row) = self.mouse_cell()?;
+        for pane in &self.active_tab().panes {
+            let viewport = pane.viewport;
+            // First slice: visible viewport cells only. Scrolled-back absolute
+            // selection coordinates are handled by the later clipboard slice.
+            let Some(local_col) = col.checked_sub(viewport.col_offset) else {
+                continue;
+            };
+            let Some(local_row) = row.checked_sub(viewport.row_offset) else {
+                continue;
+            };
+            if local_col < viewport.cols && local_row < viewport.rows {
+                return Some((pane.id, (local_row, local_col)));
+            }
+        }
+        None
     }
 
     fn mouse_cell(&self) -> Option<(usize, usize)> {
@@ -2197,6 +2435,100 @@ impl AppState {
         self.window.set_cursor(icon);
     }
 
+    fn update_selection_to_mouse(&mut self) -> bool {
+        let Some((pane, cell)) = self.pane_cell_at_mouse() else {
+            return false;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if !selection.dragging || selection.pane != pane || selection.head == cell {
+            return false;
+        }
+        selection.head = cell;
+        true
+    }
+
+    fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize)) {
+        let click_count = self.next_click_count(pane, cell);
+        let range = match click_count {
+            2 => self.word_selection_at(pane, cell),
+            3.. => Some(self.line_selection_at(pane, cell.0)),
+            _ => None,
+        };
+        self.selection = if let Some(range) = range {
+            Some(MouseSelection {
+                pane,
+                anchor: range.start,
+                head: range.end,
+                dragging: false,
+            })
+        } else {
+            Some(MouseSelection {
+                pane,
+                anchor: cell,
+                head: cell,
+                dragging: true,
+            })
+        };
+    }
+
+    fn next_click_count(&mut self, pane: PaneId, cell: (usize, usize)) -> u8 {
+        let now = Instant::now();
+        let count = self
+            .last_click
+            .as_ref()
+            .filter(|last| {
+                last.pane == pane
+                    && last.cell == cell
+                    && now.duration_since(last.at) <= Duration::from_millis(MULTI_CLICK_MS)
+            })
+            .map(|last| last.count.saturating_add(1).min(3))
+            .unwrap_or(1);
+        self.last_click = Some(MouseClick {
+            pane,
+            cell,
+            count,
+            at: now,
+        });
+        count
+    }
+
+    fn word_selection_at(&self, pane: PaneId, cell: (usize, usize)) -> Option<SelectionRange> {
+        let session_id = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|candidate| candidate.id == pane)
+            .map(|pane| pane.session)?;
+        let session = self.sessions.get(&session_id)?;
+        let term = session.term.lock().ok()?;
+        word_selection_range(&term, cell.0, cell.1)
+    }
+
+    fn line_selection_at(&self, pane: PaneId, row: usize) -> SelectionRange {
+        let cols = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|candidate| candidate.id == pane)
+            .map(|pane| pane.viewport.cols)
+            .unwrap_or(1);
+        SelectionRange::new((row, 0), (row, cols.saturating_sub(1)))
+    }
+
+    fn finish_selection_drag(&mut self) {
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        let was_dragging = selection.dragging;
+        selection.dragging = false;
+        if was_dragging && selection.anchor == selection.head {
+            self.selection = None;
+        }
+        self.window.request_redraw();
+    }
+
     fn drag_divider_to_mouse(&mut self) {
         let Some(hit) = self.dragging_divider.clone() else {
             return;
@@ -2229,6 +2561,44 @@ impl AppState {
     fn session_at_mouse(&self, include_status_row: bool) -> Option<SessionId> {
         self.pane_index_at_mouse(include_status_row)
             .map(|idx| self.active_tab().panes[idx].session)
+    }
+
+    /// M12 selection slice: visible cell selection을 clipboard text로 직렬화.
+    fn handle_copy(&mut self) {
+        let Some(selection) = self.selection.as_ref() else {
+            log::debug!("copy ignored: no selection");
+            return;
+        };
+        let Some(pane) = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|pane| pane.id == selection.pane)
+        else {
+            log::warn!("copy ignored: selected pane missing");
+            return;
+        };
+        let Some(session) = self.sessions.get(&pane.session) else {
+            log::warn!("copy ignored: selected session missing");
+            return;
+        };
+        let text = match session.term.lock() {
+            Ok(term) => {
+                selection_text(&term, SelectionRange::new(selection.anchor, selection.head))
+            }
+            Err(e) => {
+                log::warn!("copy ignored: term lock failed: {e}");
+                return;
+            }
+        };
+        if text.is_empty() {
+            log::debug!("copy ignored: empty selection");
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.clone())) {
+            Ok(()) => log::debug!("copy: {} bytes", text.len()),
+            Err(e) => log::warn!("clipboard write failed: {e}"),
+        }
     }
 
     /// M10-6: Cmd+V로 진입. arboard로 clipboard 읽고 bracketed paste mode면 \e[200~/\e[201~ 래핑.
@@ -2279,11 +2649,14 @@ impl AppState {
         }
         self.log_window_frame("resize before");
         let font_changed = self
-            .pending_font_size
+            .pending_logical_font_size
             .take()
-            .map(|font_size| {
+            .map(|logical_font_size| {
+                self.logical_font_size = logical_font_size;
+                let physical_font_size =
+                    physical_font_size(logical_font_size, self.window.scale_factor());
                 self.renderer
-                    .set_font_size(&self.device, &self.queue, font_size)
+                    .set_font_size(&self.device, &self.queue, physical_font_size)
             })
             .unwrap_or(false);
         let preserve_grid = std::mem::take(&mut self.preserve_grid_on_next_resize);
@@ -2344,11 +2717,24 @@ impl AppState {
     }
 
     fn prepare_scale_factor_change(&mut self, scale_factor: f64) {
-        let font_size = physical_font_size(FONT_SIZE, scale_factor);
-        self.pending_font_size = Some(font_size);
+        let physical_font_size = physical_font_size(self.logical_font_size, scale_factor);
+        self.pending_logical_font_size = Some(self.logical_font_size);
         self.preserve_grid_on_next_resize = true;
         self.current_scale_factor = scale_factor_or_default(scale_factor);
-        log::debug!("scale factor changed: scale={scale_factor} font_size={font_size}");
+        log::debug!(
+            "scale factor changed: scale={scale_factor} physical_font_size={physical_font_size}"
+        );
+    }
+
+    fn set_logical_font_size(&mut self, font_size: f32) {
+        let font_size = clamp_font_size(font_size);
+        if (self.logical_font_size - font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.pending_logical_font_size = Some(font_size);
+        self.preserve_grid_on_next_resize = false;
+        self.pending_resize = Some(self.window.inner_size());
+        log::info!("font zoom: logical_font_size={font_size}");
     }
 
     fn render(&mut self) {
@@ -2438,11 +2824,19 @@ impl AppState {
                         None
                     };
                 let preedit_for_render = if in_scrollback { None } else { preedit_arg };
+                let selection = self.selection.as_ref().and_then(|selection| {
+                    if selection.pane == pane_id {
+                        Some(SelectionRange::new(selection.anchor, selection.head))
+                    } else {
+                        None
+                    }
+                });
                 self.renderer.append_term(
                     &self.queue,
                     &term,
                     preedit_for_render,
                     cursor_render,
+                    selection,
                     pane_col_offset,
                     pane_row_offset,
                 );
@@ -2628,6 +3022,17 @@ mod tests {
     }
 
     #[test]
+    fn font_size_is_clamped_before_physical_scaling() {
+        assert_eq!(clamp_font_size(5.0), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(80.0), MAX_FONT_SIZE);
+        assert_eq!(clamp_font_size(f32::NAN), DEFAULT_FONT_SIZE);
+        assert_eq!(
+            physical_font_size(MAX_FONT_SIZE + 1.0, 2.0),
+            MAX_FONT_SIZE * 2.0
+        );
+    }
+
+    #[test]
     fn compute_viewports_single_uses_full_window() {
         let layouts = compute_viewports(PhysicalSize::new(100, 80), cell(), 1);
 
@@ -2763,6 +3168,115 @@ mod tests {
     }
 
     #[test]
+    fn quick_spawn_hint_lists_sorted_unique_keys() {
+        let presets = vec![
+            QuickSpawnPreset {
+                key: 'x',
+                spec: SessionSpec {
+                    title: "Codex".to_string(),
+                    command: CommandSpec::Custom("codex".to_string()),
+                },
+            },
+            QuickSpawnPreset {
+                key: 's',
+                spec: SessionSpec {
+                    title: "shell".to_string(),
+                    command: CommandSpec::Shell,
+                },
+            },
+            QuickSpawnPreset {
+                key: 'C',
+                spec: SessionSpec {
+                    title: "Claude".to_string(),
+                    command: CommandSpec::Custom("claude".to_string()),
+                },
+            },
+            QuickSpawnPreset {
+                key: 'c',
+                spec: SessionSpec {
+                    title: "Claude duplicate".to_string(),
+                    command: CommandSpec::Custom("claude".to_string()),
+                },
+            },
+        ];
+
+        assert_eq!(quick_spawn_hint(&presets), "SPAWN csx");
+        assert_eq!(quick_spawn_hint(&[]), "SPAWN");
+    }
+
+    #[test]
+    fn quick_spawn_timeout_triggers_after_deadline() {
+        let started_at = Instant::now();
+
+        assert!(!quick_spawn_elapsed_timed_out(
+            started_at,
+            started_at + Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS),
+        ));
+        assert!(quick_spawn_elapsed_timed_out(
+            started_at,
+            started_at + Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS + 1),
+        ));
+    }
+
+    #[test]
+    fn selection_text_serializes_visible_cells() {
+        let mut term = Term::new(8, 3);
+        for ch in "hello".chars() {
+            term.print(ch);
+        }
+        term.set_cursor(1, 0);
+        for ch in "world".chars() {
+            term.print(ch);
+        }
+
+        assert_eq!(
+            selection_text(&term, SelectionRange::new((0, 1), (1, 2))),
+            "ello\nwor"
+        );
+    }
+
+    #[test]
+    fn selection_text_skips_wide_continuation_cells() {
+        let mut term = Term::new(6, 2);
+        term.print('한');
+        term.print('a');
+
+        assert_eq!(
+            selection_text(&term, SelectionRange::new((0, 0), (0, 2))),
+            "한a"
+        );
+    }
+
+    #[test]
+    fn word_selection_range_selects_alnum_and_underscore() {
+        let mut term = Term::new(16, 1);
+        for ch in "run foo_bar!".chars() {
+            term.print(ch);
+        }
+
+        let range = word_selection_range(&term, 0, 6).expect("word range");
+        assert_eq!(range, SelectionRange::new((0, 4), (0, 10)));
+        assert_eq!(selection_text(&term, range), "foo_bar");
+        assert!(word_selection_range(&term, 0, 11).is_none());
+    }
+
+    #[test]
+    fn cmd_arrow_left_right_maps_to_home_end_bytes() {
+        use winit::keyboard::NamedKey;
+
+        assert_eq!(
+            cmd_named_key_bytes(&NamedKey::ArrowLeft),
+            Some(&b"\x1bOH"[..])
+        );
+        assert_eq!(
+            cmd_named_key_bytes(&NamedKey::ArrowRight),
+            Some(&b"\x1bOF"[..])
+        );
+        assert_eq!(cmd_named_key_bytes(&NamedKey::ArrowUp), None);
+        assert_eq!(cmd_named_key_bytes(&NamedKey::ArrowDown), None);
+    }
+
+    #[test]
     fn tab_text_fits_available_columns() {
         assert_eq!(tab_text("1", 3), " 1 ");
         assert_eq!(tab_text("10", 3), " 1");
@@ -2860,6 +3374,14 @@ mod tests {
             cmd_shortcut(Some("w"), Some(KeyCode::KeyW), true, false),
             Some(CmdShortcut::CloseTab)
         );
+        assert_eq!(
+            cmd_shortcut(Some("c"), Some(KeyCode::KeyC), false, false),
+            Some(CmdShortcut::Copy)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("v"), Some(KeyCode::KeyV), false, false),
+            Some(CmdShortcut::Paste)
+        );
     }
 
     #[test]
@@ -2881,6 +3403,32 @@ mod tests {
         assert_eq!(
             cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false),
             Some(CmdShortcut::RespawnSession)
+        );
+    }
+
+    #[test]
+    fn cmd_shortcut_routes_font_zoom() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            cmd_shortcut(Some("="), Some(KeyCode::Equal), false, false),
+            Some(CmdShortcut::FontZoomIn)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("+"), Some(KeyCode::Equal), true, false),
+            Some(CmdShortcut::FontZoomIn)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("-"), Some(KeyCode::Minus), false, false),
+            Some(CmdShortcut::FontZoomOut)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("0"), Some(KeyCode::Digit0), false, false),
+            Some(CmdShortcut::FontZoomReset)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("="), Some(KeyCode::Equal), false, true),
+            None
         );
     }
 

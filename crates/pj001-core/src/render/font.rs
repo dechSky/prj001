@@ -2,6 +2,12 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCach
 use swash::scale::image::Content;
 use swash::zeno::Placement;
 
+const LINE_HEIGHT_MULTIPLIER: f32 = 1.35;
+const CELL_FIT_SAMPLE_CHARS: &[char] = &[
+    'M', 'g', 'j', 'p', 'q', 'y', '_', '|', '[', ']', '{', '}', '(', ')', 'Á', 'É', '안', '한',
+    '가', '힣', '┃', '─', '╋',
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct CellMetrics {
     pub width: u32,
@@ -25,15 +31,17 @@ pub struct FontStack {
 impl FontStack {
     pub fn new(font_size: f32) -> Self {
         let mut font_system = FontSystem::new();
-        let line_height = (font_size * 1.3).ceil();
+        let line_height = (font_size * LINE_HEIGHT_MULTIPLIER).ceil();
         let metrics = Metrics::new(font_size, line_height);
         let cell = measure_cell(&mut font_system, metrics);
-        Self {
+        let mut stack = Self {
             font_system,
             swash_cache: SwashCache::new(),
             metrics,
             cell,
-        }
+        };
+        stack.fit_cell_to_sampled_glyphs();
+        stack
     }
 
     pub fn raster_one(&mut self, ch: char) -> Option<GlyphRaster> {
@@ -92,6 +100,43 @@ impl FontStack {
         }
         out
     }
+
+    fn fit_cell_to_sampled_glyphs(&mut self) {
+        let mut placements = Vec::new();
+        for ch in CELL_FIT_SAMPLE_CHARS {
+            if let Some(raster) = self.raster_one(*ch) {
+                placements.push(raster.placement);
+            }
+        }
+        if placements.is_empty() {
+            return;
+        }
+
+        let baseline = placements
+            .iter()
+            .map(|placement| placement.top as f32)
+            .fold(self.cell.baseline, f32::max)
+            .ceil();
+        let height = placements
+            .iter()
+            .map(|placement| baseline - placement.top as f32 + placement.height as f32)
+            .fold(self.cell.height as f32, f32::max)
+            .ceil()
+            .max(1.0) as u32;
+        if baseline != self.cell.baseline || height != self.cell.height {
+            log::debug!(
+                "fit_cell_to_sampled_glyphs: cell {}x{} baseline={} -> {}x{} baseline={}",
+                self.cell.width,
+                self.cell.height,
+                self.cell.baseline,
+                self.cell.width,
+                height,
+                baseline,
+            );
+            self.cell.height = height;
+            self.cell.baseline = baseline;
+        }
+    }
 }
 
 fn measure_cell(font_system: &mut FontSystem, metrics: Metrics) -> CellMetrics {
@@ -123,5 +168,34 @@ fn measure_cell(font_system: &mut FontSystem, metrics: Metrics) -> CellMetrics {
         width: advance.ceil().max(1.0) as u32,
         height: height.ceil().max(1.0) as u32,
         baseline: baseline_y.ceil(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CELL_FIT_SAMPLE_CHARS, FontStack};
+
+    #[test]
+    fn sampled_glyphs_fit_inside_cell_after_metric_adjustment() {
+        for font_size in [14.0, 28.0, 56.0] {
+            let mut font = FontStack::new(font_size);
+            let cell = font.cell;
+            for ch in CELL_FIT_SAMPLE_CHARS {
+                let Some(raster) = font.raster_one(*ch) else {
+                    continue;
+                };
+                let y = cell.baseline - raster.placement.top as f32;
+                assert!(
+                    y >= 0.0,
+                    "glyph {ch:?} starts above cell: y={y}, cell={cell:?}"
+                );
+                assert!(
+                    y + raster.placement.height as f32 <= cell.height as f32,
+                    "glyph {ch:?} overflows cell: bottom={}, height={}, cell={cell:?}",
+                    y + raster.placement.height as f32,
+                    cell.height,
+                );
+            }
+        }
     }
 }

@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
-pub use geometry::CursorRender;
+pub use geometry::{CursorRender, SelectionRange};
 
 use atlas::GlyphAtlas;
 use font::FontStack;
@@ -314,6 +314,7 @@ impl Renderer {
         term: &Term,
         preedit: Option<(&str, usize, usize)>,
         cursor: Option<geometry::CursorRender>,
+        selection: Option<geometry::SelectionRange>,
         col_offset: usize,
         row_offset: usize,
     ) {
@@ -352,6 +353,7 @@ impl Renderer {
             &self.atlas,
             self.baseline,
             cursor,
+            selection,
             col_offset,
             row_offset,
         );
