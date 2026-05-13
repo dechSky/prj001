@@ -12,6 +12,9 @@ bitflags! {
         const REVERSE    = 1 << 3;
         const WIDE       = 1 << 4;
         const WIDE_CONT  = 1 << 5;
+        /// 슬라이스 6.3b: OSC 8 hyperlink active 동안 print된 cells.
+        /// 렌더 시점에 theme의 ANSI 12(밝은 파랑)로 fg 치환 → 시각적으로 링크 강조.
+        const HYPERLINK  = 1 << 6;
     }
 }
 
@@ -941,6 +944,10 @@ impl Term {
         let mut attrs = base_attrs;
         if w == 2 {
             attrs |= Attrs::WIDE;
+        }
+        // 슬라이스 6.3b: OSC 8 active 동안 cells에 HYPERLINK 마킹.
+        if self.hyperlink_uri.is_some() {
+            attrs |= Attrs::HYPERLINK;
         }
         let g = self.grid_mut();
         *g.cell_mut(row, col) = Cell { ch, fg, bg, attrs };

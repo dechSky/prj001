@@ -61,10 +61,14 @@ pub fn build_instances_at(
             // 그 위에 별도로 shape 영역만 덮음 (Model A — cursor-design.md §5.0).
             let reversed = cell.attrs.contains(Attrs::REVERSE);
             let selected = selection.is_some_and(|selection| selection.contains(r, c));
+            let hyperlink = cell.attrs.contains(Attrs::HYPERLINK);
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
                 (resolve(cell.bg, false, palette), resolve(cell.fg, true, palette))
+            } else if hyperlink {
+                // 슬라이스 6.3b: hyperlink cells는 theme의 ANSI 12(밝은 파랑) — bg는 일반대로.
+                (palette.ansi[12], resolve(cell.bg, false, palette))
             } else {
                 (resolve(cell.fg, true, palette), resolve(cell.bg, false, palette))
             };
@@ -293,14 +297,14 @@ fn resolve(c: Color, is_fg: bool, palette: &ThemePalette) -> [f32; 4] {
                 palette.bg
             }
         }
-        Color::Indexed(n) => indexed(n),
+        Color::Indexed(n) => indexed(n, palette),
         Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
     }
 }
 
-fn indexed(n: u8) -> [f32; 4] {
+fn indexed(n: u8, palette: &ThemePalette) -> [f32; 4] {
     if n < 16 {
-        ANSI_16[n as usize]
+        palette.ansi[n as usize]
     } else if n < 232 {
         let i = n - 16;
         let r = i / 36;
@@ -321,21 +325,3 @@ fn cube(x: u8) -> f32 {
     }
 }
 
-const ANSI_16: [[f32; 4]; 16] = [
-    [0.0, 0.0, 0.0, 1.0],
-    [0.502, 0.0, 0.0, 1.0],
-    [0.0, 0.502, 0.0, 1.0],
-    [0.502, 0.502, 0.0, 1.0],
-    [0.0, 0.0, 0.502, 1.0],
-    [0.502, 0.0, 0.502, 1.0],
-    [0.0, 0.502, 0.502, 1.0],
-    [0.753, 0.753, 0.753, 1.0],
-    [0.502, 0.502, 0.502, 1.0],
-    [1.0, 0.0, 0.0, 1.0],
-    [0.0, 1.0, 0.0, 1.0],
-    [1.0, 1.0, 0.0, 1.0],
-    [0.0, 0.0, 1.0, 1.0],
-    [1.0, 0.0, 1.0, 1.0],
-    [0.0, 1.0, 1.0, 1.0],
-    [1.0, 1.0, 1.0, 1.0],
-];

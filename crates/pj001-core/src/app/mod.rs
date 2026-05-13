@@ -845,6 +845,9 @@ struct AppState {
 #[derive(Clone, Debug, Default)]
 struct FindState {
     query: String,
+    /// 마지막 발견된 match의 절대 row (scrollback rows + main grid rows 통합 좌표).
+    /// None = 미발견 / 아직 검색 안 함. 6.5b: next/prev 시작점.
+    last_match_abs: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1203,7 +1206,8 @@ impl ApplicationHandler<UserEvent> for App {
                     event.text
                 );
                 use winit::keyboard::{Key, NamedKey, PhysicalKey};
-                // 슬라이스 6.5: find 입력 모드 — Cmd+F 활성 중 키 입력 흡수.
+                // 슬라이스 6.5/6.5b: find 입력 모드 — Cmd+F 활성 중 키 입력 흡수.
+                // Esc = cancel, Enter = next match, Shift+Enter = prev match.
                 if event.state == ElementState::Pressed && state.pending_find.is_some() {
                     let handled = match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
@@ -1211,7 +1215,11 @@ impl ApplicationHandler<UserEvent> for App {
                             true
                         }
                         Key::Named(NamedKey::Enter) => {
-                            state.finish_find();
+                            if state.modifiers.shift_key() {
+                                state.find_prev();
+                            } else {
+                                state.find_next();
+                            }
                             true
                         }
                         Key::Named(NamedKey::Backspace) => {
@@ -1993,27 +2001,13 @@ impl AppState {
         log::info!("find mode: cancel");
     }
 
-    fn finish_find(&mut self) {
-        // Enter는 일단 cancel과 동일 — view_offset 유지하고 검색 모드만 종료.
-        // (next-match 네비게이션은 차후 슬라이스에서 Enter/Shift+Enter로 분리)
-        let query = self
-            .pending_find
-            .as_ref()
-            .map(|f| f.query.clone())
-            .unwrap_or_default();
-        self.pending_find = None;
-        let title = self.session_for_pane_idx(self.active_index()).title.clone();
-        self.window.set_title(&format!("{} — pj001", title));
-        self.window.request_redraw();
-        log::info!("find mode: finish query=\"{}\"", query);
-    }
-
     fn find_backspace(&mut self) {
         if let Some(find) = self.pending_find.as_mut() {
             find.query.pop();
+            find.last_match_abs = None;
             self.window
                 .set_title(&format!("find: {} — pj001", find.query));
-            self.find_apply_current_query();
+            self.find_apply_current_query(0, true);
             self.window.request_redraw();
         }
     }
@@ -2024,16 +2018,40 @@ impl AppState {
         }
         if let Some(find) = self.pending_find.as_mut() {
             find.query.push(ch);
+            find.last_match_abs = None;
             self.window
                 .set_title(&format!("find: {} — pj001", find.query));
-            self.find_apply_current_query();
+            self.find_apply_current_query(0, true);
             self.window.request_redraw();
         }
     }
 
-    /// 현재 query로 scrollback + main grid를 검색 → 첫 match를 view에 띄움.
-    /// scrollback에서 발견되면 view_offset 조정, main grid면 view_offset=0(bottom snap).
-    fn find_apply_current_query(&mut self) {
+    /// Enter — 마지막 match 다음 위치부터 forward 검색.
+    fn find_next(&mut self) {
+        let start = self
+            .pending_find
+            .as_ref()
+            .and_then(|f| f.last_match_abs.map(|abs| abs.saturating_add(1)))
+            .unwrap_or(0);
+        self.find_apply_current_query(start, true);
+        self.window.request_redraw();
+    }
+
+    /// Shift+Enter — 마지막 match 이전 위치부터 backward 검색.
+    fn find_prev(&mut self) {
+        let start_from = self
+            .pending_find
+            .as_ref()
+            .and_then(|f| f.last_match_abs)
+            .unwrap_or(0);
+        // backward 검색 — 시작점부터 거꾸로.
+        self.find_apply_current_query(start_from, false);
+        self.window.request_redraw();
+    }
+
+    /// 현재 query를 `start_abs`부터 `forward` 방향으로 검색, 발견 시 view에 띄우고 last_match_abs 갱신.
+    /// `forward=false`면 start_abs까지 거꾸로(start_abs는 exclusive).
+    fn find_apply_current_query(&mut self, start_abs: usize, forward: bool) {
         let query = match self.pending_find.as_ref() {
             Some(f) if !f.query.is_empty() => f.query.clone(),
             _ => return,
@@ -2046,20 +2064,22 @@ impl AppState {
         let cols = term.cols();
         let rows = term.rows();
         let scrollback_len = term.scrollback_len();
-        // 위→아래 순으로 스캔하여 query를 포함하는 첫 row를 찾는다.
-        // scrollback rows + main grid rows 통합.
         let total = scrollback_len + rows;
-        for abs in 0..total {
-            // 절대 row abs를 view_offset 좌표로 변환:
-            // view_offset=K일 때 화면 top은 scrollback[scrollback_len - K] 라인 또는
-            // main row (abs - scrollback_len + K). 단순화 — view_offset 후보 결정.
+        if total == 0 {
+            return;
+        }
+        let range: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(start_abs.min(total)..total)
+        } else {
+            Box::new((0..start_abs.min(total)).rev())
+        };
+        let mut found: Option<usize> = None;
+        for abs in range {
             let row_text: String = if abs < scrollback_len {
-                // scrollback row 읽기 — view_offset = scrollback_len - abs로 그 행이 top이 된다.
                 let needed_offset = scrollback_len - abs;
                 term.set_view_offset(needed_offset.min(scrollback_len));
                 (0..cols).map(|c| term.cell(0, c).ch).collect()
             } else {
-                // main grid row
                 let row = abs - scrollback_len;
                 if row >= rows {
                     continue;
@@ -2068,12 +2088,18 @@ impl AppState {
                 (0..cols).map(|c| term.cell(row, c).ch).collect()
             };
             if row_text.contains(&query) {
-                // 발견 — view_offset은 이미 위에서 설정됨.
-                return;
+                found = Some(abs);
+                break;
             }
         }
-        // 미발견 — view_offset 원복(bottom).
-        term.set_view_offset(0);
+        // term lock 해제 전 view_offset 정리.
+        if found.is_none() {
+            term.set_view_offset(0);
+        }
+        drop(term);
+        if let Some(find) = self.pending_find.as_mut() {
+            find.last_match_abs = found;
+        }
     }
 
     fn start_quick_spawn(&mut self) {
