@@ -1208,7 +1208,12 @@ impl ApplicationHandler<UserEvent> for App {
                 use winit::keyboard::{Key, NamedKey, PhysicalKey};
                 // 슬라이스 6.5/6.5b: find 입력 모드 — Cmd+F 활성 중 키 입력 흡수.
                 // Esc = cancel, Enter = next match, Shift+Enter = prev match.
-                if event.state == ElementState::Pressed && state.pending_find.is_some() {
+                // Cmd-조합 키는 swallow 안 함 (fall through하여 Cmd 핸들러 실행 — Cmd+V/Cmd+Q 등 정상 동작).
+                if event.state == ElementState::Pressed
+                    && state.pending_find.is_some()
+                    && !state.modifiers.super_key()
+                    && !state.modifiers.control_key()
+                {
                     let handled = match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             state.cancel_find();
@@ -1227,12 +1232,8 @@ impl ApplicationHandler<UserEvent> for App {
                             true
                         }
                         Key::Character(s) => {
-                            // Cmd+F 자체는 Find 진입 시 super_key 분기에서 swallow됨.
-                            // 여기선 super 없이 입력된 텍스트만 query에 추가.
-                            if !state.modifiers.super_key() {
-                                for ch in s.chars() {
-                                    state.find_append_char(ch);
-                                }
+                            for ch in s.chars() {
+                                state.find_append_char(ch);
                             }
                             true
                         }
@@ -1988,6 +1989,7 @@ impl AppState {
 
     fn start_find(&mut self) {
         self.pending_find = Some(FindState::default());
+        self.selection = None;
         self.window.set_title("find: — pj001");
         self.window.request_redraw();
         log::info!("find mode: open");
@@ -1995,6 +1997,7 @@ impl AppState {
 
     fn cancel_find(&mut self) {
         self.pending_find = None;
+        self.selection = None;
         let title = self.session_for_pane_idx(self.active_index()).title.clone();
         self.window.set_title(&format!("{} — pj001", title));
         self.window.request_redraw();
@@ -2049,7 +2052,8 @@ impl AppState {
         self.window.request_redraw();
     }
 
-    /// 현재 query를 `start_abs`부터 `forward` 방향으로 검색, 발견 시 view에 띄우고 last_match_abs 갱신.
+    /// 현재 query를 `start_abs`부터 `forward` 방향으로 검색, 발견 시 view에 띄우고
+    /// last_match_abs 갱신, **match cells에 selection highlight 적용**.
     /// `forward=false`면 start_abs까지 거꾸로(start_abs는 exclusive).
     fn find_apply_current_query(&mut self, start_abs: usize, forward: bool) {
         let query = match self.pending_find.as_ref() {
@@ -2057,6 +2061,7 @@ impl AppState {
             _ => return,
         };
         let idx = self.active_index();
+        let pane_id = self.active_tab().panes[idx].id;
         let session = self.session_for_pane_idx(idx);
         let Ok(mut term) = session.term.lock() else {
             return;
@@ -2073,32 +2078,63 @@ impl AppState {
         } else {
             Box::new((0..start_abs.min(total)).rev())
         };
-        let mut found: Option<usize> = None;
+        let mut found: Option<(usize, usize, usize)> = None; // (abs_row, col_start, visible_row)
         for abs in range {
-            let row_text: String = if abs < scrollback_len {
+            let (row_text, visible_row) = if abs < scrollback_len {
                 let needed_offset = scrollback_len - abs;
                 term.set_view_offset(needed_offset.min(scrollback_len));
-                (0..cols).map(|c| term.cell(0, c).ch).collect()
+                let text: String = (0..cols).map(|c| term.cell(0, c).ch).collect();
+                (text, 0usize)
             } else {
                 let row = abs - scrollback_len;
                 if row >= rows {
                     continue;
                 }
                 term.set_view_offset(0);
-                (0..cols).map(|c| term.cell(row, c).ch).collect()
+                let text: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
+                (text, row)
             };
-            if row_text.contains(&query) {
-                found = Some(abs);
+            // ASCII 가정 — char_index == col. 멀티바이트 UTF-8 query는 byte index와 차이 있음,
+            // 후속 슬라이스에서 char_indices 기반 정확 매칭으로 개선.
+            if let Some(col_start) = row_text.find(&query) {
+                found = Some((abs, col_start, visible_row));
                 break;
             }
         }
-        // term lock 해제 전 view_offset 정리.
         if found.is_none() {
             term.set_view_offset(0);
         }
         drop(term);
-        if let Some(find) = self.pending_find.as_mut() {
-            find.last_match_abs = found;
+        // selection highlight 적용 — 새 mouse selection처럼 보이지만 dragging=false라서
+        // mouse drag 충돌 없음. Esc/cancel 시 clear됨.
+        if let Some((abs, col_start, visible_row)) = found {
+            let query_len = query.chars().count();
+            let head_col = col_start
+                .saturating_add(query_len.saturating_sub(1))
+                .min(cols.saturating_sub(1));
+            log::info!(
+                "find: match abs={} visible_row={} col={}..={} query=\"{}\"",
+                abs,
+                visible_row,
+                col_start,
+                head_col,
+                query,
+            );
+            self.selection = Some(MouseSelection {
+                pane: pane_id,
+                anchor: (visible_row, col_start),
+                head: (visible_row, head_col),
+                dragging: false,
+            });
+            if let Some(find) = self.pending_find.as_mut() {
+                find.last_match_abs = Some(abs);
+            }
+        } else {
+            log::info!("find: no match query=\"{}\"", query);
+            self.selection = None;
+            if let Some(find) = self.pending_find.as_mut() {
+                find.last_match_abs = None;
+            }
         }
     }
 
@@ -3316,6 +3352,7 @@ impl AppState {
         }
         self.append_tab_bar();
         self.append_split_chrome();
+        self.append_find_overlay();
         self.renderer.finish_terms(&self.device, &self.queue);
 
         let view = frame
@@ -3362,6 +3399,28 @@ impl AppState {
                 bg,
             );
         }
+    }
+
+    /// 슬라이스 6.5c: find 모드 활성 시 화면 최하단에 `find: <query>_` overlay.
+    /// 활성 pane content 마지막 row를 덮는 시각적 트레이드오프(데이터는 보존, 시각만 덮임).
+    fn append_find_overlay(&mut self) {
+        let Some(find) = self.pending_find.as_ref() else {
+            return;
+        };
+        let cell = self.renderer.cell_metrics();
+        if cell.height == 0 || cell.width == 0 {
+            return;
+        }
+        let total_rows = (self.surface_config.height / cell.height).max(1) as usize;
+        let total_cols = (self.surface_config.width / cell.width).max(1) as usize;
+        let row = total_rows.saturating_sub(1);
+        let bg = [0.10, 0.10, 0.16, 1.0];
+        let fg = [1.0, 0.78, 0.40, 1.0];
+        self.renderer.append_fill_row(0, row, total_cols, bg);
+        let text = format!("find: {}_", find.query);
+        let width = text.chars().count().min(total_cols);
+        self.renderer
+            .append_text_line(&self.queue, &text, 0, row, width, fg, bg);
     }
 
     fn append_split_chrome(&mut self) {
