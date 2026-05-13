@@ -458,7 +458,9 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | **Cmd+Option+1..9** | active tab 안 n번째 pane 전환 | `Cmd+Shift+숫자`는 macOS/global shortcut 충돌 가능성이 있어 제외 |
 | **Cmd+[ / Cmd+]** | active tab 안 이전/다음 pane 전환 | M13 layout |
 | **Cmd+Shift+[ / Cmd+Shift+]** | 이전/다음 tab 전환 | M14 tabs |
-| **Cmd+N** | swallow. multi-window 미구현 | 미지원 |
+| **Cmd+N** | active tab에 새 shell pane 추가 (vertical split) | M15 dynamic spawn 첫 slice |
+| **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; bridge mode는 `c=Claude`, `x=Codex` 추가 | M15 dynamic spawn, core는 preset data만 사용 |
+| **Cmd+R** | active pane의 session을 같은 command로 재시작. SessionId는 새로 발급되고 scrollback은 초기화 | M15 respawn 첫 slice |
 | **그 외 Cmd+key** | swallow (안전 기본값) | shell이 Cmd modifier 의미 가질 가능성 0에 가까움. PTY 보내면 의도 없는 byte |
 
 구현:

@@ -1,4 +1,4 @@
-use pj001_core::app::{self, CommandSpec, Config, SessionSpec};
+use pj001_core::app::{self, CommandSpec, Config, QuickSpawnPreset, SessionSpec};
 use pj001_core::error::{self, Error};
 
 fn main() -> error::Result<()> {
@@ -86,13 +86,36 @@ fn bridge_config(left: String, right: String) -> Config {
     Config::vertical_split(
         SessionSpec {
             title: "Claude".to_string(),
-            command: CommandSpec::Custom(left),
+            command: CommandSpec::Custom(left.clone()),
         },
         SessionSpec {
             title: "Codex".to_string(),
-            command: CommandSpec::Custom(right),
+            command: CommandSpec::Custom(right.clone()),
         },
     )
+    .with_quick_spawn_presets(vec![
+        QuickSpawnPreset {
+            key: 's',
+            spec: SessionSpec {
+                title: "shell".to_string(),
+                command: CommandSpec::Shell,
+            },
+        },
+        QuickSpawnPreset {
+            key: 'c',
+            spec: SessionSpec {
+                title: "Claude".to_string(),
+                command: CommandSpec::Custom(left),
+            },
+        },
+        QuickSpawnPreset {
+            key: 'x',
+            spec: SessionSpec {
+                title: "Codex".to_string(),
+                command: CommandSpec::Custom(right),
+            },
+        },
+    ])
 }
 
 #[cfg(test)]
@@ -137,16 +160,7 @@ mod tests {
                 "/bin/bash"
             ]))
             .unwrap(),
-            Config::vertical_split(
-                SessionSpec {
-                    title: "Claude".to_string(),
-                    command: CommandSpec::Custom("/bin/zsh".to_string()),
-                },
-                SessionSpec {
-                    title: "Codex".to_string(),
-                    command: CommandSpec::Custom("/bin/bash".to_string()),
-                },
-            )
+            bridge_config("/bin/zsh".to_string(), "/bin/bash".to_string())
         );
     }
 

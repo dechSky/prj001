@@ -6,6 +6,18 @@
 
 **v2 변경 (vs v1, 누락 점검 반영)**: M11 신설(VT 인프라 보강) → M12~M19로 시프트. M13(OSC) 스코프 확장. M15(단축키) 확장. §15 out-of-scope 박스 신설. §16 post-MVP+ cleanup 추가.
 
+## 2026-05-13 갱신 — HiDPI font/window 단위 정리
+
+웹 분석 + Claude 검토 기준: winit 창 요청값은 logical size로 두고, `WindowEvent::Resized`/wgpu surface는 physical pixel size를 그대로 쓴다. cosmic-text `Metrics`도 physical pixel 기준이므로 `FONT_SIZE(14.0 logical) * window.scale_factor()`를 renderer에 전달한다. `ScaleFactorChanged`에서는 atlas/font metrics를 재생성하고 pane viewport/PTY size를 재계산한다. monitor 해상도 bucket 방식은 모니터별 체감 크기 불일치로 폐기.
+
+## 2026-05-13 갱신 — M15 첫 slice: Cmd+R respawn
+
+Claude 2nd opinion 기준, `AgentKind`/preset 위치 결정 전에는 active session respawn이 M15에서 가장 작은 구현 단위다. `Cmd+R`은 active pane의 기존 `Session.command`를 그대로 재사용해 새 PTY를 spawn하고, 성공 후 pane의 `SessionId`만 교체한다. scrollback은 초기화되고 기존 session은 code `-1` lifecycle exit로 기록한다. `Cmd+Shift+N` quick spawn과 preset metadata는 `PaneMeta`/`SessionMeta` 위치 결정 후 후속 slice로 진행.
+
+## 2026-05-13 갱신 — M15 quick spawn boundary
+
+`Cmd+Shift+N` quick spawn은 `Session.kind`/`AgentKind`를 core에 추가하지 않고 `Config.quick_spawn_presets: Vec<(key, SessionSpec)>` 형태의 데이터 주입으로 처리한다. 일반 실행 기본값은 `s=shell`만 제공하고, `--bridge` 모드는 기존 agent-specific carve-out에 맞춰 `c=Claude`, `x=Codex` preset을 추가한다. core status bar는 계속 title 기반으로 표시한다.
+
 ---
 
 ## 2026-05-11 갱신 — 정본 이전 + milestone 번호 재배치

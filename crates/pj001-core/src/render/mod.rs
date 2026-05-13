@@ -33,6 +33,7 @@ pub struct Renderer {
     instance_count: u32,
     atlas: GlyphAtlas,
     font_stack: FontStack,
+    font_size: f32,
     cell: CellMetrics,
     baseline: f32,
     viewport: [f32; 2],
@@ -236,6 +237,7 @@ impl Renderer {
             instance_count: 0,
             atlas,
             font_stack,
+            font_size,
             cell,
             baseline,
             viewport,
@@ -245,6 +247,50 @@ impl Renderer {
 
     pub fn cell_metrics(&self) -> CellMetrics {
         self.cell
+    }
+
+    pub fn set_font_size(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        font_size: f32,
+    ) -> bool {
+        if (self.font_size - font_size).abs() < f32::EPSILON {
+            return false;
+        }
+        let mut font_stack = FontStack::new(font_size);
+        let cell = font_stack.cell;
+        let baseline = cell.baseline;
+        let mut atlas = GlyphAtlas::new(device);
+        for (ch, raster) in font_stack.raster_ascii() {
+            atlas.insert(queue, ch, &raster);
+        }
+
+        self.font_stack = font_stack;
+        self.font_size = font_size;
+        self.cell = cell;
+        self.baseline = baseline;
+        self.atlas = atlas;
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.resize(queue, self.viewport);
+        true
     }
 
     pub fn resize(&mut self, queue: &wgpu::Queue, viewport: [f32; 2]) {

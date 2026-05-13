@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use portable_pty::PtySize;
 use unicode_width::UnicodeWidthStr;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
@@ -43,6 +43,18 @@ const STATUS_INACTIVE_BG: [f32; 4] = [0.12, 0.13, 0.15, 1.0];
 const STATUS_DEAD_BG: [f32; 4] = [0.40, 0.12, 0.12, 1.0];
 const DIVIDER_BG: [f32; 4] = [0.22, 0.23, 0.26, 1.0];
 
+fn scale_factor_or_default(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+fn physical_font_size(font_size: f32, scale_factor: f64) -> f32 {
+    font_size * scale_factor_or_default(scale_factor) as f32
+}
+
 /// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
 fn log_page_dispatch_once(target: &'static str) {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -58,6 +70,7 @@ fn log_page_dispatch_once(target: &'static str) {
 pub struct Config {
     pub sessions: Vec<SessionSpec>,
     pub initial_layout: InitialLayout,
+    pub quick_spawn_presets: Vec<QuickSpawnPreset>,
     pub hooks: Hooks,
 }
 
@@ -65,6 +78,12 @@ pub struct Config {
 pub struct SessionSpec {
     pub title: String,
     pub command: CommandSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickSpawnPreset {
+    pub key: char,
+    pub spec: SessionSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,7 +169,9 @@ pub enum LifecycleEvent {
 /// useful value equality.
 impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
-        self.sessions == other.sessions && self.initial_layout == other.initial_layout
+        self.sessions == other.sessions
+            && self.initial_layout == other.initial_layout
+            && self.quick_spawn_presets == other.quick_spawn_presets
     }
 }
 
@@ -164,6 +185,7 @@ impl Config {
                 command: shell.map_or(CommandSpec::Shell, CommandSpec::Custom),
             }],
             initial_layout: InitialLayout::Single { session: 0 },
+            quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
         }
     }
@@ -176,8 +198,14 @@ impl Config {
                 first: 0,
                 second: 1,
             },
+            quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
         }
+    }
+
+    pub fn with_quick_spawn_presets(mut self, presets: Vec<QuickSpawnPreset>) -> Self {
+        self.quick_spawn_presets = presets;
+        self
     }
 
     pub fn with_hooks(mut self, hooks: Hooks) -> Self {
@@ -211,6 +239,16 @@ impl Config {
             })
             .collect()
     }
+}
+
+fn default_quick_spawn_presets() -> Vec<QuickSpawnPreset> {
+    vec![QuickSpawnPreset {
+        key: 's',
+        spec: SessionSpec {
+            title: "shell".to_string(),
+            command: CommandSpec::Shell,
+        },
+    }]
 }
 
 impl CommandSpec {
@@ -314,6 +352,20 @@ fn status_text(state: &str, title: &str, cols: usize) -> String {
     }
 }
 
+fn quick_spawn_hint(presets: &[QuickSpawnPreset]) -> String {
+    let mut keys = presets
+        .iter()
+        .map(|preset| preset.key.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        "SPAWN".to_string()
+    } else {
+        format!("SPAWN {}", keys.into_iter().collect::<String>())
+    }
+}
+
 fn tab_text(title: &str, cols: usize) -> String {
     let title_width = UnicodeWidthStr::width(title);
     if cols >= title_width + 2 {
@@ -377,7 +429,10 @@ enum CmdShortcut {
     NextPane,
     SplitVertical,
     SplitHorizontal,
+    NewPane,
     NewTab,
+    QuickSpawnStart,
+    RespawnSession,
     ClosePaneOrTab,
     CloseTab,
     Quit,
@@ -452,6 +507,16 @@ fn cmd_shortcut(
     if lower == Some("t") || physical_code == Some(KeyCode::KeyT) {
         return Some(CmdShortcut::NewTab);
     }
+    if lower == Some("n") || physical_code == Some(KeyCode::KeyN) {
+        return if shift {
+            Some(CmdShortcut::QuickSpawnStart)
+        } else {
+            Some(CmdShortcut::NewPane)
+        };
+    }
+    if lower == Some("r") || physical_code == Some(KeyCode::KeyR) {
+        return Some(CmdShortcut::RespawnSession);
+    }
     if lower == Some("w") || physical_code == Some(KeyCode::KeyW) {
         return Some(if shift {
             CmdShortcut::CloseTab
@@ -522,6 +587,11 @@ struct AppState {
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
     pending_resize: Option<PhysicalSize<u32>>,
+    pending_font_size: Option<f32>,
+    preserve_grid_on_next_resize: bool,
+    current_scale_factor: f64,
+    quick_spawn_presets: Vec<QuickSpawnPreset>,
+    pending_quick_spawn: Option<Instant>,
     /// M12-6: design §2.1의 monotonic ID 정책을 IdAllocator로 캡슐화. M15 dynamic spawn에서 활용.
     #[allow(dead_code)]
     ids: IdAllocator,
@@ -617,10 +687,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("pj001")
-            .with_inner_size(PhysicalSize::new(960u32, 600u32))
-            .with_min_inner_size(PhysicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT));
+            .with_inner_size(LogicalSize::new(960.0, 600.0))
+            .with_min_inner_size(LogicalSize::new(
+                MIN_WINDOW_WIDTH as f64,
+                MIN_WINDOW_HEIGHT as f64,
+            ));
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
-        window.set_min_inner_size(Some(PhysicalSize::new(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)));
+        window.set_min_inner_size(Some(LogicalSize::new(
+            MIN_WINDOW_WIDTH as f64,
+            MIN_WINDOW_HEIGHT as f64,
+        )));
         // PTY spawn은 첫 Resized에서. window는 pending에 보관.
         self.pending_window = Some(window);
         self.startup_waited_once = false;
@@ -674,6 +750,24 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 // M17-5 coalesce: 즉시 resize 안 하고 누적. about_to_wait에서 마지막 size 한 번 처리.
                 state.pending_resize = Some(size);
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            WindowEvent::Moved(position) => {
+                log::debug!(
+                    "window moved: position={:?} scale={} stored_scale={}",
+                    position,
+                    state.window.scale_factor(),
+                    state.current_scale_factor,
+                );
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                log::debug!(
+                    "scale factor changed: old_scale={} new_scale={}",
+                    state.current_scale_factor,
+                    scale_factor,
+                );
+                state.log_window_frame("scale-factor-changed");
+                state.prepare_scale_factor_change(scale_factor);
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
             WindowEvent::Occluded(false) => {
@@ -783,6 +877,22 @@ impl ApplicationHandler<UserEvent> for App {
                     event.text
                 );
                 use winit::keyboard::{Key, NamedKey, PhysicalKey};
+                if event.state == ElementState::Pressed && state.pending_quick_spawn.is_some() {
+                    let handled = match &event.logical_key {
+                        Key::Character(s) => state.finish_quick_spawn(s),
+                        Key::Named(NamedKey::Escape) => {
+                            state.cancel_quick_spawn("escape");
+                            true
+                        }
+                        _ => {
+                            state.cancel_quick_spawn("unsupported key");
+                            true
+                        }
+                    };
+                    if handled {
+                        return;
+                    }
+                }
                 // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
                     let physical_code = match event.physical_key {
@@ -864,6 +974,22 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(CmdShortcut::NewTab) => {
                             if let Err(e) = state.create_tab() {
                                 log::warn!("cmd+t new tab failed: {e}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::NewPane) => {
+                            if let Err(e) = state.split_active(SplitAxis::Vertical) {
+                                log::warn!("cmd+n new pane failed: {e}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::QuickSpawnStart) => {
+                            state.start_quick_spawn();
+                            return;
+                        }
+                        Some(CmdShortcut::RespawnSession) => {
+                            if let Err(e) = state.respawn_active() {
+                                log::warn!("cmd+r respawn failed: {e}");
                             }
                             return;
                         }
@@ -1380,8 +1506,19 @@ impl AppState {
     }
 
     fn split_active(&mut self, axis: SplitAxis) -> Result<()> {
+        self.split_active_with_spec(
+            axis,
+            SessionSpec {
+                title: "shell".to_string(),
+                command: CommandSpec::Shell,
+            },
+        )
+    }
+
+    fn split_active_with_spec(&mut self, axis: SplitAxis, spec: SessionSpec) -> Result<()> {
         let new_pane = self.ids.new_pane();
         let active = self.active_tab().active;
+        let previous_root = self.active_tab().root.clone();
         let mut next_layout = self.active_tab().root.clone();
         if !next_layout.split_pane(active, axis, new_pane) {
             log::warn!("split requested for missing active pane {}", active.0);
@@ -1399,16 +1536,133 @@ impl AppState {
             log::warn!("split produced no viewport for new pane {}", new_pane.0);
             return Ok(());
         };
-        self.spawn_session_for_pane(
-            new_pane,
-            SessionSpec {
-                title: "shell".to_string(),
-                command: CommandSpec::Shell,
-            },
-            viewport,
-        )?;
+        if let Err(error) = self.spawn_session_for_pane(new_pane, spec, viewport) {
+            self.active_tab_mut().root = previous_root;
+            self.apply_layout_viewports();
+            self.window.request_redraw();
+            return Err(error);
+        }
         self.apply_layout_viewports_for_size(size);
         self.set_active(new_pane);
+        Ok(())
+    }
+
+    fn start_quick_spawn(&mut self) {
+        self.pending_quick_spawn = Some(Instant::now());
+        let hint = quick_spawn_hint(&self.quick_spawn_presets);
+        self.window.set_title(&format!("{hint} — pj001"));
+        self.window.request_redraw();
+        log::info!("quick spawn started: {hint}");
+    }
+
+    fn cancel_quick_spawn(&mut self, reason: &str) {
+        self.pending_quick_spawn = None;
+        let title = self.session_for_pane_idx(self.active_index()).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.window.request_redraw();
+        log::info!("quick spawn canceled: {reason}");
+    }
+
+    fn finish_quick_spawn(&mut self, key: &str) -> bool {
+        let Some(started_at) = self.pending_quick_spawn else {
+            return false;
+        };
+        self.pending_quick_spawn = None;
+        if started_at.elapsed() > Duration::from_secs(3) {
+            self.cancel_quick_spawn("timeout");
+            return true;
+        }
+        let Some(ch) = key.chars().next().map(|c| c.to_ascii_lowercase()) else {
+            self.cancel_quick_spawn("empty key");
+            return true;
+        };
+        if ch == 'n' {
+            self.pending_quick_spawn = Some(started_at);
+            log::debug!("quick spawn ignored repeated trigger key");
+            return true;
+        };
+        let Some(spec) = self
+            .quick_spawn_presets
+            .iter()
+            .find(|preset| preset.key.to_ascii_lowercase() == ch)
+            .map(|preset| preset.spec.clone())
+        else {
+            self.cancel_quick_spawn("unmapped key");
+            return true;
+        };
+        if let Err(e) = self.split_active_with_spec(SplitAxis::Vertical, spec) {
+            log::warn!("quick spawn failed: {e}");
+            let title = self.session_for_pane_idx(self.active_index()).title.clone();
+            self.window.set_title(&format!("{} — pj001", title));
+        }
+        true
+    }
+
+    fn respawn_active(&mut self) -> Result<()> {
+        let active_idx = self.active_index();
+        let pane_id = self.active_tab().panes[active_idx].id;
+        let old_session_id = self.active_tab().panes[active_idx].session;
+        let viewport = self.active_tab().panes[active_idx].viewport;
+        let Some(old_session) = self.sessions.get(&old_session_id) else {
+            log::warn!("respawn requested for missing session {}", old_session_id.0);
+            return Ok(());
+        };
+        let command = old_session.command.clone();
+        let title = old_session.title.clone();
+        let new_session_id = self.ids.new_session();
+        let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
+        log::info!(
+            "respawn pane {} session {} -> {} command={}",
+            pane_id.0,
+            old_session_id.0,
+            new_session_id.0,
+            command,
+        );
+        let pty = PtyHandle::spawn(
+            &command,
+            PtySize {
+                rows: viewport.rows as u16,
+                cols: viewport.cols as u16,
+                pixel_width: viewport.width_px as u16,
+                pixel_height: viewport.height_px as u16,
+            },
+            term.clone(),
+            self.proxy.clone(),
+            new_session_id,
+        )?;
+        self.sessions.insert(
+            new_session_id,
+            Session {
+                id: new_session_id,
+                title: title.clone(),
+                command,
+                pty,
+                term,
+                alive: true,
+                exit_code: None,
+                created_at: Instant::now(),
+            },
+        );
+        self.active_tab_mut().panes[active_idx].session = new_session_id;
+        if let Some(mut old_session) = self.sessions.remove(&old_session_id) {
+            old_session.alive = false;
+            old_session.exit_code = Some(-1);
+            drop(old_session);
+            self.emit_lifecycle(LifecycleEvent::SessionExited {
+                session_id: old_session_id,
+                code: -1,
+            });
+        }
+        self.emit_lifecycle(LifecycleEvent::SessionStarted {
+            session_id: new_session_id,
+            title: title.clone(),
+        });
+        self.sync_active_tab_title(title.clone());
+        self.window.set_title(&format!("{} — pj001", title));
+        self.cursor_visible = true;
+        self.last_ime_cursor = None;
+        self.preedit = None;
+        self.window.request_redraw();
         Ok(())
     }
 
@@ -1652,6 +1906,11 @@ impl AppState {
         )
     }
 
+    fn minimum_inner_size_logical(&self) -> LogicalSize<f64> {
+        let size = self.minimum_inner_size();
+        size.to_logical(self.window.scale_factor())
+    }
+
     fn target_inner_size_for_layout(&self) -> PhysicalSize<u32> {
         let min = self.minimum_inner_size();
         PhysicalSize::new(
@@ -1661,8 +1920,25 @@ impl AppState {
     }
 
     fn update_min_inner_size(&self) {
+        log::debug!(
+            "set min inner size logical={:?} scale={}",
+            self.minimum_inner_size_logical(),
+            self.window.scale_factor(),
+        );
         self.window
-            .set_min_inner_size(Some(self.minimum_inner_size()));
+            .set_min_inner_size(Some(self.minimum_inner_size_logical()));
+    }
+
+    fn log_window_frame(&self, label: &str) {
+        let inner = self.window.inner_size();
+        log::debug!(
+            "{label}: outer={:?} inner={}x{} window_scale={} stored_scale={}",
+            self.window.outer_position().ok(),
+            inner.width,
+            inner.height,
+            self.window.scale_factor(),
+            self.current_scale_factor,
+        );
     }
 
     /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는
@@ -1731,7 +2007,7 @@ impl AppState {
             &queue,
             format,
             [size.width as f32, size.height as f32],
-            FONT_SIZE,
+            physical_font_size(FONT_SIZE, window.scale_factor()),
         );
 
         let hooks = config.hooks.clone();
@@ -1811,6 +2087,7 @@ impl AppState {
             active: PaneId::first(),
         };
 
+        let current_scale_factor = window.scale_factor();
         let state = Self {
             window,
             proxy,
@@ -1833,6 +2110,11 @@ impl AppState {
             last_mouse_pos: None,
             dragging_divider: None,
             pending_resize: None,
+            pending_font_size: None,
+            preserve_grid_on_next_resize: false,
+            current_scale_factor,
+            quick_spawn_presets: config.quick_spawn_presets.clone(),
+            pending_quick_spawn: None,
             ids,
         };
         state.update_min_inner_size();
@@ -1995,6 +2277,16 @@ impl AppState {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        self.log_window_frame("resize before");
+        let font_changed = self
+            .pending_font_size
+            .take()
+            .map(|font_size| {
+                self.renderer
+                    .set_font_size(&self.device, &self.queue, font_size)
+            })
+            .unwrap_or(false);
+        let preserve_grid = std::mem::take(&mut self.preserve_grid_on_next_resize);
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
@@ -2016,8 +2308,12 @@ impl AppState {
         let pane_count = self.active_tab().panes.len();
         for idx in 0..pane_count {
             let pane_id = self.active_tab().panes[idx].id;
-            let viewport = layouts[&pane_id];
+            let mut viewport = layouts[&pane_id];
             let prev = self.active_tab().panes[idx].viewport;
+            if preserve_grid {
+                viewport.cols = prev.cols;
+                viewport.rows = prev.rows;
+            }
             // M12-5 회귀 fix (Codex threads 019e164b → 019e1653 가설 K):
             // PTY/Term resize는 실제 terminal cell size(rows/cols)가 바뀔 때만 필요하다.
             // col_offset/status_row/pixel 크기는 visual layout/chrome 값이라 이걸 trigger로
@@ -2040,7 +2336,19 @@ impl AppState {
                 });
             }
         }
+        if font_changed && !preserve_grid {
+            self.update_min_inner_size();
+        }
         self.window.request_redraw();
+        self.log_window_frame("resize after");
+    }
+
+    fn prepare_scale_factor_change(&mut self, scale_factor: f64) {
+        let font_size = physical_font_size(FONT_SIZE, scale_factor);
+        self.pending_font_size = Some(font_size);
+        self.preserve_grid_on_next_resize = true;
+        self.current_scale_factor = scale_factor_or_default(scale_factor);
+        log::debug!("scale factor changed: scale={scale_factor} font_size={font_size}");
     }
 
     fn render(&mut self) {
@@ -2231,6 +2539,8 @@ impl AppState {
             let alive = session.alive;
             let state = if !alive {
                 "DEAD"
+            } else if pane.id == active && self.pending_quick_spawn.is_some() {
+                "SPAWN"
             } else if pane.id == active {
                 "ACTIVE"
             } else {
@@ -2303,6 +2613,18 @@ mod tests {
             height: 20,
             baseline: 15.0,
         }
+    }
+
+    #[test]
+    fn physical_font_size_scales_logical_default() {
+        assert_eq!(physical_font_size(14.0, 1.0), 14.0);
+        assert_eq!(physical_font_size(14.0, 2.0), 28.0);
+    }
+
+    #[test]
+    fn physical_font_size_ignores_invalid_scale() {
+        assert_eq!(physical_font_size(14.0, 0.0), 14.0);
+        assert_eq!(physical_font_size(14.0, f64::NAN), 14.0);
     }
 
     #[test]
@@ -2541,6 +2863,28 @@ mod tests {
     }
 
     #[test]
+    fn cmd_shortcut_routes_new_tab_and_new_pane() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            cmd_shortcut(Some("t"), Some(KeyCode::KeyT), false, false),
+            Some(CmdShortcut::NewTab)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("n"), Some(KeyCode::KeyN), false, false),
+            Some(CmdShortcut::NewPane)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("n"), Some(KeyCode::KeyN), true, false),
+            Some(CmdShortcut::QuickSpawnStart)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false),
+            Some(CmdShortcut::RespawnSession)
+        );
+    }
+
+    #[test]
     fn close_decision_escalates_cmd_w_from_pane_to_tab_to_exit() {
         assert_eq!(
             close_decision(CmdShortcut::ClosePaneOrTab, 2, 1),
@@ -2620,6 +2964,7 @@ mod tests {
                 first: 0,
                 second: 1,
             },
+            quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
         };
 
@@ -2638,6 +2983,7 @@ mod tests {
                 first: 0,
                 second: 0,
             },
+            quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
         };
 
