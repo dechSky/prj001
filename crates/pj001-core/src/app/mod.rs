@@ -1072,6 +1072,15 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // 슬라이스 6.3c: Cmd+click on hyperlink cell → 브라우저로 OSC 8 URI 열기.
+                if matches!(button_state, ElementState::Pressed)
+                    && state.modifiers.super_key()
+                    && !state.modifiers.shift_key()
+                {
+                    if state.try_open_hyperlink_at_mouse() {
+                        return;
+                    }
+                }
                 // 슬라이스 6.6: mouse reporting 활성 + Shift 미보유 → PTY로 전달.
                 // Shift 보유 시 selection 모드로 우회 (xterm/iterm 표준).
                 if !state.modifiers.shift_key() {
@@ -2833,6 +2842,43 @@ impl AppState {
             return false;
         }
         selection.head = cell;
+        true
+    }
+
+    /// 슬라이스 6.3c: Cmd+click 시 클릭한 cell의 hyperlink URI를 추출해 macOS `open`으로 실행.
+    /// 반환 true면 caller가 다른 click 처리 skip.
+    fn try_open_hyperlink_at_mouse(&mut self) -> bool {
+        let Some((pane_id, (row, col))) = self.pane_cell_at_mouse() else {
+            return false;
+        };
+        // pane_id의 session에서 cell의 hyperlink_id 조회.
+        let idx_opt = self
+            .active_tab()
+            .panes
+            .iter()
+            .position(|p| p.id == pane_id);
+        let Some(idx) = idx_opt else {
+            return false;
+        };
+        let session = self.session_for_pane_idx(idx);
+        let Ok(term) = session.term.lock() else {
+            return false;
+        };
+        let cell = term.cell(row, col);
+        let id = cell.hyperlink_id;
+        if id == 0 {
+            return false;
+        }
+        let uri = match term.hyperlink_uri_by_id(id) {
+            Some(u) => u.to_string(),
+            None => return false,
+        };
+        drop(term);
+        // macOS `open` 호출.
+        log::info!("hyperlink open: {}", uri);
+        if let Err(e) = std::process::Command::new("open").arg(&uri).spawn() {
+            log::warn!("hyperlink open failed: {e}");
+        }
         true
     }
 

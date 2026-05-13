@@ -55,6 +55,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// 슬라이스 6.3c: OSC 8 hyperlink pool index. 0 = 링크 없음, 1.. = `Term.hyperlink_pool[id-1]`.
+    /// click 시 Cmd+click → URI 추출 → macOS `open`.
+    pub hyperlink_id: u16,
 }
 
 impl Default for Cell {
@@ -64,6 +67,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::empty(),
+            hyperlink_id: 0,
         }
     }
 }
@@ -431,9 +435,14 @@ pub struct Term {
     /// OSC 7로 받은 현재 작업 디렉터리. shell의 chpwd hook이 보낸 file URL을
     /// path로 디코드해 보관. None이면 미수신/미파싱. block UI(M13+)와 pane 헤더가 사용.
     cwd: Option<String>,
-    /// OSC 8 active hyperlink URI. None = 일반 텍스트. 차후 cell 단위 매핑은
-    /// 사이드테이블로 분리 (1차는 추적만).
+    /// OSC 8 active hyperlink URI. None = 일반 텍스트.
+    /// 슬라이스 6.3c — URI 자체는 hyperlink_pool에 저장하고 cell엔 id만 stamp.
     hyperlink_uri: Option<String>,
+    /// 슬라이스 6.3c: OSC 8로 받은 URI 풀. 인덱스 0은 reserved("no link"), 1부터 실제 URI.
+    /// 중복 dedup은 작은 코퍼스 가정으로 linear search.
+    hyperlink_pool: Vec<String>,
+    /// 현재 active OSC 8 URI의 pool index. 0 = inactive (cells에 stamp 안 됨).
+    active_hyperlink_id: u16,
     /// OSC 133;A — 최근 prompt start row (절대 = scrollback rows + main grid row).
     /// 차후 Cmd+↑/↓ "prev/next prompt" 점프, block UI 카드 경계 결정에 사용.
     last_prompt_row: Option<u64>,
@@ -495,6 +504,8 @@ impl Term {
             g0_charset: Charset::Ascii,
             cwd: None,
             hyperlink_uri: None,
+            hyperlink_pool: Vec::new(),
+            active_hyperlink_id: 0,
             last_prompt_row: None,
             prompts_seen: 0,
             last_command_exit: None,
@@ -553,14 +564,45 @@ impl Term {
         self.cwd = Some(path.into());
     }
 
-    /// OSC 8 hyperlink — 현재 active URI. None이면 normal text.
-    /// `print()` 시 attrs에 HYPERLINK 플래그 켜고 별도 사이드테이블에 URI 매핑(차후).
-    /// 1차 cut은 단순 plain text — URI는 추적만, 시각적 표현 X.
+    /// OSC 8 active hyperlink URI. None = 일반 텍스트.
     pub fn hyperlink_uri(&self) -> Option<&str> {
         self.hyperlink_uri.as_deref()
     }
+    /// OSC 8 dispatch — URI 지정/해제. Some이면 pool에 등록(또는 기존 인덱스 재사용)하고
+    /// 다음 `print()`부터 cells에 hyperlink_id stamp.
     pub fn set_hyperlink_uri(&mut self, uri: Option<String>) {
-        self.hyperlink_uri = uri;
+        match uri {
+            None => {
+                self.hyperlink_uri = None;
+                self.active_hyperlink_id = 0;
+            }
+            Some(u) => {
+                // pool에 이미 있으면 인덱스 재사용, 없으면 push.
+                let id = self
+                    .hyperlink_pool
+                    .iter()
+                    .position(|p| p == &u)
+                    .map(|i| (i + 1) as u16)
+                    .unwrap_or_else(|| {
+                        // u16 overflow 방어 — 65535개까지만 등록. 그 이상은 ID 0(링크 없음)으로 fallback.
+                        if self.hyperlink_pool.len() >= u16::MAX as usize - 1 {
+                            return 0;
+                        }
+                        self.hyperlink_pool.push(u.clone());
+                        self.hyperlink_pool.len() as u16
+                    });
+                self.active_hyperlink_id = id;
+                self.hyperlink_uri = Some(u);
+            }
+        }
+    }
+
+    /// hyperlink_id로 URI 조회. 0이거나 pool 범위 밖이면 None.
+    pub fn hyperlink_uri_by_id(&self, id: u16) -> Option<&str> {
+        if id == 0 {
+            return None;
+        }
+        self.hyperlink_pool.get((id - 1) as usize).map(|s| s.as_str())
     }
 
     // M10-2: bracketed paste mode getter/setter.
@@ -949,14 +991,16 @@ impl Term {
         if self.hyperlink_uri.is_some() {
             attrs |= Attrs::HYPERLINK;
         }
+        let hyperlink_id = self.active_hyperlink_id;
         let g = self.grid_mut();
-        *g.cell_mut(row, col) = Cell { ch, fg, bg, attrs };
+        *g.cell_mut(row, col) = Cell { ch, fg, bg, attrs, hyperlink_id };
         if w == 2 {
             *g.cell_mut(row, col + 1) = Cell {
                 ch: ' ',
                 fg,
                 bg,
                 attrs: base_attrs | Attrs::WIDE_CONT,
+                hyperlink_id,
             };
         }
         self.cursor.col += w;

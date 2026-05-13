@@ -834,6 +834,47 @@ mod tests {
     }
 
     #[test]
+    fn osc_8_cells_get_hyperlink_id_stamped() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]8;;https://a.com\x1b\\");
+        run(&mut term, b"AB");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        run(&mut term, b"C");
+        // A, B는 hyperlink_id 1, C는 0.
+        assert_eq!(term.cell(0, 0).hyperlink_id, 1);
+        assert_eq!(term.cell(0, 1).hyperlink_id, 1);
+        assert_eq!(term.cell(0, 2).hyperlink_id, 0);
+        assert_eq!(term.hyperlink_uri_by_id(1), Some("https://a.com"));
+    }
+
+    #[test]
+    fn osc_8_pool_dedups_repeated_uri() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]8;;https://x.com\x1b\\");
+        run(&mut term, b"X");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        run(&mut term, b"\x1b]8;;https://x.com\x1b\\");
+        run(&mut term, b"Y");
+        // 두 cell 모두 같은 id 1.
+        assert_eq!(term.cell(0, 0).hyperlink_id, 1);
+        assert_eq!(term.cell(0, 1).hyperlink_id, 1);
+    }
+
+    #[test]
+    fn osc_8_multiple_uris_get_distinct_ids() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]8;;https://a.com\x1b\\");
+        run(&mut term, b"A");
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        run(&mut term, b"\x1b]8;;https://b.com\x1b\\");
+        run(&mut term, b"B");
+        assert_eq!(term.cell(0, 0).hyperlink_id, 1);
+        assert_eq!(term.cell(0, 1).hyperlink_id, 2);
+        assert_eq!(term.hyperlink_uri_by_id(1), Some("https://a.com"));
+        assert_eq!(term.hyperlink_uri_by_id(2), Some("https://b.com"));
+    }
+
+    #[test]
     fn osc_133_a_records_prompt_row() {
         let mut term = Term::new(8, 3);
         run(&mut term, b"\x1b[2;1H"); // cursor to row 1
