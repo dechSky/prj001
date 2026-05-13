@@ -450,6 +450,10 @@ pub struct Term {
     prompts_seen: u64,
     /// OSC 133;D 종료 코드. None이면 미수신 / running.
     last_command_exit: Option<i32>,
+    /// OSC 133;B — 명령어 텍스트 시작 절대 행.
+    last_command_start_row: Option<u64>,
+    /// OSC 133;C — 명령어 출력 시작 절대 행. block UI에서 prompt/command와 output 시각적 분리.
+    last_output_start_row: Option<u64>,
     /// 슬라이스 6.6: xterm 마우스 reporting 모드. None = 보고 안 함.
     mouse_protocol: MouseProtocol,
     /// CSI ?1006: SGR encoding. true면 `CSI < b;c;r M/m`, false면 legacy 1-byte 인코딩.
@@ -509,6 +513,8 @@ impl Term {
             last_prompt_row: None,
             prompts_seen: 0,
             last_command_exit: None,
+            last_command_start_row: None,
+            last_output_start_row: None,
             mouse_protocol: MouseProtocol::Off,
             mouse_sgr_encoding: false,
         }
@@ -534,6 +540,16 @@ impl Term {
         self.last_prompt_row = Some(absolute);
         self.prompts_seen = self.prompts_seen.saturating_add(1);
     }
+    /// `OSC 133;B` 시점 — 명령어 텍스트 시작.
+    pub fn semantic_command_start(&mut self) {
+        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
+        self.last_command_start_row = Some(absolute);
+    }
+    /// `OSC 133;C` 시점 — 명령어 출력 시작.
+    pub fn semantic_output_start(&mut self) {
+        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
+        self.last_output_start_row = Some(absolute);
+    }
     /// `OSC 133;D[;exit]` 시점에 호출. exit는 None이면 unknown.
     pub fn semantic_command_end(&mut self, exit: Option<i32>) {
         self.last_command_exit = exit;
@@ -546,6 +562,12 @@ impl Term {
     }
     pub fn last_command_exit(&self) -> Option<i32> {
         self.last_command_exit
+    }
+    pub fn last_command_start_row(&self) -> Option<u64> {
+        self.last_command_start_row
+    }
+    pub fn last_output_start_row(&self) -> Option<u64> {
+        self.last_output_start_row
     }
 
     /// M11-4: G0 charset 지정 (ESC ( B = ASCII, ESC ( 0 = DEC special graphics).
@@ -603,6 +625,18 @@ impl Term {
             return None;
         }
         self.hyperlink_pool.get((id - 1) as usize).map(|s| s.as_str())
+    }
+
+    /// hyperlink pool 전체 클리어. 스크롤백 evict + 명시적 reset 시 호출.
+    /// 주의: 이미 cells에 stamp된 hyperlink_id는 무효화 — Hit miss 처리는 lookup이 None 반환으로 자연 처리.
+    pub fn clear_hyperlink_pool(&mut self) {
+        self.hyperlink_pool.clear();
+        self.active_hyperlink_id = 0;
+        self.hyperlink_uri = None;
+    }
+
+    pub fn hyperlink_pool_len(&self) -> usize {
+        self.hyperlink_pool.len()
     }
 
     // M10-2: bracketed paste mode getter/setter.
@@ -1347,6 +1381,8 @@ impl Term {
         self.cursor.col = 0;
         // title 유지 (xterm 기본)
         // pending_responses는 그대로 (이미 큐된 응답은 보낸다)
+        // hyperlink pool도 RIS 시 클리어 (cells도 다 지우니까 안전).
+        self.clear_hyperlink_pool();
     }
 
     #[allow(dead_code)]

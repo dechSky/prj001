@@ -24,8 +24,10 @@ log = "0.4"
 pj001-core = { path = "crates/pj001-core" }
 pollster = "0.4"
 portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
 swash = "0.2"
 thiserror = "2"
+toml = "0.8"
 unicode-width = "0.2"
 vte = "0.15"
 wgpu = "29"

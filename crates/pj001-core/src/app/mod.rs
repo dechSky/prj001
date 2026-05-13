@@ -2087,27 +2087,33 @@ impl AppState {
         } else {
             Box::new((0..start_abs.min(total)).rev())
         };
+        let query_chars: Vec<char> = query.chars().collect();
+        let qlen = query_chars.len();
         let mut found: Option<(usize, usize, usize)> = None; // (abs_row, col_start, visible_row)
         for abs in range {
-            let (row_text, visible_row) = if abs < scrollback_len {
+            let (row_chars, visible_row) = if abs < scrollback_len {
                 let needed_offset = scrollback_len - abs;
                 term.set_view_offset(needed_offset.min(scrollback_len));
-                let text: String = (0..cols).map(|c| term.cell(0, c).ch).collect();
-                (text, 0usize)
+                let chars: Vec<char> = (0..cols).map(|c| term.cell(0, c).ch).collect();
+                (chars, 0usize)
             } else {
                 let row = abs - scrollback_len;
                 if row >= rows {
                     continue;
                 }
                 term.set_view_offset(0);
-                let text: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
-                (text, row)
+                let chars: Vec<char> = (0..cols).map(|c| term.cell(row, c).ch).collect();
+                (chars, row)
             };
-            // ASCII 가정 — char_index == col. 멀티바이트 UTF-8 query는 byte index와 차이 있음,
-            // 후속 슬라이스에서 char_indices 기반 정확 매칭으로 개선.
-            if let Some(col_start) = row_text.find(&query) {
-                found = Some((abs, col_start, visible_row));
-                break;
+            // char-단위 정확 매칭 — col index가 그대로 셀 좌표.
+            if qlen > 0 && qlen <= row_chars.len() {
+                if let Some(col_start) = row_chars
+                    .windows(qlen)
+                    .position(|w| w == query_chars.as_slice())
+                {
+                    found = Some((abs, col_start, visible_row));
+                    break;
+                }
             }
         }
         if found.is_none() {

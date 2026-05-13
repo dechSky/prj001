@@ -217,15 +217,14 @@ impl<'a> Perform for TermPerform<'a> {
             if let Some(kind) = params.get(1) {
                 match kind.first() {
                     Some(b'A') => self.term.semantic_prompt_start(),
+                    Some(b'B') => self.term.semantic_command_start(),
+                    Some(b'C') => self.term.semantic_output_start(),
                     Some(b'D') => {
                         let exit = params.get(2)
                             .and_then(|s| std::str::from_utf8(s).ok())
                             .and_then(|s| s.parse::<i32>().ok());
                         self.term.semantic_command_end(exit);
                     }
-                    // B (command start), C (output start)는 boundary marker — 차후
-                    // block UI에서 출력 영역 분리에 사용. 1차는 no-op.
-                    Some(b'B') | Some(b'C') => {}
                     _ => {}
                 }
             }
@@ -899,6 +898,51 @@ mod tests {
         let mut term = Term::new(8, 1);
         run(&mut term, b"\x1b]133;D\x1b\\");
         assert_eq!(term.last_command_exit(), None);
+    }
+
+    #[test]
+    fn osc_133_b_records_command_start_row() {
+        let mut term = Term::new(8, 3);
+        run(&mut term, b"\x1b[2;1H"); // cursor to row 1
+        run(&mut term, b"\x1b]133;B\x1b\\");
+        assert_eq!(term.last_command_start_row(), Some(1));
+    }
+
+    #[test]
+    fn osc_133_c_records_output_start_row() {
+        let mut term = Term::new(8, 3);
+        run(&mut term, b"\x1b[3;1H"); // cursor to row 2
+        run(&mut term, b"\x1b]133;C\x1b\\");
+        assert_eq!(term.last_output_start_row(), Some(2));
+    }
+
+    #[test]
+    fn osc_133_full_block_lifecycle() {
+        // shell이 보내는 시퀀스: prompt(A) → cmd 표시 → command_start(B) → 출력 → output_start(C) → 출력 → end(D)
+        let mut term = Term::new(20, 5);
+        run(&mut term, b"\x1b[1;1H"); // row 0
+        run(&mut term, b"\x1b]133;A\x1b\\"); // prompt start at row 0
+        run(&mut term, b"\x1b[1;3H"); // row 0, col 2
+        run(&mut term, b"\x1b]133;B\x1b\\"); // command start
+        run(&mut term, b"\x1b[2;1H"); // row 1
+        run(&mut term, b"\x1b]133;C\x1b\\"); // output start
+        run(&mut term, b"\x1b]133;D;0\x1b\\"); // end exit 0
+        assert_eq!(term.last_prompt_row(), Some(0));
+        assert_eq!(term.last_command_start_row(), Some(0));
+        assert_eq!(term.last_output_start_row(), Some(1));
+        assert_eq!(term.last_command_exit(), Some(0));
+        assert_eq!(term.prompts_seen(), 1);
+    }
+
+    #[test]
+    fn ris_clears_hyperlink_pool() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]8;;https://x.com\x1b\\");
+        run(&mut term, b"X");
+        assert_eq!(term.hyperlink_pool_len(), 1);
+        run(&mut term, b"\x1bc"); // RIS
+        assert_eq!(term.hyperlink_pool_len(), 0);
+        assert_eq!(term.hyperlink_uri_by_id(1), None);
     }
 
     #[test]

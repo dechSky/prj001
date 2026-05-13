@@ -1,6 +1,7 @@
 use pj001_core::app::{self, CommandSpec, Config, QuickSpawnPreset, SessionSpec};
 use pj001_core::error::{self, Error};
 use pj001_core::render::ThemePalette;
+use serde::Deserialize;
 use std::backtrace::Backtrace;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -12,8 +13,54 @@ fn main() -> error::Result<()> {
     install_panic_hook();
     let _ = env_logger::try_init();
     let args: Vec<String> = std::env::args().collect();
-    let config = parse_config(&args[1..])?;
+    let file_config = load_user_config_file();
+    let config = parse_config(&args[1..], file_config.as_ref())?;
     app::run(config)
+}
+
+/// 슬라이스 6.7: 사용자 config file 파싱 — 현재는 general.theme만.
+/// 우선순위: CLI 플래그 > config 파일 > 빌트인 default.
+/// 경로: `$PJ001_CONFIG` env 또는 `$HOME/.config/pj001/config.toml`.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileConfig {
+    #[serde(default)]
+    general: FileGeneral,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileGeneral {
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+fn user_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("PJ001_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/pj001/config.toml"))
+}
+
+fn load_user_config_file() -> Option<FileConfig> {
+    let path = user_config_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("config file read failed at {}: {e}", path.display());
+            return None;
+        }
+    };
+    match toml::from_str::<FileConfig>(&raw) {
+        Ok(cfg) => {
+            log::info!("config loaded: {}", path.display());
+            Some(cfg)
+        }
+        Err(e) => {
+            log::warn!("config file parse failed at {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn install_panic_hook() {
@@ -51,7 +98,8 @@ fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
 
 /// 기존 `--shell` 단일 터미널 모드와 M11-1 `--bridge --left/--right` 모드 지원.
 /// `--theme <name>`로 6 테마(aurora/obsidian/vellum/holo/bento/crystal) 선택.
-fn parse_config(args: &[String]) -> error::Result<Config> {
+/// `file_config` (~/.config/pj001/config.toml)의 general.theme는 CLI 미지정 시 사용.
+fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Result<Config> {
     let mut bridge = false;
     let mut shell_override = None;
     let mut left = None;
@@ -92,7 +140,11 @@ fn parse_config(args: &[String]) -> error::Result<Config> {
             _ => {}
         }
     }
-    let theme = match theme_name {
+    // CLI 우선 → file_config → None
+    let theme = match theme_name.or_else(|| {
+        file_config
+            .and_then(|c| c.general.theme.clone())
+    }) {
         Some(name) => Some(ThemePalette::by_name(&name).ok_or_else(|| {
             Error::Args(format!(
                 "unknown theme: {name} (expected aurora/obsidian/vellum/holo/bento/crystal)"
@@ -220,7 +272,7 @@ mod tests {
     #[test]
     fn parse_default_single_mode() {
         assert_eq!(
-            parse_config(&args(&[])).unwrap(),
+            parse_config(&args(&[]), None).unwrap(),
             Config::single_shell(None)
         );
     }
@@ -228,7 +280,7 @@ mod tests {
     #[test]
     fn parse_single_shell_override() {
         assert_eq!(
-            parse_config(&args(&["--shell", "/bin/zsh"])).unwrap(),
+            parse_config(&args(&["--shell", "/bin/zsh"]), None).unwrap(),
             Config::single_shell(Some("/bin/zsh".to_string()))
         );
     }
@@ -236,7 +288,7 @@ mod tests {
     #[test]
     fn parse_bridge_defaults() {
         assert_eq!(
-            parse_config(&args(&["--bridge"])).unwrap(),
+            parse_config(&args(&["--bridge"]), None).unwrap(),
             bridge_config("claude".to_string(), "codex".to_string())
         );
     }
@@ -249,7 +301,7 @@ mod tests {
                 "--left=/bin/zsh",
                 "--right",
                 "/bin/bash"
-            ]))
+            ]), None)
             .unwrap(),
             bridge_config("/bin/zsh".to_string(), "/bin/bash".to_string())
         );
@@ -262,7 +314,7 @@ mod tests {
             "--left=/bin/zsh",
             "--right",
             "/bin/bash",
-        ]))
+        ]), None)
         .unwrap();
 
         assert_eq!(
@@ -282,55 +334,116 @@ mod tests {
 
     #[test]
     fn parse_rejects_missing_value_before_next_flag() {
-        assert!(parse_config(&args(&["--shell", "--bridge"])).is_err());
-        assert!(parse_config(&args(&["--bridge", "--left", "--right=/bin/zsh"])).is_err());
-        assert!(parse_config(&args(&["--shell=--bridge"])).is_err());
+        assert!(parse_config(&args(&["--shell", "--bridge"]), None).is_err());
+        assert!(parse_config(&args(&["--bridge", "--left", "--right=/bin/zsh"]), None).is_err());
+        assert!(parse_config(&args(&["--shell=--bridge"]), None).is_err());
     }
 
     #[test]
     fn parse_rejects_bridge_with_shell_override() {
-        assert!(parse_config(&args(&["--bridge", "--shell", "/bin/zsh"])).is_err());
+        assert!(parse_config(&args(&["--bridge", "--shell", "/bin/zsh"]), None).is_err());
     }
 
     #[test]
     fn parse_rejects_bridge_pane_args_without_bridge() {
-        assert!(parse_config(&args(&["--left", "/bin/zsh"])).is_err());
-        assert!(parse_config(&args(&["--right=/bin/zsh"])).is_err());
+        assert!(parse_config(&args(&["--left", "/bin/zsh"]), None).is_err());
+        assert!(parse_config(&args(&["--right=/bin/zsh"]), None).is_err());
     }
 
     #[test]
     fn parse_rejects_unknown_flags() {
-        assert!(parse_config(&args(&["--unknown"])).is_err());
+        assert!(parse_config(&args(&["--unknown"]), None).is_err());
     }
 
     #[test]
     fn parse_theme_sets_palette() {
-        let cfg = parse_config(&args(&["--theme", "vellum"])).unwrap();
+        let cfg = parse_config(&args(&["--theme", "vellum"]), None).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
     }
 
     #[test]
     fn parse_theme_eq_form() {
-        let cfg = parse_config(&args(&["--theme=aurora"])).unwrap();
+        let cfg = parse_config(&args(&["--theme=aurora"]), None).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("aurora"));
     }
 
     #[test]
     fn parse_theme_unknown_rejected() {
-        assert!(parse_config(&args(&["--theme", "solarized"])).is_err());
+        assert!(parse_config(&args(&["--theme", "solarized"]), None).is_err());
     }
 
     #[test]
     fn parse_theme_combines_with_bridge() {
         let cfg =
-            parse_config(&args(&["--bridge", "--theme", "obsidian", "--left=foo"])).unwrap();
+            parse_config(&args(&["--bridge", "--theme", "obsidian", "--left=foo"]), None).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
         assert_eq!(cfg.sessions.len(), 2);
     }
 
     #[test]
     fn parse_no_theme_defaults_to_none() {
-        let cfg = parse_config(&args(&[])).unwrap();
+        let cfg = parse_config(&args(&[]), None).unwrap();
         assert!(cfg.theme.is_none());
+    }
+
+    #[test]
+    fn file_config_theme_applied_when_cli_omits() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: Some("vellum".to_string()),
+            },
+        };
+        let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
+        assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
+    }
+
+    #[test]
+    fn cli_theme_overrides_file_config() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: Some("vellum".to_string()),
+            },
+        };
+        let cfg = parse_config(&args(&["--theme", "obsidian"]), Some(&fc)).unwrap();
+        assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
+    }
+
+    #[test]
+    fn file_config_unknown_theme_errors() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: Some("nope".to_string()),
+            },
+        };
+        assert!(parse_config(&args(&[]), Some(&fc)).is_err());
+    }
+
+    #[test]
+    fn file_config_parses_minimal_toml() {
+        let raw = r#"
+[general]
+theme = "aurora"
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.general.theme.as_deref(), Some("aurora"));
+    }
+
+    #[test]
+    fn file_config_empty_toml_defaults() {
+        let parsed: FileConfig = toml::from_str("").unwrap();
+        assert!(parsed.general.theme.is_none());
+    }
+
+    #[test]
+    fn file_config_unknown_key_ignored() {
+        // 알려지지 않은 key는 ignore (forward compat).
+        let raw = r#"
+[general]
+theme = "bento"
+[future_section]
+something = "value"
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.general.theme.as_deref(), Some("bento"));
     }
 }
