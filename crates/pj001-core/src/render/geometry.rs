@@ -4,6 +4,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::grid::{Attrs, Color, CursorShape, Term};
 
 use super::atlas::GlyphAtlas;
+use super::theme::ThemePalette;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -38,10 +39,6 @@ pub struct SelectionRange {
     pub end: (usize, usize),
 }
 
-const FG_DEFAULT: [f32; 4] = [0.86, 0.86, 0.86, 1.0];
-const BG_DEFAULT: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
-const SELECTION_BG: [f32; 4] = [0.18, 0.35, 0.50, 1.0];
-
 pub fn build_instances_at(
     term: &Term,
     atlas: &GlyphAtlas,
@@ -50,6 +47,7 @@ pub fn build_instances_at(
     selection: Option<SelectionRange>,
     col_offset: usize,
     row_offset: usize,
+    palette: &ThemePalette,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     for r in 0..term.rows() {
@@ -64,11 +62,11 @@ pub fn build_instances_at(
             let reversed = cell.attrs.contains(Attrs::REVERSE);
             let selected = selection.is_some_and(|selection| selection.contains(r, c));
             let (fg, bg) = if selected {
-                (FG_DEFAULT, SELECTION_BG)
+                (palette.fg, palette.selection_bg)
             } else if reversed {
-                (resolve(cell.bg, false), resolve(cell.fg, true))
+                (resolve(cell.bg, false, palette), resolve(cell.fg, true, palette))
             } else {
-                (resolve(cell.fg, true), resolve(cell.bg, false))
+                (resolve(cell.fg, true, palette), resolve(cell.bg, false, palette))
             };
 
             let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
@@ -77,7 +75,7 @@ pub fn build_instances_at(
                 atlas.get(cell.ch).filter(|e| e.width > 0 && e.height > 0)
             };
 
-            let bg_is_default = bg == BG_DEFAULT;
+            let bg_is_default = bg == palette.bg;
             if entry.is_none() && bg_is_default && !selected {
                 continue;
             }
@@ -132,9 +130,9 @@ pub fn build_instances_at(
             1.0
         };
         let (orig_fg, orig_bg) = if cell.attrs.contains(Attrs::REVERSE) {
-            (resolve(cell.bg, false), resolve(cell.fg, true))
+            (resolve(cell.bg, false, palette), resolve(cell.fg, true, palette))
         } else {
-            (resolve(cell.fg, true), resolve(cell.bg, false))
+            (resolve(cell.fg, true, palette), resolve(cell.bg, false, palette))
         };
         // reverse: overlay에서 fg ↔ bg swap.
         let overlay_fg = orig_bg;
@@ -231,10 +229,11 @@ pub fn build_preedit_instances_at(
     baseline: f32,
     col_offset: usize,
     row_offset: usize,
+    palette: &ThemePalette,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     let mut col = start_col;
-    let dim_fg = mix(FG_DEFAULT, BG_DEFAULT, 0.4);
+    let dim_fg = mix(palette.fg, palette.bg, 0.4);
     for ch in preedit.chars() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
         if w == 0 {
@@ -266,7 +265,7 @@ pub fn build_preedit_instances_at(
             glyph_offset,
             glyph_size,
             fg: dim_fg,
-            bg: BG_DEFAULT,
+            bg: palette.bg,
             cell_span,
             flags: 0,
             _pad: [0.0; 2],
@@ -285,13 +284,13 @@ fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     ]
 }
 
-fn resolve(c: Color, is_fg: bool) -> [f32; 4] {
+fn resolve(c: Color, is_fg: bool, palette: &ThemePalette) -> [f32; 4] {
     match c {
         Color::Default => {
             if is_fg {
-                FG_DEFAULT
+                palette.fg
             } else {
-                BG_DEFAULT
+                palette.bg
             }
         }
         Color::Indexed(n) => indexed(n),

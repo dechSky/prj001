@@ -19,9 +19,9 @@ use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, ImePurpose, Window, WindowId};
 
 use crate::error::{Error, Result};
-use crate::grid::Term;
+use crate::grid::{MouseProtocol, Term};
 use crate::pty::PtyHandle;
-use crate::render::{CursorRender, Renderer, SelectionRange};
+use crate::render::{CursorRender, Renderer, SelectionRange, ThemePalette};
 use event::{IdAllocator, PaneId, SessionId, TabId, UserEvent};
 #[cfg(test)]
 use layout::SplitRatio;
@@ -94,18 +94,91 @@ fn shell_quoted_path_for_drop(path: &Path) -> Option<String> {
 }
 
 fn paste_payload_bytes(text: &str, bracketed: bool) -> Option<Vec<u8>> {
-    if bracketed && text.contains("\x1b[201~") {
+    // 보안: paste/drop 데이터에서 위험한 control char 제거.
+    // 정책 — keep tab/LF만, ESC + 기타 C0 + C1 + DEL + CR 전부 strip.
+    // (CR strip 이유: bracketed paste off일 때 shell이 paste 내용을 즉시 실행하는
+    //  paste-execution 취약점을 닫음. 호환성 vs 보안 트레이드오프 — 보안 선택.)
+    let sanitized = sanitize_paste_text(text);
+    if bracketed && sanitized.contains("\x1b[201~") {
+        // sanitize 이후엔 ESC가 없어야 하지만 방어적으로 한 번 더.
         return None;
     }
     if !bracketed {
-        return Some(text.as_bytes().to_vec());
+        return Some(sanitized.into_bytes());
     }
 
-    let mut bytes = Vec::with_capacity(text.len() + b"\x1b[200~".len() + b"\x1b[201~".len());
+    let mut bytes = Vec::with_capacity(sanitized.len() + b"\x1b[200~".len() + b"\x1b[201~".len());
     bytes.extend_from_slice(b"\x1b[200~");
-    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(sanitized.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     Some(bytes)
+}
+
+/// 슬라이스 6.6: xterm mouse report 인코딩. SGR(1006) 또는 legacy.
+/// `button`: 0=left, 1=middle, 2=right, 64=wheel-up, 65=wheel-down.
+/// `motion` true면 +32 (1002/1003 드래그/모션). press/release는 SGR 'M'/'m', legacy는 항상 'M' + button=3 release.
+/// col/row: 0-based 입력, encoding은 1-based.
+#[allow(clippy::too_many_arguments)]
+fn encode_mouse_report(
+    button: u8,
+    press: bool,
+    motion: bool,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    col: usize,
+    row: usize,
+    sgr: bool,
+) -> Vec<u8> {
+    let mut b = button;
+    if shift {
+        b += 4;
+    }
+    if alt {
+        b += 8;
+    }
+    if ctrl {
+        b += 16;
+    }
+    if motion {
+        b += 32;
+    }
+    let col1 = col.saturating_add(1);
+    let row1 = row.saturating_add(1);
+    if sgr {
+        let final_byte = if press || motion { 'M' } else { 'm' };
+        format!("\x1b[<{};{};{}{}", b, col1, row1, final_byte).into_bytes()
+    } else {
+        // legacy X10: col/row 클램프 223 (인코딩 한도 224 + 32 base).
+        let legacy_b = if press || motion { b } else { 3 };
+        let c_byte = 32u8.saturating_add(legacy_b);
+        let cx = 32u8.saturating_add(col1.min(223) as u8);
+        let cy = 32u8.saturating_add(row1.min(223) as u8);
+        vec![0x1b, b'[', b'M', c_byte, cx, cy]
+    }
+}
+
+/// paste/drop 데이터에서 control char 제거. 보존: LF, HT(tab).
+/// 제거: ESC(0x1B) + 그 외 C0(0x00-0x1F except LF/HT) + DEL(0x7F) + C1(0x80-0x9F) + CR(0x0D).
+/// CR은 LF로 변환 — 줄바꿈 의도는 보존하되 paste-execution은 차단.
+pub(crate) fn sanitize_paste_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            '\r' => out.push('\n'),
+            // C0 controls + DEL
+            '\x00'..='\x08'
+            | '\x0B'
+            | '\x0C'
+            | '\x0E'..='\x1F'
+            | '\x7F' => {}
+            // C1 controls (U+0080..U+009F)
+            '\u{0080}'..='\u{009F}' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
@@ -125,6 +198,8 @@ pub struct Config {
     pub initial_layout: InitialLayout,
     pub quick_spawn_presets: Vec<QuickSpawnPreset>,
     pub hooks: Hooks,
+    /// 활성 테마 팔레트. `None`이면 `ThemePalette::default_theme()` 사용.
+    pub theme: Option<ThemePalette>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +315,7 @@ impl Config {
             initial_layout: InitialLayout::Single { session: 0 },
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
+            theme: None,
         }
     }
 
@@ -253,6 +329,7 @@ impl Config {
             },
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
+            theme: None,
         }
     }
 
@@ -263,6 +340,11 @@ impl Config {
 
     pub fn with_hooks(mut self, hooks: Hooks) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    pub fn with_theme(mut self, theme: ThemePalette) -> Self {
+        self.theme = Some(theme);
         self
     }
 
@@ -569,6 +651,8 @@ enum CmdShortcut {
     Paste,
     ClearBuffer,
     ClearScrollback,
+    /// 슬라이스 6.5: Cmd+F find.
+    Find,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -683,6 +767,9 @@ fn cmd_shortcut(
     if lower == Some("v") || physical_code == Some(KeyCode::KeyV) {
         return Some(CmdShortcut::Paste);
     }
+    if lower == Some("f") || physical_code == Some(KeyCode::KeyF) {
+        return Some(CmdShortcut::Find);
+    }
     None
 }
 
@@ -751,6 +838,13 @@ struct AppState {
     /// M12-6: design §2.1의 monotonic ID 정책을 IdAllocator로 캡슐화. M15 dynamic spawn에서 활용.
     #[allow(dead_code)]
     ids: IdAllocator,
+    /// 슬라이스 6.5: Cmd+F find 진행 중 상태. None이면 비활성.
+    pending_find: Option<FindState>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FindState {
+    query: String,
 }
 
 #[derive(Clone, Debug)]
@@ -951,6 +1045,12 @@ impl ApplicationHandler<UserEvent> for App {
                 state.last_mouse_pos = Some(position);
                 if state.dragging_divider.is_some() {
                     state.drag_divider_to_mouse();
+                } else if !state.modifiers.shift_key()
+                    && state.try_report_mouse_motion(
+                        state.selection.as_ref().is_some_and(|s| s.dragging),
+                    )
+                {
+                    // 마우스 reporting이 이벤트를 흡수.
                 } else if state.update_selection_to_mouse() {
                     state.window.request_redraw();
                 }
@@ -968,45 +1068,73 @@ impl ApplicationHandler<UserEvent> for App {
                 state: button_state,
                 button: MouseButton::Left,
                 ..
-            } => match button_state {
-                ElementState::Pressed => {
-                    if let Some(tab_id) = state.tab_at_mouse() {
-                        state.selection = None;
-                        state.set_active_tab(tab_id);
+            } => {
+                // 슬라이스 6.6: mouse reporting 활성 + Shift 미보유 → PTY로 전달.
+                // Shift 보유 시 selection 모드로 우회 (xterm/iterm 표준).
+                if !state.modifiers.shift_key() {
+                    let pressed = matches!(button_state, ElementState::Pressed);
+                    if state.try_report_mouse_button(pressed, 0) {
                         return;
                     }
-                    if let Some(hit) = state.divider_hit_at_mouse() {
-                        state.selection = None;
-                        state.dragging_divider = Some(hit);
+                }
+                match button_state {
+                    ElementState::Pressed => {
+                        if let Some(tab_id) = state.tab_at_mouse() {
+                            state.selection = None;
+                            state.set_active_tab(tab_id);
+                            return;
+                        }
+                        if let Some(hit) = state.divider_hit_at_mouse() {
+                            state.selection = None;
+                            state.dragging_divider = Some(hit);
+                            state.update_mouse_cursor();
+                            return;
+                        }
+                        if let Some((pane_id, cell)) = state.pane_cell_at_mouse() {
+                            state.set_active(pane_id);
+                            state.start_selection_at(pane_id, cell);
+                            state.window.request_redraw();
+                        } else if let Some(pane_id) = state.pane_at_mouse(true) {
+                            state.set_active(pane_id);
+                            state.selection = None;
+                        }
+                    }
+                    ElementState::Released => {
+                        state.dragging_divider = None;
+                        state.finish_selection_drag();
                         state.update_mouse_cursor();
-                        return;
-                    }
-                    if let Some((pane_id, cell)) = state.pane_cell_at_mouse() {
-                        state.set_active(pane_id);
-                        state.start_selection_at(pane_id, cell);
-                        state.window.request_redraw();
-                    } else if let Some(pane_id) = state.pane_at_mouse(true) {
-                        state.set_active(pane_id);
-                        state.selection = None;
                     }
                 }
-                ElementState::Released => {
-                    state.dragging_divider = None;
-                    state.finish_selection_drag();
-                    state.update_mouse_cursor();
-                }
-            },
+            }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state: button_state,
                 button: MouseButton::Right,
                 ..
             } => {
-                if let Some((pane_id, _)) = state.pane_cell_at_mouse() {
-                    state.set_active(pane_id);
-                    if state.selection.is_some() {
-                        state.handle_copy();
+                if !state.modifiers.shift_key() {
+                    let pressed = matches!(button_state, ElementState::Pressed);
+                    if state.try_report_mouse_button(pressed, 2) {
+                        return;
                     }
-                    state.window.request_redraw();
+                }
+                if matches!(button_state, ElementState::Pressed) {
+                    if let Some((pane_id, _)) = state.pane_cell_at_mouse() {
+                        state.set_active(pane_id);
+                        if state.selection.is_some() {
+                            state.handle_copy();
+                        }
+                        state.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if !state.modifiers.shift_key() {
+                    let pressed = matches!(button_state, ElementState::Pressed);
+                    let _ = state.try_report_mouse_button(pressed, 1);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1075,6 +1203,37 @@ impl ApplicationHandler<UserEvent> for App {
                     event.text
                 );
                 use winit::keyboard::{Key, NamedKey, PhysicalKey};
+                // 슬라이스 6.5: find 입력 모드 — Cmd+F 활성 중 키 입력 흡수.
+                if event.state == ElementState::Pressed && state.pending_find.is_some() {
+                    let handled = match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            state.cancel_find();
+                            true
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            state.finish_find();
+                            true
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            state.find_backspace();
+                            true
+                        }
+                        Key::Character(s) => {
+                            // Cmd+F 자체는 Find 진입 시 super_key 분기에서 swallow됨.
+                            // 여기선 super 없이 입력된 텍스트만 query에 추가.
+                            if !state.modifiers.super_key() {
+                                for ch in s.chars() {
+                                    state.find_append_char(ch);
+                                }
+                            }
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        return;
+                    }
+                }
                 if event.state == ElementState::Pressed && state.pending_quick_spawn.is_some() {
                     let handled = match &event.logical_key {
                         Key::Character(s) => state.finish_quick_spawn(s),
@@ -1273,6 +1432,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::Paste) => {
                             state.handle_paste();
+                            return;
+                        }
+                        Some(CmdShortcut::Find) => {
+                            state.start_find();
                             return;
                         }
                         Some(CmdShortcut::ClearBuffer) => {
@@ -1815,6 +1978,104 @@ impl AppState {
         Ok(())
     }
 
+    fn start_find(&mut self) {
+        self.pending_find = Some(FindState::default());
+        self.window.set_title("find: — pj001");
+        self.window.request_redraw();
+        log::info!("find mode: open");
+    }
+
+    fn cancel_find(&mut self) {
+        self.pending_find = None;
+        let title = self.session_for_pane_idx(self.active_index()).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.window.request_redraw();
+        log::info!("find mode: cancel");
+    }
+
+    fn finish_find(&mut self) {
+        // Enter는 일단 cancel과 동일 — view_offset 유지하고 검색 모드만 종료.
+        // (next-match 네비게이션은 차후 슬라이스에서 Enter/Shift+Enter로 분리)
+        let query = self
+            .pending_find
+            .as_ref()
+            .map(|f| f.query.clone())
+            .unwrap_or_default();
+        self.pending_find = None;
+        let title = self.session_for_pane_idx(self.active_index()).title.clone();
+        self.window.set_title(&format!("{} — pj001", title));
+        self.window.request_redraw();
+        log::info!("find mode: finish query=\"{}\"", query);
+    }
+
+    fn find_backspace(&mut self) {
+        if let Some(find) = self.pending_find.as_mut() {
+            find.query.pop();
+            self.window
+                .set_title(&format!("find: {} — pj001", find.query));
+            self.find_apply_current_query();
+            self.window.request_redraw();
+        }
+    }
+
+    fn find_append_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        if let Some(find) = self.pending_find.as_mut() {
+            find.query.push(ch);
+            self.window
+                .set_title(&format!("find: {} — pj001", find.query));
+            self.find_apply_current_query();
+            self.window.request_redraw();
+        }
+    }
+
+    /// 현재 query로 scrollback + main grid를 검색 → 첫 match를 view에 띄움.
+    /// scrollback에서 발견되면 view_offset 조정, main grid면 view_offset=0(bottom snap).
+    fn find_apply_current_query(&mut self) {
+        let query = match self.pending_find.as_ref() {
+            Some(f) if !f.query.is_empty() => f.query.clone(),
+            _ => return,
+        };
+        let idx = self.active_index();
+        let session = self.session_for_pane_idx(idx);
+        let Ok(mut term) = session.term.lock() else {
+            return;
+        };
+        let cols = term.cols();
+        let rows = term.rows();
+        let scrollback_len = term.scrollback_len();
+        // 위→아래 순으로 스캔하여 query를 포함하는 첫 row를 찾는다.
+        // scrollback rows + main grid rows 통합.
+        let total = scrollback_len + rows;
+        for abs in 0..total {
+            // 절대 row abs를 view_offset 좌표로 변환:
+            // view_offset=K일 때 화면 top은 scrollback[scrollback_len - K] 라인 또는
+            // main row (abs - scrollback_len + K). 단순화 — view_offset 후보 결정.
+            let row_text: String = if abs < scrollback_len {
+                // scrollback row 읽기 — view_offset = scrollback_len - abs로 그 행이 top이 된다.
+                let needed_offset = scrollback_len - abs;
+                term.set_view_offset(needed_offset.min(scrollback_len));
+                (0..cols).map(|c| term.cell(0, c).ch).collect()
+            } else {
+                // main grid row
+                let row = abs - scrollback_len;
+                if row >= rows {
+                    continue;
+                }
+                term.set_view_offset(0);
+                (0..cols).map(|c| term.cell(row, c).ch).collect()
+            };
+            if row_text.contains(&query) {
+                // 발견 — view_offset은 이미 위에서 설정됨.
+                return;
+            }
+        }
+        // 미발견 — view_offset 원복(bottom).
+        term.set_view_offset(0);
+    }
+
     fn start_quick_spawn(&mut self) {
         self.pending_quick_spawn = Some(Instant::now());
         let hint = quick_spawn_hint(&self.quick_spawn_presets);
@@ -2286,6 +2547,7 @@ impl AppState {
             format,
             [size.width as f32, size.height as f32],
             physical_font_size(DEFAULT_FONT_SIZE, window.scale_factor()),
+            config.theme.unwrap_or_else(ThemePalette::default_theme),
         );
 
         let hooks = config.hooks.clone();
@@ -2397,6 +2659,7 @@ impl AppState {
             quick_spawn_presets: config.quick_spawn_presets.clone(),
             pending_quick_spawn: None,
             ids,
+            pending_find: None,
         };
         state.update_min_inner_size();
         Ok(state)
@@ -2509,6 +2772,73 @@ impl AppState {
         }
         selection.head = cell;
         true
+    }
+
+    /// 슬라이스 6.6: 마우스 버튼 이벤트를 reporting mode일 때만 PTY로 송신.
+    /// 반환 true면 caller가 다른 처리(selection 등)를 skip하라는 의미.
+    fn try_report_mouse_button(&mut self, pressed: bool, button: u8) -> bool {
+        let (proto, sgr) = self.active_mouse_state();
+        if matches!(proto, MouseProtocol::Off) {
+            return false;
+        }
+        let Some((pane_id, cell)) = self.pane_cell_at_mouse() else {
+            return false;
+        };
+        // 좌표는 pane local (0-based) — 마우스 이벤트는 pane 기준.
+        self.set_active(pane_id);
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let ctrl = self.modifiers.control_key();
+        let bytes = encode_mouse_report(
+            button, pressed, false, shift, alt, ctrl, cell.1, cell.0, sgr,
+        );
+        let idx = self.active_index();
+        let session = self.session_for_pane_idx_mut(idx);
+        if let Err(e) = session.pty.write(&bytes) {
+            log::warn!("mouse-report write failed: {e}");
+        }
+        true
+    }
+
+    /// 모션 이벤트(드래그)를 ButtonEvent/AnyEvent reporting에 따라 송신.
+    fn try_report_mouse_motion(&mut self, button_held: bool) -> bool {
+        let (proto, sgr) = self.active_mouse_state();
+        let should = match proto {
+            MouseProtocol::Off | MouseProtocol::Button => false,
+            MouseProtocol::ButtonEvent => button_held,
+            MouseProtocol::AnyEvent => true,
+        };
+        if !should {
+            return false;
+        }
+        let Some((_, cell)) = self.pane_cell_at_mouse() else {
+            return false;
+        };
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        let ctrl = self.modifiers.control_key();
+        // 버튼 정보 없음 — 0 (drag 시 SGR 인코딩에선 응용프로그램이 hold 상태 추적).
+        // 1003 hover는 release(3) — xterm spec.
+        let button = if button_held { 0 } else { 3 };
+        let bytes = encode_mouse_report(
+            button, false, true, shift, alt, ctrl, cell.1, cell.0, sgr,
+        );
+        let idx = self.active_index();
+        let session = self.session_for_pane_idx_mut(idx);
+        if let Err(e) = session.pty.write(&bytes) {
+            log::warn!("mouse-motion-report write failed: {e}");
+        }
+        true
+    }
+
+    /// active pane의 term에서 마우스 모드 + SGR encoding 스냅샷.
+    fn active_mouse_state(&self) -> (MouseProtocol, bool) {
+        let idx = self.active_index();
+        self.session_for_pane_idx(idx)
+            .term
+            .lock()
+            .map(|t| (t.mouse_protocol(), t.mouse_sgr_encoding()))
+            .unwrap_or((MouseProtocol::Off, false))
     }
 
     fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize)) {
@@ -3402,7 +3732,87 @@ mod tests {
             paste_payload_bytes("abc", true),
             Some(b"\x1b[200~abc\x1b[201~".to_vec())
         );
-        assert_eq!(paste_payload_bytes("a\x1b[201~b", true), None);
+        // 입력에 \x1b[201~ 있어도 sanitize가 ESC를 제거하므로 안전. 결과는 "[201~"가 됨.
+        assert_eq!(
+            paste_payload_bytes("a\x1b[201~b", true),
+            Some(b"\x1b[200~a[201~b\x1b[201~".to_vec())
+        );
+    }
+
+    #[test]
+    fn sanitize_paste_strips_esc_and_c0_controls() {
+        // ESC + BEL + NUL strip, tab/LF 보존.
+        assert_eq!(
+            super::sanitize_paste_text("a\x1bb\x07c\x00d\te\nf"),
+            "abcd\te\nf"
+        );
+    }
+
+    #[test]
+    fn sanitize_paste_converts_cr_to_lf() {
+        // paste-execution 방어: CR → LF.
+        assert_eq!(super::sanitize_paste_text("line1\rline2"), "line1\nline2");
+        assert_eq!(super::sanitize_paste_text("line1\r\nline2"), "line1\n\nline2");
+    }
+
+    #[test]
+    fn sanitize_paste_strips_c1_controls() {
+        // U+0080..U+009F (C1) 제거.
+        let s = format!("a{}b{}c", '\u{0085}', '\u{009F}');
+        assert_eq!(super::sanitize_paste_text(&s), "abc");
+    }
+
+    #[test]
+    fn sanitize_paste_preserves_unicode_text() {
+        // 일반 텍스트 + 한글/이모지 보존.
+        let s = "안녕 hello 🚀";
+        assert_eq!(super::sanitize_paste_text(s), s);
+    }
+
+    #[test]
+    fn sanitize_paste_strips_del() {
+        assert_eq!(super::sanitize_paste_text("ab\x7fc"), "abc");
+    }
+
+    #[test]
+    fn mouse_report_sgr_press() {
+        // col=10 row=3 (0-based) → 11/4 1-based. Left button=0. SGR press.
+        let bytes = super::encode_mouse_report(0, true, false, false, false, false, 10, 3, true);
+        assert_eq!(bytes, b"\x1b[<0;11;4M".to_vec());
+    }
+
+    #[test]
+    fn mouse_report_sgr_release() {
+        let bytes = super::encode_mouse_report(0, false, false, false, false, false, 10, 3, true);
+        assert_eq!(bytes, b"\x1b[<0;11;4m".to_vec());
+    }
+
+    #[test]
+    fn mouse_report_sgr_modifiers_combine() {
+        // shift+ctrl+alt = 4+8+16 = 28 → button 0+28 = 28.
+        let bytes = super::encode_mouse_report(0, true, false, true, true, true, 0, 0, true);
+        assert_eq!(bytes, b"\x1b[<28;1;1M".to_vec());
+    }
+
+    #[test]
+    fn mouse_report_sgr_motion_flag() {
+        let bytes = super::encode_mouse_report(0, false, true, false, false, false, 5, 5, true);
+        // motion +32, button 0 → 32. press/motion = 'M'.
+        assert_eq!(bytes, b"\x1b[<32;6;6M".to_vec());
+    }
+
+    #[test]
+    fn mouse_report_legacy_press() {
+        // col=10 row=3 → 11/4 1-based. legacy bytes = 32+button=32, 32+11=43='+', 32+4=36='$'
+        let bytes = super::encode_mouse_report(0, true, false, false, false, false, 10, 3, false);
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 43, 36]);
+    }
+
+    #[test]
+    fn mouse_report_legacy_release_uses_button_3() {
+        let bytes = super::encode_mouse_report(0, false, false, false, false, false, 10, 3, false);
+        // legacy: release encodes button=3 (32+3=35='#').
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 35, 43, 36]);
     }
 
     #[test]
@@ -3572,6 +3982,16 @@ mod tests {
     }
 
     #[test]
+    fn cmd_shortcut_routes_find() {
+        use winit::keyboard::KeyCode;
+
+        assert_eq!(
+            cmd_shortcut(Some("f"), Some(KeyCode::KeyF), false, false),
+            Some(CmdShortcut::Find)
+        );
+    }
+
+    #[test]
     fn cmd_shortcut_routes_font_zoom() {
         use winit::keyboard::KeyCode;
 
@@ -3679,6 +4099,7 @@ mod tests {
             },
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
+            theme: None,
         };
 
         assert!(config.pane_specs().is_err());
@@ -3698,6 +4119,7 @@ mod tests {
             },
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
+            theme: None,
         };
 
         assert!(config.pane_specs().is_err());

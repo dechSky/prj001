@@ -190,6 +190,47 @@ impl Grid {
 /// 정책 B: scrollback hard cap 10,000 rows.
 const SCROLLBACK_CAP: usize = 10_000;
 
+/// M11-4: DEC Special Character and Line Drawing Set 매핑 (xterm 표준).
+/// 7-bit 0x5f..=0x7e 영역만 변환. 그 외 입력은 통과.
+/// 출처: xterm ctlseqs "DEC Special Character and Line Drawing Set".
+fn dec_special_translate(ch: char) -> char {
+    match ch {
+        '_' => ' ',      // 0x5f blank
+        '`' => '◆',      // diamond
+        'a' => '▒',      // checkerboard
+        'b' => '␉',      // HT
+        'c' => '␌',      // FF
+        'd' => '␍',      // CR
+        'e' => '␊',      // LF
+        'f' => '°',      // degree
+        'g' => '±',      // plus/minus
+        'h' => '␤',      // NL
+        'i' => '␋',      // VT
+        'j' => '┘',      // lower-right corner
+        'k' => '┐',      // upper-right corner
+        'l' => '┌',      // upper-left corner
+        'm' => '└',      // lower-left corner
+        'n' => '┼',      // crossing
+        'o' => '⎺',      // horizontal scan line 1
+        'p' => '⎻',      // horizontal scan line 3
+        'q' => '─',      // horizontal scan line 5 (middle)
+        'r' => '⎼',      // horizontal scan line 7
+        's' => '⎽',      // horizontal scan line 9
+        't' => '├',      // left T
+        'u' => '┤',      // right T
+        'v' => '┴',      // bottom T
+        'w' => '┬',      // top T
+        'x' => '│',      // vertical bar
+        'y' => '≤',      // less-or-equal
+        'z' => '≥',      // greater-or-equal
+        '{' => 'π',      // pi
+        '|' => '≠',      // not-equal
+        '}' => '£',      // sterling
+        '~' => '·',      // centered dot
+        _ => ch,
+    }
+}
+
 /// M17 reflow 결과.
 #[derive(Debug)]
 pub(crate) struct RewrapResult {
@@ -380,6 +421,47 @@ pub struct Term {
     /// M10-1: vt가 PTY로 보낼 응답 누적. main이 render에서 drain → pty.write.
     /// DSR/DA 응답, M11+에서 OSC query 응답 등.
     pending_responses: Vec<Vec<u8>>,
+    /// M11-4: G0 charset (LS0 default). DEC special graphics(line drawing)일 때
+    /// `print()`가 7-bit input(0x60..=0x7e)을 Unicode box drawing 글리프로 변환.
+    /// G1/G2/G3 + SS2/SS3는 미지원 (post-MVP+ cleanup).
+    g0_charset: Charset,
+    /// OSC 7로 받은 현재 작업 디렉터리. shell의 chpwd hook이 보낸 file URL을
+    /// path로 디코드해 보관. None이면 미수신/미파싱. block UI(M13+)와 pane 헤더가 사용.
+    cwd: Option<String>,
+    /// OSC 8 active hyperlink URI. None = 일반 텍스트. 차후 cell 단위 매핑은
+    /// 사이드테이블로 분리 (1차는 추적만).
+    hyperlink_uri: Option<String>,
+    /// OSC 133;A — 최근 prompt start row (절대 = scrollback rows + main grid row).
+    /// 차후 Cmd+↑/↓ "prev/next prompt" 점프, block UI 카드 경계 결정에 사용.
+    last_prompt_row: Option<u64>,
+    /// OSC 133;A 누적 카운터 — 디버깅 + 테스트 검증용.
+    prompts_seen: u64,
+    /// OSC 133;D 종료 코드. None이면 미수신 / running.
+    last_command_exit: Option<i32>,
+    /// 슬라이스 6.6: xterm 마우스 reporting 모드. None = 보고 안 함.
+    mouse_protocol: MouseProtocol,
+    /// CSI ?1006: SGR encoding. true면 `CSI < b;c;r M/m`, false면 legacy 1-byte 인코딩.
+    mouse_sgr_encoding: bool,
+}
+
+/// 마우스 reporting 강도. `?1000` < `?1002` < `?1003` 순으로 이벤트 범위 확장.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// 보고 안 함 (기본).
+    Off,
+    /// CSI ?1000: 버튼 press/release만.
+    Button,
+    /// CSI ?1002: 버튼 + 버튼 누른 채 드래그.
+    ButtonEvent,
+    /// CSI ?1003: 모든 모션 + 버튼.
+    AnyEvent,
+}
+
+/// M11-4: 7-bit input의 charset 매핑. G0만 추적.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    Ascii,
+    DecSpecialGraphics,
 }
 
 impl Term {
@@ -407,7 +489,75 @@ impl Term {
             bracketed_paste: false,
             focus_reporting: false,
             pending_responses: Vec::new(),
+            g0_charset: Charset::Ascii,
+            cwd: None,
+            hyperlink_uri: None,
+            last_prompt_row: None,
+            prompts_seen: 0,
+            last_command_exit: None,
+            mouse_protocol: MouseProtocol::Off,
+            mouse_sgr_encoding: false,
         }
+    }
+
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.mouse_protocol
+    }
+    pub fn set_mouse_protocol(&mut self, p: MouseProtocol) {
+        self.mouse_protocol = p;
+    }
+    pub fn mouse_sgr_encoding(&self) -> bool {
+        self.mouse_sgr_encoding
+    }
+    pub fn set_mouse_sgr_encoding(&mut self, on: bool) {
+        self.mouse_sgr_encoding = on;
+    }
+
+    // OSC 133 — semantic prompt 이벤트. 1차 cut은 메타데이터 추적만(block UI 인프라).
+    /// `OSC 133;A` 시점에 호출. 현재 cursor row를 절대 행 번호로 보관.
+    pub fn semantic_prompt_start(&mut self) {
+        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
+        self.last_prompt_row = Some(absolute);
+        self.prompts_seen = self.prompts_seen.saturating_add(1);
+    }
+    /// `OSC 133;D[;exit]` 시점에 호출. exit는 None이면 unknown.
+    pub fn semantic_command_end(&mut self, exit: Option<i32>) {
+        self.last_command_exit = exit;
+    }
+    pub fn last_prompt_row(&self) -> Option<u64> {
+        self.last_prompt_row
+    }
+    pub fn prompts_seen(&self) -> u64 {
+        self.prompts_seen
+    }
+    pub fn last_command_exit(&self) -> Option<i32> {
+        self.last_command_exit
+    }
+
+    /// M11-4: G0 charset 지정 (ESC ( B = ASCII, ESC ( 0 = DEC special graphics).
+    pub fn set_g0_charset(&mut self, charset: Charset) {
+        self.g0_charset = charset;
+    }
+    pub fn g0_charset(&self) -> Charset {
+        self.g0_charset
+    }
+
+    /// OSC 7 cwd. shell의 chpwd hook이 file URL을 보낼 때마다 갱신.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    pub fn set_cwd(&mut self, path: impl Into<String>) {
+        self.cwd = Some(path.into());
+    }
+
+    /// OSC 8 hyperlink — 현재 active URI. None이면 normal text.
+    /// `print()` 시 attrs에 HYPERLINK 플래그 켜고 별도 사이드테이블에 URI 매핑(차후).
+    /// 1차 cut은 단순 plain text — URI는 추적만, 시각적 표현 X.
+    pub fn hyperlink_uri(&self) -> Option<&str> {
+        self.hyperlink_uri.as_deref()
+    }
+    pub fn set_hyperlink_uri(&mut self, uri: Option<String>) {
+        self.hyperlink_uri = uri;
     }
 
     // M10-2: bracketed paste mode getter/setter.
@@ -571,6 +721,11 @@ impl Term {
 
     pub fn snap_to_bottom(&mut self) {
         self.view_offset = 0;
+    }
+
+    /// view_offset 직접 설정. scrollback 길이로 클램프.
+    pub fn set_view_offset(&mut self, offset: usize) {
+        self.view_offset = offset.min(self.scrollback.len());
     }
 
     pub fn clear_scrollback(&mut self) {
@@ -760,6 +915,12 @@ impl Term {
     }
 
     pub fn print(&mut self, ch: char) {
+        // M11-4: G0가 DEC special graphics일 때 0x60..=0x7e 영역 7-bit 글자를
+        // 박스 드로잉 글리프로 변환. 그 외는 그대로.
+        let ch = match self.g0_charset {
+            Charset::Ascii => ch,
+            Charset::DecSpecialGraphics => dec_special_translate(ch),
+        };
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
         if w == 0 {
             return; // 결합 문자(combining)는 M5 범위 외
@@ -973,6 +1134,82 @@ impl Term {
         self.grid_mut().scroll_down(top, bottom, n);
     }
 
+    /// ICH — Insert N chars: cursor 위치부터 cells를 오른쪽으로 N칸 밀고, 비워진 N칸은
+    /// blank로 채움. 행 끝을 넘어가는 cells는 truncate. cursor는 이동 안 함.
+    pub fn insert_chars(&mut self, n: usize) {
+        let cols = self.cols();
+        let (row, col) = (self.cursor.row, self.cursor.col);
+        if col >= cols || n == 0 {
+            return;
+        }
+        let shift = n.min(cols - col);
+        let g = self.grid_mut();
+        for c in (col + shift..cols).rev() {
+            *g.cell_mut(row, c) = *g.cell(row, c - shift);
+        }
+        for c in col..(col + shift) {
+            *g.cell_mut(row, c) = Cell::default();
+        }
+        g.row_flags[row] = RowFlags::empty();
+    }
+
+    /// DCH — Delete N chars: cursor 위치의 cells를 N개 삭제, 우측을 왼쪽으로 끌어당기고
+    /// 비워진 행 끝 N칸은 blank로 채움. cursor 이동 안 함.
+    pub fn delete_chars(&mut self, n: usize) {
+        let cols = self.cols();
+        let (row, col) = (self.cursor.row, self.cursor.col);
+        if col >= cols || n == 0 {
+            return;
+        }
+        let shift = n.min(cols - col);
+        let g = self.grid_mut();
+        for c in col..(cols - shift) {
+            *g.cell_mut(row, c) = *g.cell(row, c + shift);
+        }
+        for c in (cols - shift)..cols {
+            *g.cell_mut(row, c) = Cell::default();
+        }
+        g.row_flags[row] = RowFlags::empty();
+    }
+
+    /// ECH — Erase N chars: cursor 위치부터 N개 cell을 blank로 덮어씀. shift 없음.
+    pub fn erase_chars(&mut self, n: usize) {
+        let cols = self.cols();
+        let (row, col) = (self.cursor.row, self.cursor.col);
+        if col >= cols || n == 0 {
+            return;
+        }
+        let end = (col + n).min(cols);
+        let g = self.grid_mut();
+        for c in col..end {
+            *g.cell_mut(row, c) = Cell::default();
+        }
+        g.row_flags[row] = RowFlags::empty();
+    }
+
+    /// IL — Insert N blank lines at cursor row within scroll region.
+    /// cursor가 region 밖이면 no-op. cursor 자체는 이동 안 함(xterm 동작).
+    pub fn insert_lines(&mut self, n: usize) {
+        let row = self.cursor.row;
+        if !(self.scroll_top..self.scroll_bottom).contains(&row) || n == 0 {
+            return;
+        }
+        let bottom = self.scroll_bottom;
+        // cursor row를 sub-region의 top으로 보고 그 안에서 scroll_down 호출.
+        self.grid_mut().scroll_down(row, bottom, n);
+    }
+
+    /// DL — Delete N lines at cursor row within scroll region.
+    /// 잔여 행은 위로 올라오고, 영역 하단 N행은 blank.
+    pub fn delete_lines(&mut self, n: usize) {
+        let row = self.cursor.row;
+        if !(self.scroll_top..self.scroll_bottom).contains(&row) || n == 0 {
+            return;
+        }
+        let bottom = self.scroll_bottom;
+        self.grid_mut().scroll_up(row, bottom, n);
+    }
+
     /// DECSTBM — top/bottom 모두 0-based 입력
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         let rows = self.rows();
@@ -1014,6 +1251,51 @@ impl Term {
     }
     pub fn remove_attr(&mut self, a: Attrs) {
         self.cur_attrs.remove(a);
+    }
+
+    /// DECSTR — Soft Terminal Reset (`CSI ! p`). xterm/VT220 표준.
+    /// settable mode + SGR + saved cursor만 default로. 화면 콘텐츠/tab stop/title은 보존.
+    pub fn soft_reset(&mut self) {
+        // SGR
+        self.reset_sgr();
+        // mode flags
+        self.cursor_keys_application = false;
+        self.keypad_application = false;
+        self.bracketed_paste = false;
+        self.focus_reporting = false;
+        // cursor 가시성/모양은 default (block, blink, visible)
+        self.cursor.visible = true;
+        self.cursor.shape = CursorShape::Block;
+        self.cursor.blinking = true;
+        // scroll region full
+        let rows = self.rows();
+        self.scroll_top = 0;
+        self.scroll_bottom = rows;
+        // DECSC saved slot 초기화 (xterm: 둘 다 home)
+        self.saved_main_cursor = Cursor::default();
+        self.saved_alt_cursor = Cursor::default();
+        // G0 charset → ASCII (M11-4)
+        self.g0_charset = Charset::Ascii;
+        // 슬라이스 6.6: mouse reporting reset
+        self.mouse_protocol = MouseProtocol::Off;
+        self.mouse_sgr_encoding = false;
+    }
+
+    /// RIS — Reset to Initial State (`ESC c`). 화면 + cursor + 모든 mode 풀 리셋.
+    /// DECSTR + screen erase + cursor to (0,0) + alt→main. scrollback은 보존 (xterm 동작).
+    pub fn full_reset(&mut self) {
+        // alt screen 진입 중이면 main 복귀
+        if self.use_alt {
+            self.switch_alt_screen(false);
+        }
+        self.soft_reset();
+        // 화면 클리어
+        self.erase_display(2);
+        // cursor home
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        // title 유지 (xterm 기본)
+        // pending_responses는 그대로 (이미 큐된 응답은 보낸다)
     }
 
     #[allow(dead_code)]
@@ -1520,5 +1802,132 @@ mod tests {
         term.switch_alt_screen(false);
         // main 복귀: row 0 WRAPPED 그대로
         assert!(term.row_flags(0).contains(RowFlags::WRAPPED));
+    }
+
+    fn row_chars(term: &Term, row: usize) -> String {
+        (0..term.cols()).map(|c| term.cell(row, c).ch).collect()
+    }
+
+    #[test]
+    fn insert_chars_shifts_right_and_blanks() {
+        let mut term = Term::new(8, 2);
+        print_str(&mut term, "abcdef");
+        term.set_cursor(0, 2);
+        term.insert_chars(2);
+        // "abcdef__" → cursor=col2 → "ab  cdef" (마지막 2칸 truncate 없음, len 6 → 8)
+        assert_eq!(row_chars(&term, 0), "ab  cdef");
+    }
+
+    #[test]
+    fn insert_chars_truncates_at_end() {
+        let mut term = Term::new(5, 2);
+        print_str(&mut term, "abcde");
+        term.set_cursor(0, 1);
+        term.insert_chars(3);
+        // "abcde" + col 1에서 3 insert → "a   b" (cde truncate)
+        assert_eq!(row_chars(&term, 0), "a   b");
+    }
+
+    #[test]
+    fn insert_chars_clears_wrapped() {
+        let mut term = Term::new(5, 2);
+        print_str(&mut term, "abcdef"); // wrap
+        assert!(term.row_flags(0).contains(RowFlags::WRAPPED));
+        term.set_cursor(0, 1);
+        term.insert_chars(1);
+        assert!(!term.row_flags(0).contains(RowFlags::WRAPPED));
+    }
+
+    #[test]
+    fn delete_chars_shifts_left_and_blanks_end() {
+        let mut term = Term::new(8, 2);
+        print_str(&mut term, "abcdef");
+        term.set_cursor(0, 1);
+        term.delete_chars(2);
+        // "abcdef" → cursor=1, delete 2 → "adef    "
+        assert_eq!(row_chars(&term, 0), "adef    ");
+    }
+
+    #[test]
+    fn delete_chars_more_than_remaining_blanks_rest() {
+        let mut term = Term::new(5, 2);
+        print_str(&mut term, "abcde");
+        term.set_cursor(0, 2);
+        term.delete_chars(99);
+        assert_eq!(row_chars(&term, 0), "ab   ");
+    }
+
+    #[test]
+    fn erase_chars_blanks_without_shift() {
+        let mut term = Term::new(8, 2);
+        print_str(&mut term, "abcdef");
+        term.set_cursor(0, 1);
+        term.erase_chars(3);
+        // shift 없음 — "abcdef" → "a   ef"
+        assert_eq!(row_chars(&term, 0), "a   ef  ");
+    }
+
+    #[test]
+    fn erase_chars_clamps_to_line_end() {
+        let mut term = Term::new(5, 2);
+        print_str(&mut term, "abcde");
+        term.set_cursor(0, 3);
+        term.erase_chars(99);
+        assert_eq!(row_chars(&term, 0), "abc  ");
+    }
+
+    #[test]
+    fn insert_lines_shifts_lines_down_within_region() {
+        let mut term = Term::new(4, 4);
+        print_str(&mut term, "AAAA");
+        term.set_cursor(1, 0);
+        print_str(&mut term, "BBBB");
+        term.set_cursor(2, 0);
+        print_str(&mut term, "CCCC");
+        // cursor를 row 1로 보내고 IL 1
+        term.set_cursor(1, 0);
+        term.insert_lines(1);
+        assert_eq!(row_chars(&term, 0), "AAAA");
+        assert_eq!(row_chars(&term, 1), "    "); // 새 빈 row
+        assert_eq!(row_chars(&term, 2), "BBBB"); // 밀려남
+        assert_eq!(row_chars(&term, 3), "CCCC"); // 밀려남
+    }
+
+    #[test]
+    fn delete_lines_shifts_lines_up_within_region() {
+        let mut term = Term::new(4, 4);
+        print_str(&mut term, "AAAA");
+        term.set_cursor(1, 0);
+        print_str(&mut term, "BBBB");
+        term.set_cursor(2, 0);
+        print_str(&mut term, "CCCC");
+        term.set_cursor(3, 0);
+        print_str(&mut term, "DDDD");
+        term.set_cursor(1, 0);
+        term.delete_lines(1);
+        assert_eq!(row_chars(&term, 0), "AAAA"); // 변함 없음
+        assert_eq!(row_chars(&term, 1), "CCCC"); // BBBB 삭제, CCCC 끌어올림
+        assert_eq!(row_chars(&term, 2), "DDDD");
+        assert_eq!(row_chars(&term, 3), "    "); // 빈 row
+    }
+
+    #[test]
+    fn insert_lines_noop_outside_scroll_region() {
+        let mut term = Term::new(4, 5);
+        term.set_scroll_region(1, 4); // 1..4
+        term.set_cursor(0, 0); // 영역 밖
+        print_str(&mut term, "AAAA");
+        let snap = row_chars(&term, 0);
+        term.insert_lines(2);
+        assert_eq!(row_chars(&term, 0), snap);
+    }
+
+    #[test]
+    fn delete_lines_noop_when_n_zero() {
+        let mut term = Term::new(4, 3);
+        print_str(&mut term, "AAAA");
+        term.set_cursor(0, 0);
+        term.delete_lines(0);
+        assert_eq!(row_chars(&term, 0), "AAAA");
     }
 }

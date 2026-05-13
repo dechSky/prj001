@@ -1,5 +1,6 @@
 use pj001_core::app::{self, CommandSpec, Config, QuickSpawnPreset, SessionSpec};
 use pj001_core::error::{self, Error};
+use pj001_core::render::ThemePalette;
 use std::backtrace::Backtrace;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -49,11 +50,13 @@ fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
 }
 
 /// 기존 `--shell` 단일 터미널 모드와 M11-1 `--bridge --left/--right` 모드 지원.
+/// `--theme <name>`로 6 테마(aurora/obsidian/vellum/holo/bento/crystal) 선택.
 fn parse_config(args: &[String]) -> error::Result<Config> {
     let mut bridge = false;
     let mut shell_override = None;
     let mut left = None;
     let mut right = None;
+    let mut theme_name = None;
     let mut saw_bridge_pane_arg = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -68,6 +71,7 @@ fn parse_config(args: &[String]) -> error::Result<Config> {
                 saw_bridge_pane_arg = true;
                 right = Some(take_arg_value(a, iter.next())?);
             }
+            "--theme" => theme_name = Some(take_arg_value(a, iter.next())?),
             _ if a.starts_with("--shell=") => {
                 shell_override = Some(take_eq_value("--shell", &a["--shell=".len()..])?);
             }
@@ -79,30 +83,45 @@ fn parse_config(args: &[String]) -> error::Result<Config> {
                 saw_bridge_pane_arg = true;
                 right = Some(take_eq_value("--right", &a["--right=".len()..])?);
             }
+            _ if a.starts_with("--theme=") => {
+                theme_name = Some(take_eq_value("--theme", &a["--theme=".len()..])?);
+            }
             _ if a.starts_with('-') => {
                 return Err(Error::Args(format!("unknown argument: {a}")));
             }
             _ => {}
         }
     }
-    if bridge {
+    let theme = match theme_name {
+        Some(name) => Some(ThemePalette::by_name(&name).ok_or_else(|| {
+            Error::Args(format!(
+                "unknown theme: {name} (expected aurora/obsidian/vellum/holo/bento/crystal)"
+            ))
+        })?),
+        None => None,
+    };
+    let config = if bridge {
         if shell_override.is_some() {
             return Err(error::Error::Args(
                 "--bridge cannot be combined with --shell/-s".to_string(),
             ));
         }
-        Ok(bridge_config(
+        bridge_config(
             left.unwrap_or_else(|| "claude".to_string()),
             right.unwrap_or_else(|| "codex".to_string()),
-        ))
+        )
     } else {
         if saw_bridge_pane_arg {
             return Err(error::Error::Args(
                 "--left/--right require --bridge".to_string(),
             ));
         }
-        Ok(Config::single_shell(shell_override))
-    }
+        Config::single_shell(shell_override)
+    };
+    Ok(match theme {
+        Some(theme) => config.with_theme(theme),
+        None => config,
+    })
 }
 
 fn take_arg_value(flag: &str, value: Option<&String>) -> error::Result<String> {
@@ -282,5 +301,36 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_flags() {
         assert!(parse_config(&args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn parse_theme_sets_palette() {
+        let cfg = parse_config(&args(&["--theme", "vellum"])).unwrap();
+        assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
+    }
+
+    #[test]
+    fn parse_theme_eq_form() {
+        let cfg = parse_config(&args(&["--theme=aurora"])).unwrap();
+        assert_eq!(cfg.theme.map(|t| t.name), Some("aurora"));
+    }
+
+    #[test]
+    fn parse_theme_unknown_rejected() {
+        assert!(parse_config(&args(&["--theme", "solarized"])).is_err());
+    }
+
+    #[test]
+    fn parse_theme_combines_with_bridge() {
+        let cfg =
+            parse_config(&args(&["--bridge", "--theme", "obsidian", "--left=foo"])).unwrap();
+        assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
+        assert_eq!(cfg.sessions.len(), 2);
+    }
+
+    #[test]
+    fn parse_no_theme_defaults_to_none() {
+        let cfg = parse_config(&args(&[])).unwrap();
+        assert!(cfg.theme.is_none());
     }
 }

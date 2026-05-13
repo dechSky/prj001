@@ -1,6 +1,7 @@
 mod atlas;
 mod font;
 mod geometry;
+mod theme;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -9,6 +10,7 @@ use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
 pub use geometry::{CursorRender, SelectionRange};
+pub use theme::ThemePalette;
 
 use atlas::GlyphAtlas;
 use font::FontStack;
@@ -38,6 +40,7 @@ pub struct Renderer {
     baseline: f32,
     viewport: [f32; 2],
     pending_instances: Vec<CellInstance>,
+    palette: ThemePalette,
 }
 
 impl Renderer {
@@ -47,6 +50,7 @@ impl Renderer {
         format: wgpu::TextureFormat,
         viewport: [f32; 2],
         font_size: f32,
+        palette: ThemePalette,
     ) -> Self {
         let mut font_stack = FontStack::new(font_size);
         let cell = font_stack.cell;
@@ -59,7 +63,7 @@ impl Renderer {
         let uniforms = Uniforms {
             viewport,
             cell: [cell.width as f32, cell.height as f32],
-            fg: [0.86, 0.86, 0.86, 1.0],
+            fg: palette.fg,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -242,7 +246,16 @@ impl Renderer {
             baseline,
             viewport,
             pending_instances: Vec::new(),
+            palette,
         }
+    }
+
+    pub fn palette(&self) -> ThemePalette {
+        self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: ThemePalette) {
+        self.palette = palette;
     }
 
     pub fn cell_metrics(&self) -> CellMetrics {
@@ -356,6 +369,7 @@ impl Renderer {
             selection,
             col_offset,
             row_offset,
+            &self.palette,
         );
         if let Some((preedit_str, col, row)) = preedit {
             let mut preedit_inst = geometry::build_preedit_instances_at(
@@ -367,6 +381,7 @@ impl Renderer {
                 self.baseline,
                 col_offset,
                 row_offset,
+                &self.palette,
             );
             instances.append(&mut preedit_inst);
         }
@@ -518,10 +533,10 @@ impl Renderer {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.05,
-                        g: 0.05,
-                        b: 0.07,
-                        a: 1.0,
+                        r: self.palette.bg[0] as f64,
+                        g: self.palette.bg[1] as f64,
+                        b: self.palette.bg[2] as f64,
+                        a: self.palette.bg[3] as f64,
                     }),
                     store: wgpu::StoreOp::Store,
                 },

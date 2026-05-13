@@ -1,6 +1,6 @@
 use vte::{Params, ParamsIter, Perform};
 
-use crate::grid::{Attrs, Color, CursorShape, Term};
+use crate::grid::{Attrs, Charset, Color, CursorShape, MouseProtocol, Term};
 
 pub struct TermPerform<'a> {
     term: &'a mut Term,
@@ -23,6 +23,10 @@ impl<'a> Perform for TermPerform<'a> {
             0x0D => self.term.carriage_return(),
             0x08 => self.term.backspace(),
             0x09 => self.term.tab(),
+            // M11-4: LS0 (SI, 0x0F) — G0를 GL로 invoke. 현재 모델은 G0만 추적해서 항상 GL=G0
+            // 이므로 no-op. LS1 (SO, 0x0E)도 G1 미구현이라 no-op (mc/nethack 등은 G0를
+            // DEC graphics로 designate하는 게 일반적이라 G1 누락 영향 작음).
+            0x0E | 0x0F => {}
             _ => {}
         }
     }
@@ -58,6 +62,11 @@ impl<'a> Perform for TermPerform<'a> {
             }
             return;
         }
+        // M11-3: DECSTR Soft Reset (CSI ! p, intermediates="!", action='p')
+        if intermediates == b"!" && action == 'p' {
+            self.term.soft_reset();
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
@@ -89,6 +98,12 @@ impl<'a> Perform for TermPerform<'a> {
             'K' => self.term.erase_line(arg_at(params, 0, 0) as u16),
             'S' => self.term.scroll_up_n(arg1(params, 1)),
             'T' => self.term.scroll_down_n(arg1(params, 1)),
+            // M11-1: line edit primitives.
+            '@' => self.term.insert_chars(arg1(params, 1)),
+            'P' => self.term.delete_chars(arg1(params, 1)),
+            'X' => self.term.erase_chars(arg1(params, 1)),
+            'L' => self.term.insert_lines(arg1(params, 1)),
+            'M' => self.term.delete_lines(arg1(params, 1)),
             'r' => {
                 // DECSTBM: ESC [ top ; bottom r — 1-based, default = 전체
                 let rows = self.term.rows();
@@ -119,7 +134,21 @@ impl<'a> Perform for TermPerform<'a> {
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        // M11-4: G0 designate — ESC ( <final>. ESC ( B = ASCII, ESC ( 0 = DEC special graphics.
+        // 그 외 final byte는 NRCS 변형들이라 G0=ASCII로 안전 폴백.
+        if intermediates == b"(" {
+            let cs = match byte {
+                b'0' => Charset::DecSpecialGraphics,
+                _ => Charset::Ascii,
+            };
+            self.term.set_g0_charset(cs);
+            return;
+        }
+        // G1/G2/G3 designate (`)` / `*` / `+`)는 추적 안 함 (post-MVP+ cleanup).
+        if matches!(intermediates, b")" | b"*" | b"+") {
+            return;
+        }
         match byte {
             // M7-4: DECSC `ESC 7`, DECRC `ESC 8`.
             b'7' => self.term.decsc(),
@@ -127,6 +156,8 @@ impl<'a> Perform for TermPerform<'a> {
             // M9-3: DECPAM (`ESC =`) application keypad, DECPNM (`ESC >`) numeric.
             b'=' => self.term.set_keypad_application(true),
             b'>' => self.term.set_keypad_application(false),
+            // M11-3: RIS Reset to Initial State (`ESC c`).
+            b'c' => self.term.full_reset(),
             _ => {}
         }
     }
@@ -142,8 +173,9 @@ impl<'a> Perform for TermPerform<'a> {
             }
             return;
         }
-        // M8-7 보강: OSC 7 → working directory file URL → 타이틀로 변환.
-        // macOS zsh의 update_terminal_cwd hook이 보내는 시퀀스.
+        // M8-7 + 슬라이스 6.2: OSC 7 → working directory file URL.
+        // (1) 절대 경로를 Term.cwd에 저장 (block UI/pane 헤더용).
+        // (2) home-relative 표시명을 title에 set (기존 동작 유지).
         // 형식: file://hostname/encoded/path
         if code == b"7" {
             if let Ok(url) = std::str::from_utf8(params[1]) {
@@ -151,10 +183,53 @@ impl<'a> Perform for TermPerform<'a> {
                     // hostname/path 분리. hostname은 무시, path만.
                     let path_encoded = rest.splitn(2, '/').nth(1).unwrap_or("");
                     let path = url_decode(path_encoded);
+                    // 디코드된 절대 경로 ("/" prefix 보존). 빈 문자열이면 저장 안 함.
+                    if !path.is_empty() {
+                        let absolute = if path.starts_with('/') {
+                            path.clone()
+                        } else {
+                            format!("/{path}")
+                        };
+                        self.term.set_cwd(absolute);
+                    }
                     let display = home_relative(&path);
                     self.term.set_title(display);
                 }
             }
+            return;
+        }
+        // 슬라이스 6.3: OSC 8 hyperlink — `OSC 8 ; params ; URI ST`.
+        // params는 옵션(id=, etc.)으로 현재 무시. URI 비어있으면 close.
+        // params[0]="8", params[1]=options, params[2]=URI.
+        if code == b"8" {
+            let uri = params.get(2).copied().unwrap_or(b"");
+            if uri.is_empty() {
+                self.term.set_hyperlink_uri(None);
+            } else if let Ok(s) = std::str::from_utf8(uri) {
+                self.term.set_hyperlink_uri(Some(s.to_string()));
+            }
+            return;
+        }
+        // 슬라이스 6.4: OSC 133 semantic prompt — FinalTerm/iTerm 호환.
+        // `OSC 133;A ST` prompt start, `OSC 133;B ST` command start,
+        // `OSC 133;C ST` output start, `OSC 133;D[;exit] ST` command end.
+        if code == b"133" {
+            if let Some(kind) = params.get(1) {
+                match kind.first() {
+                    Some(b'A') => self.term.semantic_prompt_start(),
+                    Some(b'D') => {
+                        let exit = params.get(2)
+                            .and_then(|s| std::str::from_utf8(s).ok())
+                            .and_then(|s| s.parse::<i32>().ok());
+                        self.term.semantic_command_end(exit);
+                    }
+                    // B (command start), C (output start)는 boundary marker — 차후
+                    // block UI에서 출력 영역 분리에 사용. 1차는 no-op.
+                    Some(b'B') | Some(b'C') => {}
+                    _ => {}
+                }
+            }
+            return;
         }
     }
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
@@ -184,6 +259,15 @@ impl<'a> TermPerform<'a> {
                 // M10-2: bracketed paste mode (CSI ?2004 h/l)
                 (2004, 'h') => self.term.set_bracketed_paste(true),
                 (2004, 'l') => self.term.set_bracketed_paste(false),
+                // 슬라이스 6.6: xterm mouse reporting modes.
+                (1000, 'h') => self.term.set_mouse_protocol(MouseProtocol::Button),
+                (1000, 'l') => self.term.set_mouse_protocol(MouseProtocol::Off),
+                (1002, 'h') => self.term.set_mouse_protocol(MouseProtocol::ButtonEvent),
+                (1002, 'l') => self.term.set_mouse_protocol(MouseProtocol::Off),
+                (1003, 'h') => self.term.set_mouse_protocol(MouseProtocol::AnyEvent),
+                (1003, 'l') => self.term.set_mouse_protocol(MouseProtocol::Off),
+                (1006, 'h') => self.term.set_mouse_sgr_encoding(true),
+                (1006, 'l') => self.term.set_mouse_sgr_encoding(false),
                 _ => {}
             }
         }
@@ -577,5 +661,247 @@ mod tests {
         assert!(!term.cursor().visible);
         // 컬러는 변하지 않아야
         let _ = Color::Default; // 사용 표시
+    }
+
+    fn row_chars(term: &Term, row: usize) -> String {
+        (0..term.cols()).map(|c| term.cell(row, c).ch).collect()
+    }
+
+    #[test]
+    fn csi_at_inserts_chars() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"abcdef");
+        run(&mut term, b"\x1b[1;3H"); // 1-based → 0-based (0, 2)
+        run(&mut term, b"\x1b[2@");
+        assert_eq!(row_chars(&term, 0), "ab  cdef");
+    }
+
+    #[test]
+    fn csi_capital_p_deletes_chars() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"abcdef");
+        run(&mut term, b"\x1b[1;2H"); // (0, 1)
+        run(&mut term, b"\x1b[2P");
+        assert_eq!(row_chars(&term, 0), "adef    ");
+    }
+
+    #[test]
+    fn csi_capital_x_erases_chars() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"abcdef");
+        run(&mut term, b"\x1b[1;2H"); // (0, 1)
+        run(&mut term, b"\x1b[3X");
+        assert_eq!(row_chars(&term, 0), "a   ef  ");
+    }
+
+    #[test]
+    fn csi_capital_l_inserts_lines() {
+        let mut term = Term::new(4, 3);
+        run(&mut term, b"AAAA");
+        run(&mut term, b"\x1b[2;1H");
+        run(&mut term, b"BBBB");
+        run(&mut term, b"\x1b[2;1H"); // 다시 row 1 (0-based)
+        run(&mut term, b"\x1b[1L");
+        assert_eq!(row_chars(&term, 0), "AAAA");
+        assert_eq!(row_chars(&term, 1), "    ");
+        assert_eq!(row_chars(&term, 2), "BBBB");
+    }
+
+    #[test]
+    fn csi_capital_m_deletes_lines() {
+        let mut term = Term::new(4, 3);
+        run(&mut term, b"AAAA");
+        run(&mut term, b"\x1b[2;1H");
+        run(&mut term, b"BBBB");
+        run(&mut term, b"\x1b[3;1H");
+        run(&mut term, b"CCCC");
+        run(&mut term, b"\x1b[2;1H");
+        run(&mut term, b"\x1b[1M");
+        assert_eq!(row_chars(&term, 0), "AAAA");
+        assert_eq!(row_chars(&term, 1), "CCCC");
+        assert_eq!(row_chars(&term, 2), "    ");
+    }
+
+    #[test]
+    fn csi_line_edits_default_to_one() {
+        let mut term = Term::new(4, 1);
+        run(&mut term, b"abcd");
+        run(&mut term, b"\x1b[1;2H");
+        run(&mut term, b"\x1b[@"); // ICH with no arg → 1
+        assert_eq!(row_chars(&term, 0), "a bc");
+    }
+
+    #[test]
+    fn csi_decstr_soft_reset_resets_modes_only() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"hello");
+        run(&mut term, b"\x1b[?1h"); // DECCKM on
+        run(&mut term, b"\x1b[?2004h"); // bracketed paste on
+        run(&mut term, b"\x1b[?25l"); // cursor hide
+        run(&mut term, b"\x1b[31m"); // SGR fg red
+        assert!(term.cursor_keys_application());
+        assert!(term.bracketed_paste());
+        assert!(!term.cursor().visible);
+
+        run(&mut term, b"\x1b[!p"); // DECSTR
+
+        assert!(!term.cursor_keys_application());
+        assert!(!term.bracketed_paste());
+        assert!(term.cursor().visible);
+        // 화면 콘텐츠는 보존
+        assert!(row_chars(&term, 0).starts_with("hello"));
+    }
+
+    #[test]
+    fn esc_c_full_reset_clears_screen_and_homes_cursor() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"hello");
+        run(&mut term, b"\x1b[?1h"); // DECCKM on
+        run(&mut term, b"\x1b[2;3H"); // cursor to (1, 2)
+        assert!(term.cursor_keys_application());
+        assert_eq!(term.cursor().row, 1);
+
+        run(&mut term, b"\x1bc"); // RIS
+
+        assert!(!term.cursor_keys_application());
+        assert_eq!(term.cursor().row, 0);
+        assert_eq!(term.cursor().col, 0);
+        // 화면은 클리어
+        assert_eq!(row_chars(&term, 0), "        ");
+    }
+
+    #[test]
+    fn esc_paren_zero_designates_dec_graphics() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b(0"); // G0 = DEC special graphics
+        run(&mut term, b"lqk");
+        // l → ┌, q → ─, k → ┐
+        assert_eq!(row_chars(&term, 0), "┌─┐     ");
+    }
+
+    #[test]
+    fn esc_paren_b_returns_to_ascii() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b(0");
+        run(&mut term, b"l");
+        run(&mut term, b"\x1b(B"); // back to ASCII
+        run(&mut term, b"l");
+        assert_eq!(row_chars(&term, 0), "┌l      ");
+    }
+
+    #[test]
+    fn dec_graphics_mid_string_translates_only_active() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"a");
+        run(&mut term, b"\x1b(0");
+        run(&mut term, b"x");  // → │
+        run(&mut term, b"\x1b(B");
+        run(&mut term, b"x");
+        assert_eq!(row_chars(&term, 0), "a│x     ");
+    }
+
+    #[test]
+    fn full_reset_returns_to_main_from_alt() {
+        let mut term = Term::new(8, 2);
+        run(&mut term, b"\x1b[?1049h"); // alt screen
+        run(&mut term, b"alt");
+        run(&mut term, b"\x1bc"); // RIS
+        // main 복귀. main grid는 빈 상태였으므로 모두 blank.
+        assert_eq!(row_chars(&term, 0), "        ");
+    }
+
+    #[test]
+    fn osc_7_stores_absolute_cwd() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]7;file://localhost/Users/derek/code\x1b\\");
+        assert_eq!(term.cwd(), Some("/Users/derek/code"));
+    }
+
+    #[test]
+    fn osc_7_url_decoded_in_cwd() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]7;file://h/Users/d/my%20dir\x1b\\");
+        assert_eq!(term.cwd(), Some("/Users/d/my dir"));
+    }
+
+    #[test]
+    fn osc_8_sets_and_clears_hyperlink() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]8;;https://example.com\x1b\\");
+        assert_eq!(term.hyperlink_uri(), Some("https://example.com"));
+        run(&mut term, b"\x1b]8;;\x1b\\");
+        assert_eq!(term.hyperlink_uri(), None);
+    }
+
+    #[test]
+    fn osc_133_a_records_prompt_row() {
+        let mut term = Term::new(8, 3);
+        run(&mut term, b"\x1b[2;1H"); // cursor to row 1
+        assert_eq!(term.prompts_seen(), 0);
+        assert_eq!(term.last_prompt_row(), None);
+        run(&mut term, b"\x1b]133;A\x1b\\");
+        assert_eq!(term.prompts_seen(), 1);
+        assert_eq!(term.last_prompt_row(), Some(1));
+    }
+
+    #[test]
+    fn osc_133_d_records_exit_code() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]133;D;0\x1b\\");
+        assert_eq!(term.last_command_exit(), Some(0));
+        run(&mut term, b"\x1b]133;D;130\x1b\\");
+        assert_eq!(term.last_command_exit(), Some(130));
+    }
+
+    #[test]
+    fn osc_133_d_without_exit_is_none() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b]133;D\x1b\\");
+        assert_eq!(term.last_command_exit(), None);
+    }
+
+    #[test]
+    fn mouse_mode_1000_button_tracking() {
+        let mut term = Term::new(8, 1);
+        assert_eq!(term.mouse_protocol(), MouseProtocol::Off);
+        run(&mut term, b"\x1b[?1000h");
+        assert_eq!(term.mouse_protocol(), MouseProtocol::Button);
+        run(&mut term, b"\x1b[?1000l");
+        assert_eq!(term.mouse_protocol(), MouseProtocol::Off);
+    }
+
+    #[test]
+    fn mouse_mode_1002_button_event() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b[?1002h");
+        assert_eq!(term.mouse_protocol(), MouseProtocol::ButtonEvent);
+    }
+
+    #[test]
+    fn mouse_mode_1003_any_event() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b[?1003h");
+        assert_eq!(term.mouse_protocol(), MouseProtocol::AnyEvent);
+    }
+
+    #[test]
+    fn mouse_mode_1006_sgr_encoding() {
+        let mut term = Term::new(8, 1);
+        assert!(!term.mouse_sgr_encoding());
+        run(&mut term, b"\x1b[?1006h");
+        assert!(term.mouse_sgr_encoding());
+        run(&mut term, b"\x1b[?1006l");
+        assert!(!term.mouse_sgr_encoding());
+    }
+
+    #[test]
+    fn decstr_resets_mouse_modes() {
+        let mut term = Term::new(8, 1);
+        run(&mut term, b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(term.mouse_protocol(), MouseProtocol::AnyEvent);
+        assert!(term.mouse_sgr_encoding());
+        run(&mut term, b"\x1b[!p"); // DECSTR
+        assert_eq!(term.mouse_protocol(), MouseProtocol::Off);
+        assert!(!term.mouse_sgr_encoding());
     }
 }
