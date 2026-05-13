@@ -18,6 +18,10 @@ Claude 2nd opinion 기준, `AgentKind`/preset 위치 결정 전에는 active ses
 
 `Cmd+Shift+N` quick spawn은 `Session.kind`/`AgentKind`를 core에 추가하지 않고 `Config.quick_spawn_presets: Vec<(key, SessionSpec)>` 형태의 데이터 주입으로 처리한다. 일반 실행 기본값은 `s=shell`만 제공하고, `--bridge` 모드는 기존 agent-specific carve-out에 맞춰 `c=Claude`, `x=Codex` preset을 추가한다. core status bar는 계속 title 기반으로 표시한다.
 
+## 2026-05-13 갱신 — M12-6 crash log first slice
+
+panic hook은 `~/.config/pj001/crash.log`에 append-only로 기록한다. hook 내부는 `Backtrace::force_capture()`를 사용해 사용자 `RUST_BACKTRACE` 설정에 의존하지 않고, 파일 생성 실패는 무시해서 panic-in-panic을 피한다. `env_logger`는 `try_init()`로 전환해 테스트/재진입에서 logger double-init panic을 피한다. 일반 log file mirroring은 rotation/flush 정책이 필요하므로 후속으로 보류.
+
 ---
 
 ## 2026-05-11 갱신 — 정본 이전 + milestone 번호 재배치
@@ -81,7 +85,7 @@ Claude 2nd opinion 기준, `AgentKind`/preset 위치 결정 전에는 active ses
 **M8-7 효과로 본 로드맵에 영향**:
 - `vte::Perform::osc_dispatch` 분기가 이미 정비됨 (OSC 0/2 + OSC 7 파싱 + URL decode + home-relative).
 - `Term::{title, set_title, take_title_if_changed}` API 존재.
-- `pty/mod.rs`가 `TERM=xterm-256color` + `TERM_PROGRAM=Apple_Terminal` env 설정 — `/etc/zshrc_Apple_Terminal` (그리고 bash 변종)이 자동 OSC 7 송신. **shell-side 사용자 hook 불필요(macOS 기본 zsh/bash 한정)**.
+- `pty/mod.rs`가 `TERM=xterm-256color` + `TERM_PROGRAM=Apple_Terminal` env 설정 — `/etc/zshrc_Apple_Terminal` (그리고 bash 변종)이 자동 OSC 7 송신. `SHELL_SESSIONS_DISABLE=1`로 Apple session restore 배너와 `.zsh_sessions` 기록은 끄되 OSC 7 hook은 유지. **shell-side 사용자 hook 불필요(macOS 기본 zsh/bash 한정)**.
 - M13-2(OSC 7) 스코프 축소 — Term에 `cwd: Option<PathBuf>` 필드 추가 + 기존 OSC 7 분기에서 같이 저장하면 끝.
 - M11 DA/DA2 응답 레벨 기본 결정: **`xterm-256color`** (env가 이미 그 값으로 셋업).
 

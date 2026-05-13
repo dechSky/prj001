@@ -1,11 +1,51 @@
 use pj001_core::app::{self, CommandSpec, Config, QuickSpawnPreset, SessionSpec};
 use pj001_core::error::{self, Error};
+use std::backtrace::Backtrace;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::panic;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() -> error::Result<()> {
-    env_logger::init();
+    install_panic_hook();
+    let _ = env_logger::try_init();
     let args: Vec<String> = std::env::args().collect();
     let config = parse_config(&args[1..])?;
     app::run(config)
+}
+
+fn install_panic_hook() {
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if let Some(path) = crash_log_path() {
+            let backtrace = Backtrace::force_capture().to_string();
+            let entry = crash_entry(SystemTime::now(), &info.to_string(), &backtrace);
+            let _ = append_crash_entry(&path, &entry);
+        }
+        previous(info);
+    }));
+}
+
+fn crash_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/pj001/crash.log"))
+}
+
+fn crash_entry(now: SystemTime, info: &str, backtrace: &str) -> String {
+    let ts = now
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("---\nts_unix: {ts}\npanic: {info}\nbacktrace:\n{backtrace}\n")
+}
+
+fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(entry.as_bytes())
 }
 
 /// 기존 `--shell` 단일 터미널 모드와 M11-1 `--bridge --left/--right` 모드 지원.
@@ -124,6 +164,38 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn crash_entry_includes_timestamp_panic_and_backtrace() {
+        let entry = crash_entry(
+            UNIX_EPOCH + std::time::Duration::from_secs(42),
+            "boom",
+            "bt",
+        );
+
+        assert!(entry.contains("ts_unix: 42"));
+        assert!(entry.contains("panic: boom"));
+        assert!(entry.contains("backtrace:\nbt"));
+    }
+
+    #[test]
+    fn append_crash_entry_creates_parent_and_appends() {
+        let base = std::env::temp_dir().join(format!(
+            "pj001-crash-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = base.join("nested/crash.log");
+
+        append_crash_entry(&path, "one\n").unwrap();
+        append_crash_entry(&path, "two\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

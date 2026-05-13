@@ -5,6 +5,7 @@ mod session;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,45 @@ fn clamp_font_size(font_size: f32) -> f32 {
 
 fn physical_font_size(logical_font_size: f32, scale_factor: f64) -> f32 {
     clamp_font_size(logical_font_size) * scale_factor_or_default(scale_factor) as f32
+}
+
+fn posix_single_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn shell_quoted_path_for_drop(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    let mut text = posix_single_quote(text);
+    text.push(' ');
+    Some(text)
+}
+
+fn paste_payload_bytes(text: &str, bracketed: bool) -> Option<Vec<u8>> {
+    if bracketed && text.contains("\x1b[201~") {
+        return None;
+    }
+    if !bracketed {
+        return Some(text.as_bytes().to_vec());
+    }
+
+    let mut bytes = Vec::with_capacity(text.len() + b"\x1b[200~".len() + b"\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    Some(bytes)
 }
 
 /// M8-5: PageUp/Down 분기 첫 발생 시점 1회 log. 같은 dispatch는 다시 안 찍음.
@@ -527,6 +567,8 @@ enum CmdShortcut {
     Quit,
     Copy,
     Paste,
+    ClearBuffer,
+    ClearScrollback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,6 +648,15 @@ fn cmd_shortcut(
     }
     if lower == Some("r") || physical_code == Some(KeyCode::KeyR) {
         return Some(CmdShortcut::RespawnSession);
+    }
+    if lower == Some("k") || physical_code == Some(KeyCode::KeyK) {
+        return Some(if shift {
+            CmdShortcut::ClearScrollback
+        } else if alt {
+            CmdShortcut::ClearScrollback
+        } else {
+            CmdShortcut::ClearBuffer
+        });
     }
     if !alt && (physical_code == Some(KeyCode::Equal) || lower == Some("=") || lower == Some("+")) {
         return Some(CmdShortcut::FontZoomIn);
@@ -909,6 +960,9 @@ impl ApplicationHandler<UserEvent> for App {
                 state.last_mouse_pos = None;
                 state.dragging_divider = None;
                 state.window.set_cursor(CursorIcon::Default);
+            }
+            WindowEvent::DroppedFile(path) => {
+                state.handle_dropped_file(&path);
             }
             WindowEvent::MouseInput {
                 state: button_state,
@@ -1219,6 +1273,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::Paste) => {
                             state.handle_paste();
+                            return;
+                        }
+                        Some(CmdShortcut::ClearBuffer) => {
+                            state.clear_active_buffer(false);
+                            return;
+                        }
+                        Some(CmdShortcut::ClearScrollback) => {
+                            state.clear_active_buffer(true);
                             return;
                         }
                         None => {}
@@ -2613,6 +2675,20 @@ impl AppState {
         if text.is_empty() {
             return;
         }
+        self.write_text_to_active_pty(&text, "paste");
+    }
+
+    fn handle_dropped_file(&mut self, path: &Path) {
+        let Some(text) = shell_quoted_path_for_drop(path) else {
+            log::warn!("file drop ignored: path is not safe UTF-8");
+            return;
+        };
+        self.selection = None;
+        self.write_text_to_active_pty(&text, "file drop");
+        self.window.request_redraw();
+    }
+
+    fn write_text_to_active_pty(&mut self, text: &str, label: &str) {
         let idx = self.active_index();
         // scrollback view 활성 시 paste는 bottom으로 snap.
         if let Ok(mut term) = self.session_for_pane_idx(idx).term.lock() {
@@ -2628,19 +2704,48 @@ impl AppState {
             .map(|t| t.bracketed_paste())
             .unwrap_or(false);
         log::debug!(
-            "paste: {} bytes, bracketed={}, lines={}",
+            "{label}: {} bytes, bracketed={}, lines={}",
             text.len(),
             bracketed,
             text.matches('\n').count() + 1
         );
+        let Some(bytes) = paste_payload_bytes(text, bracketed) else {
+            log::warn!("{label} ignored: bracketed paste terminator found in payload");
+            return;
+        };
         let session = self.session_for_pane_idx_mut(idx);
-        if bracketed {
-            let _ = session.pty.write(b"\x1b[200~");
-            let _ = session.pty.write(text.as_bytes());
-            let _ = session.pty.write(b"\x1b[201~");
-        } else {
-            let _ = session.pty.write(text.as_bytes());
+        if let Err(e) = session.pty.write(&bytes) {
+            log::warn!("{label} write failed: {e}");
         }
+    }
+
+    fn clear_active_buffer(&mut self, scrollback_only: bool) {
+        let idx = self.active_index();
+        let send_redraw;
+        if let Ok(mut term) = self.session_for_pane_idx(idx).term.lock() {
+            let alt_screen = term.is_alt_screen();
+            term.clear_scrollback();
+            send_redraw = !scrollback_only && !alt_screen;
+            log::info!(
+                "clear active buffer: mode={}",
+                if scrollback_only || alt_screen {
+                    "scrollback"
+                } else {
+                    "redraw"
+                }
+            );
+        } else {
+            log::warn!("clear active buffer ignored: term lock failed");
+            return;
+        }
+        self.selection = None;
+        if send_redraw {
+            let session = self.session_for_pane_idx_mut(idx);
+            if let Err(e) = session.pty.write(b"\x0c") {
+                log::warn!("clear active buffer redraw write failed: {e}");
+            }
+        }
+        self.window.request_redraw();
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -3261,6 +3366,46 @@ mod tests {
     }
 
     #[test]
+    fn shell_quoted_path_for_drop_uses_posix_single_quotes() {
+        assert_eq!(
+            shell_quoted_path_for_drop(Path::new("/tmp/a b/$x(1)")),
+            Some("'/tmp/a b/$x(1)' ".to_string())
+        );
+        assert_eq!(
+            shell_quoted_path_for_drop(Path::new("/tmp/it's/한글")),
+            Some("'/tmp/it'\\''s/한글' ".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_quoted_path_for_drop_rejects_control_chars() {
+        assert_eq!(shell_quoted_path_for_drop(Path::new("/tmp/a\nb")), None);
+        assert_eq!(shell_quoted_path_for_drop(Path::new("/tmp/a\u{1b}b")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quoted_path_for_drop_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]));
+
+        assert_eq!(shell_quoted_path_for_drop(&path), None);
+    }
+
+    #[test]
+    fn paste_payload_wraps_bracketed_paste() {
+        assert_eq!(paste_payload_bytes("abc", false), Some(b"abc".to_vec()));
+        assert_eq!(
+            paste_payload_bytes("abc", true),
+            Some(b"\x1b[200~abc\x1b[201~".to_vec())
+        );
+        assert_eq!(paste_payload_bytes("a\x1b[201~b", true), None);
+    }
+
+    #[test]
     fn cmd_arrow_left_right_maps_to_home_end_bytes() {
         use winit::keyboard::NamedKey;
 
@@ -3403,6 +3548,26 @@ mod tests {
         assert_eq!(
             cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false),
             Some(CmdShortcut::RespawnSession)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("k"), Some(KeyCode::KeyK), false, false),
+            Some(CmdShortcut::ClearBuffer)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("k"), Some(KeyCode::KeyK), true, false),
+            Some(CmdShortcut::ClearScrollback)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("K"), Some(KeyCode::KeyK), true, false),
+            Some(CmdShortcut::ClearScrollback)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("k"), Some(KeyCode::KeyK), false, true),
+            Some(CmdShortcut::ClearScrollback)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("˚"), Some(KeyCode::KeyK), false, true),
+            Some(CmdShortcut::ClearScrollback)
         );
     }
 

@@ -573,6 +573,22 @@ impl Term {
         self.view_offset = 0;
     }
 
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.view_offset = 0;
+    }
+
+    pub fn clear_visible(&mut self) {
+        self.erase_display(2);
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+    }
+
+    pub fn clear_buffer(&mut self) {
+        self.clear_scrollback();
+        self.clear_visible();
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         // alt 모드: alt만 resize, main은 frozen.
         // main 모드: main reflow + alt도 resize (다음 alt 진입 시 정합).
@@ -1071,6 +1087,54 @@ mod tests {
         term.erase_display(2);
         for r in 0..5 {
             assert!(!term.row_flags(r).contains(RowFlags::WRAPPED), "row {}", r);
+        }
+    }
+
+    #[test]
+    fn clear_scrollback_preserves_visible_grid() {
+        let mut term = Term::new(4, 2);
+        print_str(&mut term, "abcd");
+        term.newline();
+        term.print('e');
+        assert!(term.scrollback_len() > 0);
+        let mut visible_before = Vec::new();
+        for row in 0..term.rows() {
+            for col in 0..term.cols() {
+                visible_before.push(term.cell(row, col));
+            }
+        }
+
+        term.clear_scrollback();
+
+        assert_eq!(term.scrollback_len(), 0);
+        assert_eq!(term.view_offset(), 0);
+        let mut visible_after = Vec::new();
+        for row in 0..term.rows() {
+            for col in 0..term.cols() {
+                visible_after.push(term.cell(row, col));
+            }
+        }
+        assert_eq!(visible_after, visible_before);
+    }
+
+    #[test]
+    fn clear_buffer_clears_scrollback_and_visible_grid() {
+        let mut term = Term::new(4, 2);
+        print_str(&mut term, "abcd");
+        term.newline();
+        term.print('e');
+        assert!(term.scrollback_len() > 0);
+
+        term.clear_buffer();
+
+        assert_eq!(term.scrollback_len(), 0);
+        assert_eq!(term.view_offset(), 0);
+        assert_eq!(term.cursor().row, 0);
+        assert_eq!(term.cursor().col, 0);
+        for row in 0..term.rows() {
+            for col in 0..term.cols() {
+                assert_eq!(term.cell(row, col), Cell::default());
+            }
         }
     }
 

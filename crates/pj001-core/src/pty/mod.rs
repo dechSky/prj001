@@ -11,6 +11,19 @@ use crate::app::event::{SessionId, UserEvent};
 use crate::error::Result;
 use crate::grid::Term;
 
+fn shell_command(shell: &str) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(shell);
+    // M8-7 보강: TERM_PROGRAM=Apple_Terminal 위장으로 macOS zsh의
+    // /etc/zshrc_Apple_Terminal 이 활성화되어 OSC 7(cwd) 자동 송신.
+    // SHELL_SESSIONS_DISABLE은 Apple session restore 배너와 ~/.zsh_sessions
+    // 기록만 끈다. OSC 7 precmd hook은 이 플래그와 별도로 유지된다.
+    // TERM도 명시 (xterm-256color — 표준 ANSI/256-color 인식).
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("TERM_PROGRAM", "Apple_Terminal");
+    cmd.env("SHELL_SESSIONS_DISABLE", "1");
+    cmd
+}
+
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -28,12 +41,7 @@ impl PtyHandle {
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
-        let mut cmd = CommandBuilder::new(shell);
-        // M8-7 보강: TERM_PROGRAM=Apple_Terminal 위장으로 macOS zsh의
-        // /etc/zshrc_Apple_Terminal 이 활성화되어 OSC 7(cwd) 자동 송신.
-        // TERM도 명시 (xterm-256color — 표준 ANSI/256-color 인식).
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("TERM_PROGRAM", "Apple_Terminal");
+        let cmd = shell_command(shell);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
@@ -69,5 +77,20 @@ impl Drop for PtyHandle {
         if let Some(t) = self.reader_thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_command_sets_terminal_identity_and_disables_apple_restore() {
+        let cmd = shell_command("/bin/zsh");
+
+        assert_eq!(cmd.get_argv()[0], "/bin/zsh");
+        assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-256color");
+        assert_eq!(cmd.get_env("TERM_PROGRAM").unwrap(), "Apple_Terminal");
+        assert_eq!(cmd.get_env("SHELL_SESSIONS_DISABLE").unwrap(), "1");
     }
 }

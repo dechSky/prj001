@@ -465,8 +465,11 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; bridge mode는 `c=Claude`, `x=Codex` 추가. 3초 내 입력 없으면 자동 취소 | M15 dynamic spawn, core는 preset data만 사용 |
 | **Cmd+R** | active pane의 session을 같은 command로 재시작. SessionId는 새로 발급되고 scrollback은 초기화 | M15 respawn 첫 slice |
 | **Cmd+= / Cmd+- / Cmd+0** | 폰트 크기 확대/축소/기본값 복귀. logical font size는 6~72pt로 clamp하고 monitor scale factor는 렌더 직전 적용 | M15 font zoom 첫 slice |
+| **Cmd+K** | active pane의 scrollback을 clear하고 PTY에 `Ctrl+L`을 보내 shell/readline이 화면과 prompt를 다시 그리게 함. alt screen에서는 TUI 화면 보호를 위해 scrollback만 clear | Terminal clear UX |
+| **Cmd+Shift+K / Cmd+Option+K** | active pane의 scrollback만 clear, visible buffer 유지. `Cmd+Shift+K`가 global shortcut에 잡히는 환경에서는 `Cmd+Option+K` 사용 | Clear Scrollback Buffer convention |
 | **마우스 드래그** | 보이는 active pane 텍스트 셀 선택 하이라이트. Cmd+C로 선택 텍스트 복사 | M12 selection 첫 slice |
 | **더블클릭 / 트리플클릭** | 더블클릭은 단어 선택, 트리플클릭은 줄 선택 | M12 selection UX |
+| **파일 드롭** | Finder 파일/폴더를 active pane에 shell-quoted path로 입력. 개행 없이 trailing space만 추가하고 bracketed paste mode를 존중. non-UTF8/control-char path는 안전상 거부 | M12-5 file drag-and-drop |
 | **그 외 Cmd+key** | swallow (안전 기본값) | shell이 Cmd modifier 의미 가질 가능성 0에 가까움. PTY 보내면 의도 없는 byte |
 
 구현:
