@@ -113,6 +113,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return color;
     }
 
+    // Phase 5: SCROLLBAR_THUMB path. cell 우측 가장자리 약 3px만 thumb 색, 나머지는
+    // palette_bg (cell content 안 그리고 단순 thin band).
+    if ((in.flags & 0x400u) != 0u) {
+        let cell_w = u.cell.x * in.cell_span;
+        let thumb_w = max(2.0, cell_w * 0.30);
+        if (in.cell_pixel.x >= cell_w - thumb_w) {
+            return in.bg;
+        }
+        return u.palette_bg;
+    }
+
     // Phase 4b-2c-4b: BLOCK_CARD SDF path. bit 0x10 set이면 카드 cell —
     // edge bit(0x20 top / 0x40 bottom / 0x80 left / 0x100 right)으로 border band 판정,
     // corner(두 edge 동시 set)는 SDF로 곡선 그리기. corner 곡선의 외부는 palette_bg

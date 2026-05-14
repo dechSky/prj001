@@ -4095,7 +4095,7 @@ impl AppState {
                     let scrollbar_col = pane_col_offset + self.active_tab().panes[idx].viewport.cols
                         - 1;
                     let scrollbar_row = pane_row_offset + thumb_top;
-                    self.renderer.append_fill_column(
+                    self.renderer.append_scrollbar_thumb(
                         scrollbar_col,
                         scrollbar_row,
                         thumb_size,

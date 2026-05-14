@@ -50,6 +50,9 @@ pub const FLAG_BLOCK_EDGE_RIGHT: u32 = 0x100;
 /// Phase 4b-3: prompt marker cell. BLOCK_CARD와 함께 set. shader가 cell 중앙에
 /// rounded square marker 그림. marker 색은 block_border_color 재활용.
 pub const FLAG_BLOCK_MARKER: u32 = 0x200;
+/// Phase 5: scrollbar thumb cell. shader가 cell 우측 가장자리 좁은 띠(약 3px)만 thumb 색,
+/// 나머지는 palette.bg(투명) — cell 1개 폭의 sub-cell scrollbar.
+pub const FLAG_SCROLLBAR_THUMB: u32 = 0x400;
 
 #[derive(Clone, Copy)]
 pub struct CursorRender {

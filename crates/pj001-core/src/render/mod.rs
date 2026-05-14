@@ -481,6 +481,32 @@ impl Renderer {
         }
     }
 
+    /// Phase 5: sub-cell scrollbar thumb — cell 1개 폭에서 우측 가장자리 약 3px만 그림.
+    /// shader가 FLAG_SCROLLBAR_THUMB bit 검사해 우측 thin band만 thumb 색.
+    pub fn append_scrollbar_thumb(
+        &mut self,
+        col: usize,
+        row: usize,
+        height: usize,
+        thumb_color: [f32; 4],
+    ) {
+        for idx in 0..height {
+            self.pending_instances.push(CellInstance {
+                cell_xy: [col as f32, (row + idx) as f32],
+                uv_min: [0.0; 2],
+                uv_max: [0.0; 2],
+                glyph_offset: [0.0; 2],
+                glyph_size: [0.0; 2],
+                fg: [0.0; 4],
+                bg: thumb_color,
+                cell_span: 1.0,
+                flags: geometry::FLAG_SCROLLBAR_THUMB,
+                block_border_color: [0.0; 4],
+                _pad: [0.0; 2],
+            });
+        }
+    }
+
     pub fn append_fill_row(&mut self, col: usize, row: usize, width: usize, bg: [f32; 4]) {
         for idx in 0..width {
             self.pending_instances.push(CellInstance {
