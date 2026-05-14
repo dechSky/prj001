@@ -3197,10 +3197,26 @@ impl AppState {
                 if viewport.status_row == Some(row) {
                     return None;
                 }
+                // scrollbar thumb 우측 가장자리 cell — scrollback 있을 때만 표시되는 chrome.
+                // selection hit 아님 + cursor I-beam도 안 함.
+                if local_col + 1 == viewport.cols && self.scrollbar_visible_in(pane) {
+                    return None;
+                }
                 return Some((pane.id, (local_row, local_col)));
             }
         }
         None
+    }
+
+    /// 해당 pane에 scrollbar thumb이 표시 중인지 — scrollback 있고 view_offset valid.
+    fn scrollbar_visible_in(&self, pane: &Pane) -> bool {
+        let Some(session) = self.sessions.get(&pane.session) else {
+            return false;
+        };
+        let Ok(term) = session.term.lock() else {
+            return false;
+        };
+        term.scrollback_len() > 0
     }
 
     /// Phase 2 caret 모델: mouse pos → (pane, (row, caret_col)). caret_col은 글자 사이
