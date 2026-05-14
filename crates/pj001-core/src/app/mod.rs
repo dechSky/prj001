@@ -922,8 +922,12 @@ fn compute_tab_viewports(
             .y_px
             .saturating_add(cell.height * TAB_BAR_ROWS as u32);
         // Phase 4b-1c: pane gutter 발동. cell.width 단위로 align.
+        // 좌측 gutter — content cell이 우측으로 shift되어야 design §8 정합.
+        // 4b-1c-fix: col_offset도 같이 +=gutter_cells. 없으면 cell 위치 그대로 두고
+        // cols만 줄어 우측 stripe가 생기는 버그 (block_capable=false면 시각 영향 0).
         if gutter_cells > 0 && (viewport.cols as u32) > gutter_cells {
             viewport.cols -= gutter_cells as usize;
+            viewport.col_offset += gutter_cells as usize;
             viewport.gutter_px = gutter_px_aligned.min(u16::MAX as u32) as u16;
             viewport.content_x_px = viewport.x_px.saturating_add(gutter_px_aligned);
             viewport.width_px = viewport.width_px.saturating_sub(gutter_px_aligned);
@@ -4092,6 +4096,21 @@ mod tests {
         assert_eq!(viewport.row_offset, 1);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.y_px, 20);
+    }
+
+    #[test]
+    fn compute_tab_viewports_gutter_shifts_col_offset_left() {
+        // Phase 4b-1c-fix: gutter는 좌측에 위치. content cell이 우측으로 shift되어야 함.
+        // cell.width=10, gutter_px=20 → gutter_cells=2. cols 10→8, col_offset 0→2.
+        let root = Layout::Pane(PaneId(0));
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell(), 20);
+        let viewport = layouts[&PaneId(0)];
+
+        assert_eq!(viewport.cols, 8);
+        assert_eq!(viewport.col_offset, 2);
+        assert_eq!(viewport.gutter_px, 20);
+        assert_eq!(viewport.content_x_px, 20);
+        assert_eq!(viewport.width_px, 80);
     }
 
     // === clamp_pos_to_viewport_cell: 드래그가 창 밖으로 나가도 selection.pane 가장자리로 clamp ===
