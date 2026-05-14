@@ -79,8 +79,9 @@ define_class!(
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> NSRange {
+            // 빈 marked text도 valid range로 반환 (NSNotFound면 OS Korean IME가 즉시 commit으로 빠짐).
             if self.ivars().marked_text.borrow().is_empty() {
-                not_found_range()
+                NSRange::new(0, 0)
             } else {
                 self.ivars().marked_range.get()
             }
@@ -88,7 +89,8 @@ define_class!(
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
-            not_found_range()
+            // valid cursor range — NSNotFound 반환은 macOS Korean IME composition 불가.
+            NSRange::new(0, 0)
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
