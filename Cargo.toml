@@ -16,6 +16,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 arboard = "3.6"
+raw-window-handle = "0.6"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"

@@ -1,6 +1,8 @@
 pub mod event;
 mod input;
 mod layout;
+#[cfg(target_os = "macos")]
+mod macos_ime;
 mod session;
 
 use std::collections::HashMap;
@@ -977,6 +979,11 @@ impl App {
         // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
         state.window.set_ime_allowed(true);
         state.window.set_ime_purpose(ImePurpose::Terminal);
+        // macOS first-key escape 워크어라운드 — NSTextInputContext.activate() 직접 호출로
+        // IME를 즉시 wake-up. 입력 소스 전환 직후 첫 자모가 KeyboardInput으로 escape되는
+        // winit 동작 회피 (Codex thread 019e2491).
+        #[cfg(target_os = "macos")]
+        macos_ime::wake_input_context(&state.window);
         let window = state.window.clone();
         self.state = Some(state);
         window.request_redraw();
@@ -1076,6 +1083,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if focused {
                     // 포커스 회복 시 즉시 cursor 보이기 (다음 blink phase 기다리지 않음).
                     state.cursor_visible = true;
+                    // 포커스 회복 시점에 입력 소스가 한국어로 바뀌었을 가능성 → IME wake-up
+                    // 재호출. winit set_ime_allowed가 idempotent라 다른 trigger 필요.
+                    #[cfg(target_os = "macos")]
+                    macos_ime::wake_input_context(&state.window);
                 }
                 state.window.request_redraw();
                 // M10-3: focus reporting on이면 PTY로 송신. lock drop 후 write.
