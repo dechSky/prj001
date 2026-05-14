@@ -2,10 +2,20 @@
 pub enum UserEvent {
     /// M12-4: PTY 출력으로 Term이 갱신되었음을 알림. visible session인 경우만 redraw.
     SessionRepaint(SessionId),
+    /// Generic embedder write path. Policy and target selection stay outside pj001-core.
+    WriteToSession { id: SessionId, bytes: Vec<u8> },
     /// M12-4: PTY child process 종료. emit 측은 alive=false + exit_code 기록.
     SessionExited { id: SessionId, code: i32 },
     /// M12-4: PTY read 에러. fatal 처리(active 이동 + 다른 session도 다 죽으면 종료).
     SessionPtyError { id: SessionId, message: String },
+    /// macOS first-key IME workaround. 자체 NSView/NSTextInputClient가 commit 텍스트
+    /// 전달. PoC 단계는 로그만, AppState 연결 후엔 winit Ime::Commit과 동일 처리.
+    MacImeCommit(String),
+    /// macOS IME preedit/composition update. PoC.
+    MacImePreedit {
+        text: String,
+        cursor_byte: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

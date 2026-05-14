@@ -1830,6 +1830,26 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::MacImeCommit(text) => {
+                log::debug!("MacImeCommit({:?})", text);
+                // PoC v0.1 — 로그만. AppState IME path 연결은 PjImeView 검증 후.
+                if let Some(state) = &mut self.state {
+                    state.preedit = None;
+                    let idx = state.active_index();
+                    if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(text.as_bytes())
+                    {
+                        log::warn!("pty write (mac ime commit): {e}");
+                    }
+                    state.window.request_redraw();
+                }
+            }
+            UserEvent::MacImePreedit { text, cursor_byte } => {
+                log::debug!("MacImePreedit({:?}, cursor_byte={:?})", text, cursor_byte);
+                if let Some(state) = &mut self.state {
+                    state.preedit = if text.is_empty() { None } else { Some(text) };
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 }
