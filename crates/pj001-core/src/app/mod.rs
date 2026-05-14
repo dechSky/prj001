@@ -3972,8 +3972,16 @@ impl AppState {
                     if selection.pane != pane_id {
                         return None;
                     }
-                    // Phase 5: anchor/head는 abs caret. viewport-local로 변환 후 SelectionRange.
-                    // caret 모델: anchor == head면 빈 range(SelectionRange.contains 자연 처리).
+                    // Phase 5: anchor/head는 abs caret. viewport와 겹치는 경우만 highlight.
+                    // 둘 다 viewport 위 또는 둘 다 viewport 아래면 None — 스크롤로 selection이
+                    // viewport 밖으로 빠지면 잘못된 row 0/rows-1에 highlight되는 회귀 방지.
+                    let top_abs = term.top_visible_abs() as usize;
+                    let bottom_abs = top_abs.saturating_add(term.rows().saturating_sub(1));
+                    let lo = selection.anchor.0.min(selection.head.0);
+                    let hi = selection.anchor.0.max(selection.head.0);
+                    if hi < top_abs || lo > bottom_abs {
+                        return None;
+                    }
                     let anchor_vp = abs_to_viewport_caret(&term, selection.anchor);
                     let head_vp = abs_to_viewport_caret(&term, selection.head);
                     Some(SelectionRange::new(anchor_vp, head_vp))
