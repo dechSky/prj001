@@ -237,10 +237,14 @@ pub fn build_instances_at(
                 let Some((overlay, info)) = owner_info else {
                     continue;
                 };
+                let is_marker = gc == marker_col && r == overlay.visible_row_start;
                 let mut flags = FLAG_BLOCK_CARD | info.edge_mask;
-                if gc == marker_col && r == overlay.visible_row_start {
+                if is_marker {
                     flags |= FLAG_BLOCK_MARKER;
                 }
+                // marker cell의 fg에 palette.fg stamp → shader BLOCK_MARKER 안쪽에서 사용.
+                // non-marker cell은 fg 사용 안 함 (gutter cell엔 글자 없음).
+                let fg = if is_marker { palette.fg } else { [0.0; 4] };
                 out.push(CellInstance {
                     cell_xy: [
                         (gutter_start_col + gc) as f32,
@@ -250,7 +254,7 @@ pub fn build_instances_at(
                     uv_max: [0.0; 2],
                     glyph_offset: [0.0; 2],
                     glyph_size: [0.0; 2],
-                    fg: [0.0; 4],
+                    fg,
                     bg: info.bg,
                     cell_span: 1.0,
                     flags,

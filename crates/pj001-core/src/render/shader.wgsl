@@ -181,12 +181,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             card_color = in.block_border_color;
         }
 
-        // Phase 4b-3: prompt marker — cell 중앙에 rounded square SDF.
+        // Phase 4b-3: prompt marker — cell 중앙에 rounded square SDF. marker 색은 in.fg
+        // (build_instances_at가 marker cell에 palette.fg stamp). marker_half는 cell 크기
+        // 한도 내 — 작은 cell도 마커가 비례.
         if ((in.flags & 0x200u) != 0u) {
             let cx = cell_w * 0.5;
             let cy = cell_h * 0.5;
-            let marker_half = min(min(cell_w, cell_h) * 0.5 - 2.0, 8.0);
-            let marker_radius = max(2.0, marker_half * 0.3);
+            let marker_half = min(cell_w, cell_h) * 0.4;
+            let marker_radius = max(1.5, marker_half * 0.25);
             let dx = abs(in.cell_pixel.x - cx);
             let dy = abs(in.cell_pixel.y - cy);
             // rounded square SDF: max(|p|-half+r, 0) magnitude - r
@@ -194,7 +196,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let qy = max(dy - (marker_half - marker_radius), 0.0);
             let m_dist = sqrt(qx * qx + qy * qy) - marker_radius;
             if (m_dist < 0.0) {
-                card_color = in.block_border_color;
+                card_color = in.fg;
             }
         }
 
