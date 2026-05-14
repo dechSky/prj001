@@ -21,7 +21,7 @@ use winit::window::{CursorIcon, ImePurpose, Window, WindowId};
 use crate::error::{Error, Result};
 use crate::grid::{MouseProtocol, Term};
 use crate::pty::PtyHandle;
-use crate::render::{CursorRender, Renderer, SelectionRange, ThemePalette};
+use crate::render::{CellMetrics, CursorRender, Renderer, SelectionRange, ThemePalette};
 use event::{IdAllocator, PaneId, SessionId, TabId, UserEvent};
 #[cfg(test)]
 use layout::SplitRatio;
@@ -464,6 +464,34 @@ struct PaneViewport {
     /// `x_px + gutter_px`. mouse/selection 좌표 변환 시 사용. 4a는 x_px와 동일.
     #[allow(dead_code)]
     content_x_px: u32,
+}
+
+/// Drag 중 cursor의 physical position을 selection.pane viewport 안 cell 좌표로 clamp.
+/// 음수 좌표(창 위/왼쪽 밖) → 0, 너무 큰 좌표(아래/오른쪽 밖) → 가장자리 cell.
+/// 결과는 viewport-local (row, col).
+fn clamp_pos_to_viewport_cell(
+    pos: PhysicalPosition<f64>,
+    viewport: PaneViewport,
+    cell: CellMetrics,
+) -> (usize, usize) {
+    if cell.width == 0 || cell.height == 0 {
+        return (0, 0);
+    }
+    let abs_col = if pos.x < 0.0 {
+        0
+    } else {
+        (pos.x / cell.width as f64).floor() as usize
+    };
+    let abs_row = if pos.y < 0.0 {
+        0
+    } else {
+        (pos.y / cell.height as f64).floor() as usize
+    };
+    let cols_max = viewport.cols.saturating_sub(1);
+    let rows_max = viewport.rows.saturating_sub(1);
+    let local_col = abs_col.saturating_sub(viewport.col_offset).min(cols_max);
+    let local_row = abs_row.saturating_sub(viewport.row_offset).min(rows_max);
+    (local_row, local_col)
 }
 
 fn status_segment(
@@ -1060,6 +1088,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_mouse_pos = Some(position);
+                // 창 밖에서 button release되면 MouseInput Released를 못 받을 수 있다.
+                // 다시 들어왔을 때 dragging=true + 어떤 버튼도 안 잡혀있으면 release 누락 →
+                // selection drag 종료.
+                state.reconcile_lost_button_release();
                 if state.dragging_divider.is_some() {
                     state.drag_divider_to_mouse();
                 } else if !state.modifiers.shift_key()
@@ -2881,14 +2913,67 @@ impl AppState {
         self.window.set_cursor(icon);
     }
 
+    /// 창 밖에서 button release → `MouseInput Released` 누락 시 dragging=true가 stuck.
+    /// CursorMoved 진입에서 호출. button mask가 비어있으면 selection drag 종료 + divider drag 종료.
+    fn reconcile_lost_button_release(&mut self) {
+        if self.mouse_buttons_held != 0 {
+            return;
+        }
+        let selection_was_dragging = self
+            .selection
+            .as_ref()
+            .map(|s| s.dragging)
+            .unwrap_or(false);
+        if selection_was_dragging {
+            self.finish_selection_drag();
+        }
+        if self.dragging_divider.is_some() {
+            self.dragging_divider = None;
+            self.update_mouse_cursor();
+        }
+    }
+
     fn update_selection_to_mouse(&mut self) -> bool {
+        // Drag 중이면 cursor가 창/pane 밖으로 나가도 selection.pane viewport 가장자리로
+        // clamp해 head를 계속 업데이트. 비-drag(double/triple click highlight 등)는
+        // cell-exact 매칭이라 기존 동작 유지.
+        let Some(selection) = self.selection.as_ref() else {
+            return false;
+        };
+        if selection.dragging {
+            let pane = selection.pane;
+            let Some(viewport) = self
+                .active_tab()
+                .panes
+                .iter()
+                .find(|p| p.id == pane)
+                .map(|p| p.viewport)
+            else {
+                return false;
+            };
+            let Some(pos) = self.last_mouse_pos else {
+                return false;
+            };
+            let cell = self.renderer.cell_metrics();
+            let new_head = clamp_pos_to_viewport_cell(pos, viewport, cell);
+            // Mut borrow.
+            let Some(selection) = self.selection.as_mut() else {
+                return false;
+            };
+            if selection.head == new_head {
+                return false;
+            }
+            selection.head = new_head;
+            return true;
+        }
+        // 비-drag: 기존 cell-exact 동작.
         let Some((pane, cell)) = self.pane_cell_at_mouse() else {
             return false;
         };
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        if !selection.dragging || selection.pane != pane || selection.head == cell {
+        if selection.pane != pane || selection.head == cell {
             return false;
         }
         selection.head = cell;
@@ -3774,6 +3859,83 @@ mod tests {
         assert_eq!(viewport.row_offset, 1);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.y_px, 20);
+    }
+
+    // === clamp_pos_to_viewport_cell: 드래그가 창 밖으로 나가도 selection.pane 가장자리로 clamp ===
+
+    fn vp(cols: usize, rows: usize, col_offset: usize, row_offset: usize) -> PaneViewport {
+        PaneViewport {
+            cols,
+            rows,
+            col_offset,
+            row_offset,
+            status_row: None,
+            x_px: 0,
+            y_px: 0,
+            width_px: 0,
+            height_px: 0,
+            gutter_px: 0,
+            content_x_px: 0,
+        }
+    }
+
+    fn cm(w: u32, h: u32) -> CellMetrics {
+        CellMetrics {
+            width: w,
+            height: h,
+            baseline: 0.0,
+        }
+    }
+
+    #[test]
+    fn clamp_pos_negative_pins_to_origin() {
+        // pos가 (-50, -10)이면 row=0, col=0.
+        let p = PhysicalPosition::new(-50.0, -10.0);
+        let v = vp(10, 5, 0, 0);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 16)), (0, 0));
+    }
+
+    #[test]
+    fn clamp_pos_beyond_right_edge_pins_to_last_col() {
+        // 8px cells, 10 cols → 80px width. pos.x = 200 → 가장자리 col = 9.
+        let p = PhysicalPosition::new(200.0, 16.0);
+        let v = vp(10, 5, 0, 0);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 16)), (1, 9));
+    }
+
+    #[test]
+    fn clamp_pos_beyond_bottom_pins_to_last_row() {
+        let p = PhysicalPosition::new(8.0, 1000.0);
+        let v = vp(10, 5, 0, 0);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 16)), (4, 1));
+    }
+
+    #[test]
+    fn clamp_pos_inside_viewport_returns_local_cell() {
+        // pos = (24, 32). col=24/8=3, row=32/16=2.
+        let p = PhysicalPosition::new(24.0, 32.0);
+        let v = vp(10, 5, 0, 0);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 16)), (2, 3));
+    }
+
+    #[test]
+    fn clamp_pos_respects_viewport_offset() {
+        // viewport col_offset=5, row_offset=2.
+        // pos = (16, 32). abs col=2, abs row=2. local col=2-5 saturating→0, local row=2-2=0.
+        let p = PhysicalPosition::new(16.0, 32.0);
+        let v = vp(10, 5, 5, 2);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 16)), (0, 0));
+        // pos가 viewport 안: abs col=10, abs row=4 → local (2, 5).
+        let p2 = PhysicalPosition::new(80.0, 64.0);
+        assert_eq!(clamp_pos_to_viewport_cell(p2, v, cm(8, 16)), (2, 5));
+    }
+
+    #[test]
+    fn clamp_pos_handles_zero_cell_metrics_safely() {
+        let p = PhysicalPosition::new(40.0, 40.0);
+        let v = vp(10, 5, 0, 0);
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(0, 16)), (0, 0));
+        assert_eq!(clamp_pos_to_viewport_cell(p, v, cm(8, 0)), (0, 0));
     }
 
     #[test]
