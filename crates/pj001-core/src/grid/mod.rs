@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
 
-use crate::block::{AbandonReason, BlockBoundary, BlockState, BlockStream, RowBlockTag};
+use crate::block::{
+    AbandonReason, BlockBoundary, BlockState, BlockStream, RowBlockTag, VisibleBlock,
+};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -749,6 +751,54 @@ impl Term {
     #[allow(dead_code)]
     pub(crate) fn blocks(&self) -> &BlockStream {
         &self.blocks
+    }
+
+    /// Phase 4b-2: visible row range(viewport 안)에 걸치는 Block들을 visible row 좌표로 반환.
+    /// abs row → visible row 변환은 `oldest_kept_abs`/`scrollback.len()`/`view_offset` 기반.
+    /// 결과 row는 0..viewport_rows-1 범위 inclusive로 clip.
+    /// 4b-2-render에서 카드 bg overlay에 사용.
+    #[allow(dead_code)]
+    pub(crate) fn visible_blocks(&self, viewport_rows: usize) -> Vec<VisibleBlock> {
+        if viewport_rows == 0 || self.use_alt {
+            return Vec::new();
+        }
+        let main_rows = self.main.rows as u64;
+        let sb_len = self.scrollback.len() as u64;
+        let view = self.view_offset as u64;
+        // visible row 0의 abs row 좌표.
+        // (view_offset=0이면 main row 0; view_offset>0이면 scrollback 일부 보임)
+        let top_abs = self
+            .oldest_kept_abs
+            .saturating_add(sb_len)
+            .saturating_add(0)
+            .saturating_sub(view);
+        let bottom_abs = top_abs.saturating_add(main_rows).saturating_sub(1);
+        let mut out = Vec::new();
+        for block in self.blocks.iter() {
+            // 각 block의 abs span [prompt_start_abs, output_end_abs.unwrap_or(prompt_start_abs)].
+            // output 미완료 block은 마지막 abs row까지(main 끝)로 spanning.
+            let block_top = block.prompt_start_abs;
+            let block_bottom = block
+                .output_end_abs
+                .or(block.output_start_abs)
+                .or(block.command_start_abs)
+                .unwrap_or(block.prompt_start_abs);
+            // viewport와 겹치는 부분.
+            if block_bottom < top_abs || block_top > bottom_abs {
+                continue;
+            }
+            let clip_top = block_top.max(top_abs);
+            let clip_bottom = block_bottom.min(bottom_abs);
+            let visible_top = (clip_top - top_abs) as usize;
+            let visible_bottom = (clip_bottom - top_abs) as usize;
+            out.push(VisibleBlock {
+                id: block.id,
+                state: block.state.clone(),
+                visible_row_start: visible_top,
+                visible_row_end: visible_bottom,
+            });
+        }
+        out
     }
     pub fn last_prompt_row(&self) -> Option<u64> {
         self.last_prompt_row
@@ -2598,6 +2648,76 @@ mod tests {
         // 다른 row는 비어있음.
         assert!(term.main_row_block_tags(0).is_empty());
         assert!(term.main_row_block_tags(1).is_empty());
+    }
+
+    // === Phase 4b-2 — visible_blocks helper (row range 변환) ===
+
+    #[test]
+    fn visible_blocks_returns_empty_when_no_blocks() {
+        let term = Term::new(20, 5);
+        let v = term.visible_blocks(5);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn visible_blocks_returns_empty_in_alt_screen() {
+        let mut term = Term::new(20, 5);
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        term.switch_alt_screen(true);
+        let v = term.visible_blocks(5);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn visible_blocks_maps_single_block_to_viewport_row() {
+        // row 1에 prompt + B + C(같은 row). output_end 없음 → main 끝까지.
+        let mut term = Term::new(20, 5);
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        let v = term.visible_blocks(5);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].visible_row_start, 1);
+        // output_end 없으면 prompt_start_abs까지만 → row 1 그 자체.
+        assert_eq!(v[0].visible_row_end, 1);
+    }
+
+    #[test]
+    fn visible_blocks_spans_command_to_output_end() {
+        let mut term = Term::new(20, 5);
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        term.set_cursor(2, 0);
+        term.semantic_command_start();
+        term.set_cursor(2, 5);
+        term.semantic_output_start();
+        term.set_cursor(3, 0);
+        term.semantic_command_end(Some(0));
+        let v = term.visible_blocks(5);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].visible_row_start, 1);
+        assert_eq!(v[0].visible_row_end, 3);
+    }
+
+    #[test]
+    fn visible_blocks_clips_to_viewport_top_when_scrolled() {
+        // prompt row 0 + 데이터 후 scrollback view → block은 scrollback에 일부 들어감.
+        let mut term = Term::new(20, 3);
+        term.set_cursor(0, 0);
+        term.semantic_prompt_start();
+        // 2번 newline → row 0 scrollback으로 push.
+        term.set_cursor(2, 0);
+        term.newline();
+        term.set_cursor(2, 0);
+        term.newline();
+        // scrollback view 0 (bottom) → block.prompt_start_abs=0가 viewport 위로 사라짐.
+        // top_abs = oldest_kept_abs + sb_len = 0 + 2 = 2. block.prompt_start_abs=0이라 viewport 아래로 미만.
+        let v = term.visible_blocks(3);
+        assert!(v.is_empty());
+        // view를 위로 올려서 prompt row 다시 visible.
+        term.scroll_view_by(2);
+        let v = term.visible_blocks(3);
+        assert!(!v.is_empty());
     }
 
     #[test]
