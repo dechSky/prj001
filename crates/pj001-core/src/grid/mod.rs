@@ -271,6 +271,9 @@ pub(crate) struct RewrapResult {
     pub cursor_global_row: usize,
     /// 새 시퀀스 내 cursor의 col (eager wrap pending 시 cells.len()과 같을 수 있음).
     pub cursor_new_col: usize,
+    /// Phase 4a Step 5: new_rows와 parallel. len == new_rows.len(). 보통 빈 Vec.
+    /// rewrap_lines가 tag 인자를 받으면 logical_offset 기반으로 매핑하여 채움.
+    pub new_row_tags: Vec<Vec<RowBlockTag>>,
 }
 
 /// logical line 안에서 cursor offset → (relative row, col) 매핑.
@@ -293,8 +296,23 @@ fn map_cursor_in_line(line_rows: &[(Vec<Cell>, RowFlags)], offset: usize) -> (us
 
 /// M17 reflow 핵심 알고리즘. logical line 단위로 분할 → re-wrap.
 /// 외부 의존 없음 — 헤드리스 unit test 가능.
+///
+/// Phase 4a Step 5a: thin wrapper. tag 인자 없이 기존 호출 방식 유지 — 기존 테스트 보존.
 pub(crate) fn rewrap_lines(
     rows: &[(Vec<Cell>, RowFlags)],
+    cursor_row: usize,
+    cursor_col: usize,
+    new_cols: usize,
+) -> RewrapResult {
+    rewrap_lines_with_tags(rows, &[], cursor_row, cursor_col, new_cols)
+}
+
+/// `rewrap_lines`의 tag-aware 변형. `tags`는 `rows`와 parallel slice (len 동일 또는 0).
+/// 빈 slice면 tag 처리 skip — 결과의 `new_row_tags`는 빈 Vec들로 채워짐.
+/// Phase 4a Step 5b에서 logical_offset carry 로직 추가.
+pub(crate) fn rewrap_lines_with_tags(
+    rows: &[(Vec<Cell>, RowFlags)],
+    tags: &[Vec<RowBlockTag>],
     cursor_row: usize,
     cursor_col: usize,
     new_cols: usize,
@@ -303,7 +321,11 @@ pub(crate) fn rewrap_lines(
         new_rows: Vec::new(),
         cursor_global_row: 0,
         cursor_new_col: 0,
+        new_row_tags: Vec::new(),
     };
+    // tags len 검증: 0 또는 rows.len()과 일치해야 한다. mismatch면 ignore (safety).
+    let use_tags = !tags.is_empty() && tags.len() == rows.len();
+    let _ = use_tags; // Step 5b에서 활용.
     if rows.is_empty() || new_cols == 0 {
         return result;
     }
@@ -401,6 +423,8 @@ pub(crate) fn rewrap_lines(
         i = end + 1;
     }
 
+    // Phase 4a: new_row_tags를 new_rows와 같은 길이로 빈 Vec 채움. 실제 tag carry는 Step 5b.
+    result.new_row_tags = vec![Vec::new(); result.new_rows.len()];
     result
 }
 
