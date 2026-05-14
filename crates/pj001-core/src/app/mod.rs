@@ -882,7 +882,10 @@ struct AppState {
     renderer: Renderer,
     hooks: Hooks,
     last_ime_cursor: Option<(usize, usize)>,
-    preedit: Option<String>,
+    /// 활성 IME composition 상태. 첫 non-empty Ime::Preedit 시점에 anchor(현재 term cursor)
+    /// 와 함께 생성. 이후 Preedit update는 text만 갱신해 PTY repaint로 term cursor가
+    /// 움직여도 preedit overlay/IME popup 위치 안정.
+    preedit: Option<PreeditState>,
     cursor_visible: bool,
     last_blink: Instant,
     focused: bool,
@@ -931,6 +934,18 @@ struct MouseSelection {
     /// release 시 false면 단순 click → selection=None. true면 single cell이어도 유지.
     /// 한 글자 선택(drag로 옆 cell 다녀와서 release)을 지원하기 위해 사용.
     dragged_off_anchor: bool,
+}
+
+/// 활성 IME composition. winit `Ime::Preedit`이 도착하면 첫 non-empty에서 생성.
+/// anchor는 그 시점 term cursor — 이후 PTY repaint로 cursor가 움직여도 anchor 유지.
+/// `cursor_byte`는 winit이 전달하는 UTF-8 byte caret 위치 (`Preedit(text, Some(start, end))`).
+/// None이면 caret 위치 미정 — preedit 끝으로 fallback.
+#[derive(Clone, Debug)]
+struct PreeditState {
+    text: String,
+    anchor_row: usize,
+    anchor_col: usize,
+    cursor_byte: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1267,9 +1282,36 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime) => {
                 use winit::event::Ime;
                 match ime {
-                    Ime::Preedit(s, _range) => {
-                        log::debug!("ime: Preedit({:?})", s);
-                        state.preedit = if s.is_empty() { None } else { Some(s) };
+                    Ime::Preedit(s, range) => {
+                        log::debug!("ime: Preedit({:?}, {:?})", s, range);
+                        if s.is_empty() {
+                            state.preedit = None;
+                        } else {
+                            let cursor_byte = range.map(|(_start, end)| end);
+                            // anchor는 첫 non-empty Preedit에서만 capture. 이후 update는 text/caret만.
+                            match state.preedit.as_mut() {
+                                Some(p) => {
+                                    p.text = s;
+                                    p.cursor_byte = cursor_byte;
+                                }
+                                None => {
+                                    let (anchor_row, anchor_col) = {
+                                        let idx = state.active_index();
+                                        let session = state.session_for_pane_idx(idx);
+                                        match session.term.lock() {
+                                            Ok(term) => (term.cursor().row, term.cursor().col),
+                                            Err(_) => (0, 0),
+                                        }
+                                    };
+                                    state.preedit = Some(PreeditState {
+                                        text: s,
+                                        anchor_row,
+                                        anchor_col,
+                                        cursor_byte,
+                                    });
+                                }
+                            }
+                        }
                         state.window.request_redraw();
                     }
                     Ime::Commit(s) => {
@@ -3556,19 +3598,30 @@ impl AppState {
                     }
                 }
                 let in_scrollback = term.view_offset() > 0;
+                // preedit anchor: composition 시작 시점의 term cursor를 그대로 유지.
+                // PTY repaint로 term cursor가 움직여도 preedit overlay와 IME caret은 흔들리지 않음.
                 let preedit_arg = if is_active {
-                    self.preedit.as_deref().map(|s| (s, cur.col, cur.row))
+                    self.preedit
+                        .as_ref()
+                        .map(|p| (p.text.as_str(), p.anchor_col, p.anchor_row, p.cursor_byte))
                 } else {
                     None
                 };
                 let cursor_render =
                     if is_active && cur.visible && self.cursor_visible && !in_scrollback {
-                        let (row, col) = if let Some((preedit_str, col, row)) = preedit_arg {
-                            let mut c = col;
-                            for ch in preedit_str.chars() {
+                        let (row, col) = if let Some((preedit_str, anchor_col, anchor_row, cursor_byte)) =
+                            preedit_arg
+                        {
+                            // caret 위치 = anchor + (cursor_byte까지의 width). cursor_byte 없으면 끝.
+                            let caret_byte = cursor_byte.unwrap_or(preedit_str.len()).min(preedit_str.len());
+                            let mut c = anchor_col;
+                            for (b, ch) in preedit_str.char_indices() {
+                                if b >= caret_byte {
+                                    break;
+                                }
                                 c += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
                             }
-                            (row, c.min(term.cols().saturating_sub(1)))
+                            (anchor_row, c.min(term.cols().saturating_sub(1)))
                         } else {
                             (cur.row, cur.col)
                         };
@@ -3581,7 +3634,12 @@ impl AppState {
                     } else {
                         None
                     };
-                let preedit_for_render = if in_scrollback { None } else { preedit_arg };
+                // renderer는 기존 시그니처 (text, col, row) 받음 — anchor를 그대로 전달.
+                let preedit_for_render = if in_scrollback {
+                    None
+                } else {
+                    preedit_arg.map(|(s, col, row, _)| (s, col, row))
+                };
                 let selection = self.selection.as_ref().and_then(|selection| {
                     if selection.pane != pane_id {
                         return None;
@@ -3603,16 +3661,35 @@ impl AppState {
                     pane_col_offset,
                     pane_row_offset,
                 );
-                // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
-                if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
-                    let cell = self.renderer.cell_metrics();
-                    let pos = winit::dpi::PhysicalPosition::<f64>::new(
-                        ((cur.col + pane_col_offset) as u32 * cell.width) as f64,
-                        ((cur.row + pane_row_offset) as u32 * cell.height) as f64,
-                    );
-                    let size = winit::dpi::PhysicalSize::<u32>::new(cell.width, cell.height);
-                    self.window.set_ime_cursor_area(pos, size);
-                    self.last_ime_cursor = Some((cur.row, cur.col));
+                // M6-3b: active pane 기준 IME composition window 위치 갱신.
+                // preedit composition 중에는 anchor + caret을 기준으로 (PTY repaint 흔들림 회피).
+                // preedit 없으면 기존대로 term cursor.
+                if is_active && !in_scrollback {
+                    let (ime_row, ime_col) = if let Some((p_text, anchor_col, anchor_row, cursor_byte)) =
+                        preedit_arg
+                    {
+                        let caret_byte = cursor_byte.unwrap_or(p_text.len()).min(p_text.len());
+                        let mut c = anchor_col;
+                        for (b, ch) in p_text.char_indices() {
+                            if b >= caret_byte {
+                                break;
+                            }
+                            c += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        }
+                        (anchor_row, c.min(term.cols().saturating_sub(1)))
+                    } else {
+                        (cur.row, cur.col)
+                    };
+                    if self.last_ime_cursor != Some((ime_row, ime_col)) {
+                        let cell = self.renderer.cell_metrics();
+                        let pos = winit::dpi::PhysicalPosition::<f64>::new(
+                            ((ime_col + pane_col_offset) as u32 * cell.width) as f64,
+                            ((ime_row + pane_row_offset) as u32 * cell.height) as f64,
+                        );
+                        let size = winit::dpi::PhysicalSize::<u32>::new(cell.width, cell.height);
+                        self.window.set_ime_cursor_area(pos, size);
+                        self.last_ime_cursor = Some((ime_row, ime_col));
+                    }
                 }
             }
         }
