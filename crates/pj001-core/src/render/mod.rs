@@ -22,6 +22,8 @@ struct Uniforms {
     viewport: [f32; 2],
     cell: [f32; 2],
     fg: [f32; 4],
+    /// Phase 4b-2c-4b: SDF block card corner의 외부 영역(palette.bg = clear color) 처리.
+    palette_bg: [f32; 4],
 }
 
 pub struct Renderer {
@@ -64,6 +66,7 @@ impl Renderer {
             viewport,
             cell: [cell.width as f32, cell.height as f32],
             fg: palette.fg,
+            palette_bg: palette.bg,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -318,6 +321,7 @@ impl Renderer {
             viewport,
             cell: [self.cell.width as f32, self.cell.height as f32],
             fg: [0.86, 0.86, 0.86, 1.0],
+            palette_bg: self.palette.bg,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
