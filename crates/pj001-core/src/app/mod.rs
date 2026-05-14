@@ -967,6 +967,28 @@ fn scrollbar_thumb(
     Some((top_offset, thumb_size))
 }
 
+/// modifier-only key 판정 — Cmd/Shift/Ctrl/Alt/Super/Meta/Fn 단독 press는 PTY로 안 보내고
+/// type-to-snap도 안 발동해야 함 (Derek 보고). winit NamedKey 매칭.
+fn is_modifier_only_key(key: &winit::keyboard::Key) -> bool {
+    use winit::keyboard::{Key, NamedKey};
+    matches!(
+        key,
+        Key::Named(NamedKey::Control)
+            | Key::Named(NamedKey::Shift)
+            | Key::Named(NamedKey::Alt)
+            | Key::Named(NamedKey::Super)
+            | Key::Named(NamedKey::Meta)
+            | Key::Named(NamedKey::Hyper)
+            | Key::Named(NamedKey::Fn)
+            | Key::Named(NamedKey::FnLock)
+            | Key::Named(NamedKey::CapsLock)
+            | Key::Named(NamedKey::NumLock)
+            | Key::Named(NamedKey::ScrollLock)
+            | Key::Named(NamedKey::Symbol)
+            | Key::Named(NamedKey::SymbolLock)
+    )
+}
+
 /// Phase 4c: BlockState + duration_ms → status badge text. None이면 badge 안 그림.
 fn status_badge_text(state: &BlockState, duration_ms: Option<u64>) -> Option<String> {
     match state {
@@ -1769,7 +1791,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
-                if event.state == ElementState::Pressed {
+                // 단, Cmd/Shift/Ctrl/Alt/Fn 같은 modifier 단독 press는 PTY로 보낼 키 입력이
+                // 아니므로 snap 안 함 (Derek 보고: scroll 올린 뒤 Cmd 누르면 맨 아래 내려가는 버그).
+                if event.state == ElementState::Pressed && !is_modifier_only_key(&event.logical_key)
+                {
                     let idx = state.active_index();
                     if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
                         if term.view_offset() > 0 {
@@ -4330,6 +4355,28 @@ mod tests {
         assert_eq!(viewport.row_offset, 1);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.y_px, 20);
+    }
+
+    #[test]
+    fn is_modifier_only_recognizes_modifier_keys() {
+        use winit::keyboard::{Key, NamedKey};
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Control)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Shift)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Alt)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Super)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Meta)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::Fn)));
+        assert!(is_modifier_only_key(&Key::Named(NamedKey::CapsLock)));
+    }
+
+    #[test]
+    fn is_modifier_only_rejects_normal_keys() {
+        use winit::keyboard::{Key, NamedKey, SmolStr};
+        assert!(!is_modifier_only_key(&Key::Character(SmolStr::new("a"))));
+        assert!(!is_modifier_only_key(&Key::Named(NamedKey::Enter)));
+        assert!(!is_modifier_only_key(&Key::Named(NamedKey::ArrowUp)));
+        assert!(!is_modifier_only_key(&Key::Named(NamedKey::PageDown)));
+        assert!(!is_modifier_only_key(&Key::Named(NamedKey::Escape)));
     }
 
     #[test]
