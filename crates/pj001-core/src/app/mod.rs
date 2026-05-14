@@ -1074,6 +1074,9 @@ struct MouseSelection {
     anchor: (usize, usize),
     head: (usize, usize),
     dragging: bool,
+    /// 빈 cell에서 drag 시작한 경우 line whole 모드 — drag 이동 시 head를 row 단위로 line 전체.
+    /// 글자 cell에서 시작은 기존 char-level (line_drag=false).
+    line_drag: bool,
 }
 
 /// Phase 5: viewport-local caret → abs caret. abs_row = top_visible_abs + viewport_row.
@@ -2453,11 +2456,21 @@ impl AppState {
                 head_col,
                 query,
             );
+            // Phase 5: selection abs row 의미 통일. find가 view_offset 조정 후라 top_visible_abs +
+            // visible_row가 정확한 abs caret row.
+            let top_abs = self
+                .sessions
+                .get(&self.active_tab().panes[idx].session)
+                .and_then(|s| s.term.lock().ok())
+                .map(|t| t.top_visible_abs() as usize)
+                .unwrap_or(0);
+            let abs_row = top_abs + visible_row;
             self.selection = Some(MouseSelection {
                 pane: pane_id,
-                anchor: (visible_row, col_start),
-                head: (visible_row, head_col),
+                anchor: (abs_row, col_start),
+                head: (abs_row, head_col),
                 dragging: false,
+                line_drag: false,
             });
             if let Some(find) = self.pending_find.as_mut() {
                 find.last_match_abs = Some((abs, col_start));
@@ -3253,13 +3266,33 @@ impl AppState {
                 .map(|t| caret_to_abs(&t, new_head_viewport))
                 .unwrap_or(new_head_viewport)
         };
+        let viewport_cols = viewport.cols;
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        if selection.head == new_head_abs {
+        // line_drag 모드: head를 line whole로 — drag head row >= anchor row이면 head=(row, cols),
+        // 아니면 head=(row, 0). anchor도 line 시작에 정렬 (line_drag start_selection_at에서 이미
+        // anchor=(row, 0) 또는 (row, cols)로 시작).
+        let target_head = if selection.line_drag {
+            let head_row = new_head_abs.0;
+            let anchor_row = selection.anchor.0;
+            // anchor를 line의 적절 끝으로 재정렬 (drag 방향 따라).
+            if head_row >= anchor_row {
+                // 정방향 drag — anchor=(anchor_row, 0), head=(head_row, cols).
+                selection.anchor = (anchor_row, 0);
+                (head_row, viewport_cols)
+            } else {
+                // 역방향 drag (위로) — anchor=(anchor_row, cols), head=(head_row, 0).
+                selection.anchor = (anchor_row, viewport_cols);
+                (head_row, 0)
+            }
+        } else {
+            new_head_abs
+        };
+        if selection.head == target_head {
             return false;
         }
-        selection.head = new_head_abs;
+        selection.head = target_head;
         true
     }
 
@@ -3382,20 +3415,25 @@ impl AppState {
     fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize), caret: (usize, usize)) {
         let click_count = self.next_click_count(pane, cell);
         // Phase 5: cell/caret은 viewport-local. abs row로 변환해 anchor/head 저장.
+        // 또한 click cell이 빈 cell이면 line whole drag mode 활성.
         let session_id = self
             .active_tab()
             .panes
             .iter()
             .find(|p| p.id == pane)
             .map(|p| p.session);
-        let abs_caret = if let Some(sid) = session_id {
+        let (abs_caret, is_empty_cell, viewport_cols) = if let Some(sid) = session_id {
             if let Some(term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok()) {
-                caret_to_abs(&term, caret)
+                let abs = caret_to_abs(&term, caret);
+                let empty = cell.0 < term.rows()
+                    && cell.1 < term.cols()
+                    && term.cell(cell.0, cell.1).ch == ' ';
+                (abs, empty, term.cols())
             } else {
-                caret
+                (caret, false, 0)
             }
         } else {
-            caret
+            (caret, false, 0)
         };
         let range = match click_count {
             2 => self.word_selection_at(pane, cell),
@@ -3408,13 +3446,19 @@ impl AppState {
                 anchor: range.start,
                 head: range.end,
                 dragging: false,
+                line_drag: false,
             })
         } else {
+            // 빈 cell이면 line_drag=true 표시만. anchor=head=abs_caret으로 시작해서 단순 click
+            // 후 release면 selection 없음 (anchor==head 자연 처리). drag로 head 움직이면
+            // update_selection_to_mouse가 line whole로 확장.
+            let _ = viewport_cols;
             Some(MouseSelection {
                 pane,
                 anchor: abs_caret,
                 head: abs_caret,
                 dragging: true,
+                line_drag: is_empty_cell,
             })
         };
     }
