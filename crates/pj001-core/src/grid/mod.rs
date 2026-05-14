@@ -1121,6 +1121,29 @@ impl Term {
             .saturating_sub(self.view_offset as u64)
     }
 
+    /// Phase 5: abs row 좌표로 cell 접근. main grid + scrollback 양쪽 검색.
+    /// abs_row가 evict됐거나 main 영역 뒤이면 None.
+    pub fn cell_at_abs(&self, abs_row: u64, col: usize) -> Option<Cell> {
+        if col >= self.main.cols {
+            return None;
+        }
+        let sb_len = self.scrollback.len() as u64;
+        let main_start_abs = self.oldest_kept_abs.saturating_add(sb_len);
+        if abs_row >= main_start_abs {
+            let main_row = abs_row.saturating_sub(main_start_abs) as usize;
+            if main_row >= self.main.rows {
+                return None;
+            }
+            Some(*self.main.cell(main_row, col))
+        } else if abs_row >= self.oldest_kept_abs {
+            let sb_idx = abs_row.saturating_sub(self.oldest_kept_abs) as usize;
+            let row = self.scrollback.get(sb_idx)?;
+            row.cells.get(col).copied()
+        } else {
+            None
+        }
+    }
+
     /// scrollback view 스크롤. delta > 0 = 위로, delta < 0 = 아래로.
     pub fn scroll_view_by(&mut self, delta: isize) {
         let max = self.scrollback.len();

@@ -631,6 +631,43 @@ fn quick_spawn_elapsed_timed_out(started_at: Instant, now: Instant) -> bool {
     now.duration_since(started_at) > Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS)
 }
 
+/// Phase 5: selection abs row 기반 text 추출. selection.start/end는 abs caret 좌표.
+/// scrollback row + main row 양쪽 cell_at_abs로 접근. evict된 abs는 skip.
+fn selection_text_abs(term: &Term, selection: SelectionRange) -> String {
+    let mut lines = Vec::new();
+    let start_row = selection.start.0;
+    let end_row = selection.end.0;
+    let cols = term.cols();
+    for abs_row in start_row..=end_row {
+        let start_col = if abs_row == start_row {
+            selection.start.1
+        } else {
+            0
+        };
+        let end_col = if abs_row == end_row {
+            selection.end.1
+        } else {
+            cols
+        };
+        let mut line = String::new();
+        let s = start_col.min(cols);
+        let e = end_col.min(cols);
+        for col in s..e {
+            let Some(cell) = term.cell_at_abs(abs_row as u64, col) else {
+                continue;
+            };
+            if cell.attrs.contains(crate::grid::Attrs::WIDE_CONT) {
+                continue;
+            }
+            line.push(cell.ch);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// Phase 5 이전 viewport-local selection text — test에서만 사용 (selection_text_abs로 전환).
+#[cfg(test)]
 fn selection_text(term: &Term, selection: SelectionRange) -> String {
     // caret 모델: selection.start/end는 caret 좌표. cell col iterate은 half-open
     // [start.col, end.col)에서. middle row는 0..cols.
@@ -3640,11 +3677,9 @@ impl AppState {
         };
         let text = match session.term.lock() {
             Ok(term) => {
-                // Phase 5: abs → viewport caret 변환 후 selection_text. viewport 밖 부분은
-                // clip되어 viewport 안 텍스트만 추출 (scrollback 텍스트 복사는 후속 작업).
-                let anchor_vp = abs_to_viewport_caret(&term, selection.anchor);
-                let head_vp = abs_to_viewport_caret(&term, selection.head);
-                selection_text(&term, SelectionRange::new(anchor_vp, head_vp))
+                // Phase 5 후속: selection.anchor/head는 abs caret. selection_text_abs가
+                // scrollback row + main row 양쪽 cell_at_abs로 접근 → viewport 밖 row도 추출.
+                selection_text_abs(&term, SelectionRange::new(selection.anchor, selection.head))
             }
             Err(e) => {
                 log::warn!("copy ignored: term lock failed: {e}");
@@ -4640,6 +4675,65 @@ mod tests {
             started_at,
             started_at + Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS + 1),
         ));
+    }
+
+    #[test]
+    fn selection_text_abs_extracts_scrollback_row() {
+        // Phase 5 후속: scrollback으로 밀린 row의 text도 abs row로 추출 가능.
+        let mut term = Term::new(10, 2);
+        for ch in "abc".chars() {
+            term.print(ch);
+        }
+        term.set_cursor(1, 0);
+        for ch in "def".chars() {
+            term.print(ch);
+        }
+        term.set_cursor(1, 3);
+        // newline → main row 0 "abc"가 scrollback으로 push, cursor row 1로 유지.
+        term.newline();
+
+        // abs row 0 = scrollback "abc", abs row 1 = main row 0 "def".
+        let range = SelectionRange::new((0, 0), (1, 3));
+        let text = selection_text_abs(&term, range);
+        assert_eq!(text, "abc\ndef");
+    }
+
+    #[test]
+    fn selection_text_abs_returns_empty_for_evicted_rows() {
+        // evict된 abs (oldest_kept_abs 미만)는 cell_at_abs가 None → 빈 line.
+        let mut term = Term::new(5, 1);
+        for ch in "x".chars() {
+            term.print(ch);
+        }
+        // abs row 100은 존재 안 함 (way past main).
+        let range = SelectionRange::new((100, 0), (100, 3));
+        let text = selection_text_abs(&term, range);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn cell_at_abs_scrollback_and_main() {
+        let mut term = Term::new(5, 2);
+        for ch in "ab".chars() {
+            term.print(ch);
+        }
+        term.set_cursor(1, 0);
+        for ch in "cd".chars() {
+            term.print(ch);
+        }
+        term.set_cursor(1, 2);
+        term.newline(); // "ab" → scrollback. main row 0 = "cd", row 1 = "".
+
+        // abs 0 = scrollback "ab".
+        assert_eq!(term.cell_at_abs(0, 0).map(|c| c.ch), Some('a'));
+        assert_eq!(term.cell_at_abs(0, 1).map(|c| c.ch), Some('b'));
+        // abs 1 = main row 0 "cd".
+        assert_eq!(term.cell_at_abs(1, 0).map(|c| c.ch), Some('c'));
+        assert_eq!(term.cell_at_abs(1, 1).map(|c| c.ch), Some('d'));
+        // abs 2 = main row 1 (empty).
+        assert_eq!(term.cell_at_abs(2, 0).map(|c| c.ch), Some(' '));
+        // abs 100 = 없음.
+        assert!(term.cell_at_abs(100, 0).is_none());
     }
 
     #[test]
