@@ -927,6 +927,10 @@ struct MouseSelection {
     anchor: (usize, usize),
     head: (usize, usize),
     dragging: bool,
+    /// drag 중 cell이 anchor와 한 번이라도 달라졌는지 여부.
+    /// release 시 false면 단순 click → selection=None. true면 single cell이어도 유지.
+    /// 한 글자 선택(drag로 옆 cell 다녀와서 release)을 지원하기 위해 사용.
+    dragged_off_anchor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2276,6 +2280,7 @@ impl AppState {
                 anchor: (visible_row, col_start),
                 head: (visible_row, head_col),
                 dragging: false,
+                dragged_off_anchor: false,
             });
             if let Some(find) = self.pending_find.as_mut() {
                 find.last_match_abs = Some((abs, col_start));
@@ -3032,6 +3037,11 @@ impl AppState {
             return false;
         }
         selection.head = new_head;
+        // 한 글자 선택 지원: drag로 anchor 외 cell을 한 번이라도 방문하면 latch.
+        // release 시 head가 anchor로 돌아와도 single cell selection 유지.
+        if selection.head != selection.anchor {
+            selection.dragged_off_anchor = true;
+        }
         true
     }
 
@@ -3162,6 +3172,7 @@ impl AppState {
                 anchor: range.start,
                 head: range.end,
                 dragging: false,
+                dragged_off_anchor: false,
             })
         } else {
             Some(MouseSelection {
@@ -3169,6 +3180,7 @@ impl AppState {
                 anchor: cell,
                 head: cell,
                 dragging: true,
+                dragged_off_anchor: false,
             })
         };
     }
@@ -3222,8 +3234,11 @@ impl AppState {
             return;
         };
         let was_dragging = selection.dragging;
+        let dragged_off = selection.dragged_off_anchor;
         selection.dragging = false;
-        if was_dragging && selection.anchor == selection.head {
+        // 단순 클릭(drag 없음)이면 selection 비움. drag로 anchor 밖에 한 번이라도 갔다면
+        // 결과적으로 head==anchor여도 single-cell selection 유지 (한 글자 선택).
+        if was_dragging && selection.anchor == selection.head && !dragged_off {
             self.selection = None;
         }
         self.window.request_redraw();
@@ -3568,14 +3583,16 @@ impl AppState {
                     };
                 let preedit_for_render = if in_scrollback { None } else { preedit_arg };
                 let selection = self.selection.as_ref().and_then(|selection| {
-                    // 싱글클릭은 anchor==head로 시작 → render 1 cell highlight가 release에
-                    // 사라져 "선택됐다 풀림" 깜빡임 발생. drag로 head가 anchor와 달라진
-                    // 시점부터 visual selection 노출.
-                    if selection.pane == pane_id && selection.anchor != selection.head {
-                        Some(SelectionRange::new(selection.anchor, selection.head))
-                    } else {
-                        None
+                    if selection.pane != pane_id {
+                        return None;
                     }
+                    // drag 중일 때만 single-cell highlight 숨김 (싱글클릭 깜빡임 방지).
+                    // dragging=false면 word/line/find/한-글자-drag 모두 의도된 selection이라
+                    // single cell이어도 그대로 노출.
+                    if selection.dragging && selection.anchor == selection.head {
+                        return None;
+                    }
+                    Some(SelectionRange::new(selection.anchor, selection.head))
                 });
                 self.renderer.append_term(
                     &self.queue,
