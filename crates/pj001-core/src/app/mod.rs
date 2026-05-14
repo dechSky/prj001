@@ -2961,6 +2961,8 @@ impl AppState {
     }
 
     fn update_mouse_cursor(&self) {
+        // 우선순위: divider drag/hover(↔ ↕) > pane 영역(I-beam) > 그 외(Default).
+        // pane 영역은 status row 포함 — 터미널 위면 어디든 텍스트 편집 가능 인상 주기 위해.
         let hit = self
             .dragging_divider
             .as_ref()
@@ -2969,7 +2971,13 @@ impl AppState {
         let icon = match hit.map(|hit| hit.axis()) {
             Some(SplitAxis::Vertical) => CursorIcon::ColResize,
             Some(SplitAxis::Horizontal) => CursorIcon::RowResize,
-            None => CursorIcon::Default,
+            None => {
+                if self.pane_at_mouse(true).is_some() {
+                    CursorIcon::Text
+                } else {
+                    CursorIcon::Default
+                }
+            }
         };
         self.window.set_cursor(icon);
     }

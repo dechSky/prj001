@@ -220,7 +220,8 @@ impl<'a> Perform for TermPerform<'a> {
                     Some(b'B') => self.term.semantic_command_start(),
                     Some(b'C') => self.term.semantic_output_start(),
                     Some(b'D') => {
-                        let exit = params.get(2)
+                        let exit = params
+                            .get(2)
                             .and_then(|s| std::str::from_utf8(s).ok())
                             .and_then(|s| s.parse::<i32>().ok());
                         self.term.semantic_command_end(exit);
@@ -409,8 +410,9 @@ mod tests {
     #[test]
     fn decscusr_sets_shape_and_blinking() {
         let mut term = Term::new(80, 24);
-        // 기본값 검증
-        assert_eq!(term.cursor().shape, CursorShape::Block);
+        // 기본값 검증 — Term 초기 default는 Bar (글자 사이 표시). shell이 DECSCUSR로
+        // 명시하면 그에 따름. DECSCUSR 0/1 (default)은 xterm 표준대로 Block.
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
         assert!(term.cursor().blinking);
 
         // n=5: blink bar
@@ -793,7 +795,7 @@ mod tests {
         let mut term = Term::new(8, 1);
         run(&mut term, b"a");
         run(&mut term, b"\x1b(0");
-        run(&mut term, b"x");  // → │
+        run(&mut term, b"x"); // → │
         run(&mut term, b"\x1b(B");
         run(&mut term, b"x");
         assert_eq!(row_chars(&term, 0), "a│x     ");

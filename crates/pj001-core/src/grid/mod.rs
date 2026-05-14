@@ -85,8 +85,9 @@ pub enum CursorShape {
 }
 
 impl Default for CursorShape {
+    /// Bar (글자 사이 위치 표시). shell이 DECSCUSR로 명시적 shape 보내면 그대로 따름.
     fn default() -> Self {
-        CursorShape::Block
+        CursorShape::Bar
     }
 }
 
@@ -104,7 +105,7 @@ impl Default for Cursor {
         Self {
             row: 0,
             col: 0,
-            shape: CursorShape::Block,
+            shape: CursorShape::Bar,
             blinking: true,
             visible: true,
         }
@@ -226,38 +227,38 @@ const HYPERLINK_POOL_GC_THRESHOLD: usize = 1024;
 /// 출처: xterm ctlseqs "DEC Special Character and Line Drawing Set".
 fn dec_special_translate(ch: char) -> char {
     match ch {
-        '_' => ' ',      // 0x5f blank
-        '`' => '◆',      // diamond
-        'a' => '▒',      // checkerboard
-        'b' => '␉',      // HT
-        'c' => '␌',      // FF
-        'd' => '␍',      // CR
-        'e' => '␊',      // LF
-        'f' => '°',      // degree
-        'g' => '±',      // plus/minus
-        'h' => '␤',      // NL
-        'i' => '␋',      // VT
-        'j' => '┘',      // lower-right corner
-        'k' => '┐',      // upper-right corner
-        'l' => '┌',      // upper-left corner
-        'm' => '└',      // lower-left corner
-        'n' => '┼',      // crossing
-        'o' => '⎺',      // horizontal scan line 1
-        'p' => '⎻',      // horizontal scan line 3
-        'q' => '─',      // horizontal scan line 5 (middle)
-        'r' => '⎼',      // horizontal scan line 7
-        's' => '⎽',      // horizontal scan line 9
-        't' => '├',      // left T
-        'u' => '┤',      // right T
-        'v' => '┴',      // bottom T
-        'w' => '┬',      // top T
-        'x' => '│',      // vertical bar
-        'y' => '≤',      // less-or-equal
-        'z' => '≥',      // greater-or-equal
-        '{' => 'π',      // pi
-        '|' => '≠',      // not-equal
-        '}' => '£',      // sterling
-        '~' => '·',      // centered dot
+        '_' => ' ', // 0x5f blank
+        '`' => '◆', // diamond
+        'a' => '▒', // checkerboard
+        'b' => '␉', // HT
+        'c' => '␌', // FF
+        'd' => '␍', // CR
+        'e' => '␊', // LF
+        'f' => '°', // degree
+        'g' => '±', // plus/minus
+        'h' => '␤', // NL
+        'i' => '␋', // VT
+        'j' => '┘', // lower-right corner
+        'k' => '┐', // upper-right corner
+        'l' => '┌', // upper-left corner
+        'm' => '└', // lower-left corner
+        'n' => '┼', // crossing
+        'o' => '⎺', // horizontal scan line 1
+        'p' => '⎻', // horizontal scan line 3
+        'q' => '─', // horizontal scan line 5 (middle)
+        'r' => '⎼', // horizontal scan line 7
+        's' => '⎽', // horizontal scan line 9
+        't' => '├', // left T
+        'u' => '┤', // right T
+        'v' => '┴', // bottom T
+        'w' => '┬', // top T
+        'x' => '│', // vertical bar
+        'y' => '≤', // less-or-equal
+        'z' => '≥', // greater-or-equal
+        '{' => 'π', // pi
+        '|' => '≠', // not-equal
+        '}' => '£', // sterling
+        '~' => '·', // centered dot
         _ => ch,
     }
 }
@@ -875,10 +876,7 @@ impl Term {
             }
         }
         if self.active_hyperlink_id != 0 {
-            self.active_hyperlink_id = remap
-                .get(&self.active_hyperlink_id)
-                .copied()
-                .unwrap_or(0);
+            self.active_hyperlink_id = remap.get(&self.active_hyperlink_id).copied().unwrap_or(0);
         }
         self.hyperlink_pool = new_pool;
         log::debug!(
@@ -893,7 +891,9 @@ impl Term {
         if id == 0 {
             return None;
         }
-        self.hyperlink_pool.get((id - 1) as usize).map(|s| s.as_str())
+        self.hyperlink_pool
+            .get((id - 1) as usize)
+            .map(|s| s.as_str())
     }
 
     /// hyperlink pool 전체 클리어. 스크롤백 evict + 명시적 reset 시 호출.
@@ -1361,7 +1361,13 @@ impl Term {
         }
         let hyperlink_id = self.active_hyperlink_id;
         let g = self.grid_mut();
-        *g.cell_mut(row, col) = Cell { ch, fg, bg, attrs, hyperlink_id };
+        *g.cell_mut(row, col) = Cell {
+            ch,
+            fg,
+            bg,
+            attrs,
+            hyperlink_id,
+        };
         if w == 2 {
             *g.cell_mut(row, col + 1) = Cell {
                 ch: ' ',
@@ -1694,9 +1700,9 @@ impl Term {
         self.keypad_application = false;
         self.bracketed_paste = false;
         self.focus_reporting = false;
-        // cursor 가시성/모양은 default (block, blink, visible)
+        // cursor 가시성/모양은 default (bar, blink, visible).
         self.cursor.visible = true;
-        self.cursor.shape = CursorShape::Block;
+        self.cursor.shape = CursorShape::Bar;
         self.cursor.blinking = true;
         // scroll region full
         let rows = self.rows();
@@ -2606,8 +2612,7 @@ mod tests {
         // 단순 rows 변경은 reflow를 통과하지 않고 sb retention만 — 여기선 cols 변경.
         term.resize(4, 5);
         // 적어도 한 row에 tag가 carry되어야.
-        let total_main_tags: usize =
-            (0..5).map(|r| term.main_row_block_tags(r).len()).sum();
+        let total_main_tags: usize = (0..5).map(|r| term.main_row_block_tags(r).len()).sum();
         let total_sb_tags: usize = term
             .scrollback
             .iter()
@@ -2626,13 +2631,15 @@ mod tests {
         let prev_id = term.blocks().iter().next().unwrap().id;
         term.resize(10, 5);
         // Block은 살아있고, prompt_start_abs는 새 좌표.
-        let block = term.blocks().get(prev_id).expect("block must survive narrowing");
+        let block = term
+            .blocks()
+            .get(prev_id)
+            .expect("block must survive narrowing");
         // tag가 carry된 row가 어떤 abs인지 확인.
         let mut found = false;
         for r in 0..term.main.rows {
             if !term.main_row_block_tags(r).is_empty() {
-                let expected =
-                    term.oldest_kept_abs() + term.scrollback.len() as u64 + r as u64;
+                let expected = term.oldest_kept_abs() + term.scrollback.len() as u64 + r as u64;
                 assert_eq!(block.prompt_start_abs, expected);
                 found = true;
                 break;
