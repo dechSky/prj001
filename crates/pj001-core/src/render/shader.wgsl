@@ -181,6 +181,23 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             card_color = in.block_border_color;
         }
 
+        // Phase 4b-3: prompt marker — cell 중앙에 rounded square SDF.
+        if ((in.flags & 0x200u) != 0u) {
+            let cx = cell_w * 0.5;
+            let cy = cell_h * 0.5;
+            let marker_half = min(min(cell_w, cell_h) * 0.5 - 2.0, 8.0);
+            let marker_radius = max(2.0, marker_half * 0.3);
+            let dx = abs(in.cell_pixel.x - cx);
+            let dy = abs(in.cell_pixel.y - cy);
+            // rounded square SDF: max(|p|-half+r, 0) magnitude - r
+            let qx = max(dx - (marker_half - marker_radius), 0.0);
+            let qy = max(dy - (marker_half - marker_radius), 0.0);
+            let m_dist = sqrt(qx * qx + qy * qy) - marker_radius;
+            if (m_dist < 0.0) {
+                card_color = in.block_border_color;
+            }
+        }
+
         // glyph layer
         if (in.glyph_size.x > 0.0 && in.glyph_size.y > 0.0) {
             let rel = in.cell_pixel - in.glyph_offset;

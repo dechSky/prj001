@@ -47,6 +47,9 @@ pub const FLAG_BLOCK_EDGE_BOTTOM: u32 = 0x40;
 pub const FLAG_BLOCK_EDGE_LEFT: u32 = 0x80;
 #[allow(dead_code)]
 pub const FLAG_BLOCK_EDGE_RIGHT: u32 = 0x100;
+/// Phase 4b-3: prompt marker cell. BLOCK_CARD와 함께 set. shader가 cell 중앙에
+/// rounded square marker 그림. marker 색은 block_border_color 재활용.
+pub const FLAG_BLOCK_MARKER: u32 = 0x200;
 
 #[derive(Clone, Copy)]
 pub struct CursorRender {
@@ -222,16 +225,22 @@ pub fn build_instances_at(
     // Phase 4b-2c-3: gutter 영역에 카드 색 fill instance. gutter는 col_offset 좌측의
     // gutter_cells 폭. block overlay row range에 걸치는 row의 각 gutter cell에 대해
     // cell_info() → Some이면 fill push. Phase 4b-2c-4c: SDF flag 같이 stamp.
+    // Phase 4b-3: 각 카드의 첫 row + gutter 중앙 cell이 prompt marker. BLOCK_MARKER bit set.
     if gutter_cells > 0 && col_offset >= gutter_cells {
         let gutter_start_col = col_offset - gutter_cells;
+        let marker_col = gutter_cells / 2;
         for r in 0..term.rows() {
             for gc in 0..gutter_cells {
-                let info_opt = block_overlays
+                let owner_info = block_overlays
                     .iter()
-                    .find_map(|b| b.cell_info(r, gc, card_cols));
-                let Some(info) = info_opt else {
+                    .find_map(|b| b.cell_info(r, gc, card_cols).map(|info| (b, info)));
+                let Some((overlay, info)) = owner_info else {
                     continue;
                 };
+                let mut flags = FLAG_BLOCK_CARD | info.edge_mask;
+                if gc == marker_col && r == overlay.visible_row_start {
+                    flags |= FLAG_BLOCK_MARKER;
+                }
                 out.push(CellInstance {
                     cell_xy: [
                         (gutter_start_col + gc) as f32,
@@ -244,7 +253,7 @@ pub fn build_instances_at(
                     fg: [0.0; 4],
                     bg: info.bg,
                     cell_span: 1.0,
-                    flags: FLAG_BLOCK_CARD | info.edge_mask,
+                    flags,
                     block_border_color: info.border_color,
                     _pad: [0.0; 2],
                 });
