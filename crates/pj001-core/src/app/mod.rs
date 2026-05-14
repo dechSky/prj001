@@ -1841,6 +1841,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
                 // 단, Cmd/Shift/Ctrl/Alt/Fn 같은 modifier 단독 press는 PTY로 보낼 키 입력이
                 // 아니므로 snap 안 함 (Derek 보고: scroll 올린 뒤 Cmd 누르면 맨 아래 내려가는 버그).
+                // 또한 일반 키 input 시 selection 자동 해제 (macOS textfield 표준).
                 if event.state == ElementState::Pressed && !is_modifier_only_key(&event.logical_key)
                 {
                     let idx = state.active_index();
@@ -1849,6 +1850,10 @@ impl ApplicationHandler<UserEvent> for App {
                             term.snap_to_bottom();
                             state.window.request_redraw();
                         }
+                    }
+                    if state.selection.is_some() {
+                        state.selection = None;
+                        state.window.request_redraw();
                     }
                 }
                 // single lock snapshot (advisor 가이드).
@@ -3816,7 +3821,12 @@ impl AppState {
         if text.is_empty() {
             return;
         }
+        // Phase 5: paste 시 selection 해제 (Derek 보고: 긴 paste 후 selection이 viewport 안
+        // 잘못된 영역에 highlight). PTY echo로 화면 갱신되면 abs selection이 다른 row 가리킴.
+        // handle_dropped_file도 동일 패턴.
+        self.selection = None;
         self.write_text_to_active_pty(&text, "paste");
+        self.window.request_redraw();
     }
 
     fn handle_dropped_file(&mut self, path: &Path) {
