@@ -3119,6 +3119,10 @@ impl AppState {
                 continue;
             };
             if local_col < viewport.cols && local_row < viewport.rows {
+                // status row는 색 띠 chrome — selection/text hit 영역 아님.
+                if viewport.status_row == Some(row) {
+                    return None;
+                }
                 return Some((pane.id, (local_row, local_col)));
             }
         }
@@ -3189,19 +3193,24 @@ impl AppState {
     }
 
     fn update_mouse_cursor(&self) {
-        // 우선순위: divider drag/hover(↔ ↕) > pane content cell(I-beam) > 그 외(Default).
-        // content cell만 I-beam으로 — selection hit-test와 동일 영역. status row/tab bar는
-        // 텍스트 편집 영역이 아니라 I-beam 부적절.
+        // 우선순위: divider drag/hover(↔ ↕) > selection drag 중(I-beam 유지) > pane content
+        // cell(I-beam) > 그 외(Default). status row/tab bar는 텍스트 편집 영역이 아니라 I-beam
+        // 부적절 (pane_cell_at_mouse가 status row 제외).
         let hit = self
             .dragging_divider
             .as_ref()
             .cloned()
             .or_else(|| self.divider_hit_at_mouse());
+        let dragging_selection = self
+            .selection
+            .as_ref()
+            .map(|s| s.dragging)
+            .unwrap_or(false);
         let icon = match hit.map(|hit| hit.axis()) {
             Some(SplitAxis::Vertical) => CursorIcon::ColResize,
             Some(SplitAxis::Horizontal) => CursorIcon::RowResize,
             None => {
-                if self.pane_cell_at_mouse().is_some() {
+                if dragging_selection || self.pane_cell_at_mouse().is_some() {
                     CursorIcon::Text
                 } else {
                     CursorIcon::Default
