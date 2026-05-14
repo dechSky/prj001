@@ -965,6 +965,10 @@ struct AppState {
     preserve_grid_on_next_resize: bool,
     current_scale_factor: f64,
     quick_spawn_presets: Vec<QuickSpawnPreset>,
+    /// Phase 4b: Block UI 렌더 모드. Config에서 받음. block_visual_active() helper에서 사용.
+    /// 4b-1c (viewport gutter 발동)부터 실제 사용.
+    #[allow(dead_code)]
+    block_mode: BlockMode,
     pending_quick_spawn: Option<Instant>,
     /// 슬라이스 6.6b (Codex review B-1): 마우스 버튼 상태 비트마스크.
     /// bit 0 = Left, bit 1 = Middle, bit 2 = Right. selection.dragging은 reporting이
@@ -1900,6 +1904,18 @@ impl AppState {
             .iter()
             .position(|p| p.id == self.active_tab().active)
             .unwrap_or(0)
+    }
+
+    /// Phase 4b: 현재 시각적으로 Block UI를 켜야 하는지. block_mode=Auto && 어느 session이라도
+    /// block_capable=true. PoC v1은 전역 boolean — 다음 단계에서 pane별로 세분화 가능.
+    #[allow(dead_code)]
+    fn block_visual_active(&self) -> bool {
+        if self.block_mode != BlockMode::Auto {
+            return false;
+        }
+        self.sessions
+            .values()
+            .any(|s| s.term.lock().map(|t| t.block_capable()).unwrap_or(false))
     }
 
     fn pane_index_at_mouse(&self, include_status_row: bool) -> Option<usize> {
@@ -2928,6 +2944,7 @@ impl AppState {
             preserve_grid_on_next_resize: false,
             current_scale_factor,
             quick_spawn_presets: config.quick_spawn_presets.clone(),
+            block_mode: config.block_mode,
             pending_quick_spawn: None,
             ids,
             pending_find: None,
