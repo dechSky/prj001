@@ -908,17 +908,42 @@ fn compute_tab_viewports(
     root: &Layout,
     size: PhysicalSize<u32>,
     cell: crate::render::CellMetrics,
+    gutter_px: u32,
 ) -> HashMap<PaneId, PaneViewport> {
     let content_size = tab_content_size(size, cell);
     let mut layouts = layout::compute_viewports(root, content_size, cell);
+    let cell_w = cell.width.max(1);
+    let gutter_cells = gutter_px / cell_w;
+    let gutter_px_aligned = gutter_cells * cell_w;
     for viewport in layouts.values_mut() {
         viewport.row_offset += TAB_BAR_ROWS;
         viewport.status_row = viewport.status_row.map(|row| row + TAB_BAR_ROWS);
         viewport.y_px = viewport
             .y_px
             .saturating_add(cell.height * TAB_BAR_ROWS as u32);
+        // Phase 4b-1c: pane gutter 발동. cell.width 단위로 align.
+        if gutter_cells > 0 && (viewport.cols as u32) > gutter_cells {
+            viewport.cols -= gutter_cells as usize;
+            viewport.gutter_px = gutter_px_aligned.min(u16::MAX as u32) as u16;
+            viewport.content_x_px = viewport.x_px.saturating_add(gutter_px_aligned);
+            viewport.width_px = viewport.width_px.saturating_sub(gutter_px_aligned);
+        }
     }
     layouts
+}
+
+/// Phase 4b-1c gutter_px helper. block_visual=true이면 font_size+4를 cell.width 단위로 ceil.
+fn compute_block_gutter_px(
+    block_visual: bool,
+    cell: crate::render::CellMetrics,
+    font_size: f32,
+) -> u32 {
+    if !block_visual {
+        return 0;
+    }
+    let raw = (font_size + 4.0).max(0.0) as u32;
+    let cell_w = cell.width.max(1);
+    raw.div_ceil(cell_w) * cell_w
 }
 
 fn tab_content_size(
@@ -2109,7 +2134,12 @@ impl AppState {
 
     fn apply_layout_viewports_for_size(&mut self, size: PhysicalSize<u32>) {
         let root = self.active_tab().root.clone();
-        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
+        let gutter_px = compute_block_gutter_px(
+            self.block_visual_active(),
+            self.renderer.cell_metrics(),
+            self.logical_font_size,
+        );
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics(), gutter_px);
         let pane_count = self.active_tab().panes.len();
         for idx in 0..pane_count {
             let pane_id = self.active_tab().panes[idx].id;
@@ -2160,8 +2190,17 @@ impl AppState {
         if size.width > self.surface_config.width || size.height > self.surface_config.height {
             let _ = self.window.request_inner_size(size);
         }
-        let layouts =
-            compute_tab_viewports(&self.active_tab().root, size, self.renderer.cell_metrics());
+        let gutter_px = compute_block_gutter_px(
+            self.block_visual_active(),
+            self.renderer.cell_metrics(),
+            self.logical_font_size,
+        );
+        let layouts = compute_tab_viewports(
+            &self.active_tab().root,
+            size,
+            self.renderer.cell_metrics(),
+            gutter_px,
+        );
         let Some(viewport) = layouts.get(&new_pane).copied() else {
             log::warn!("split produced no viewport for new pane {}", new_pane.0);
             return Ok(());
@@ -2497,7 +2536,12 @@ impl AppState {
         let pane_id = self.ids.new_pane();
         let root = Layout::Pane(pane_id);
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
-        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
+        let gutter_px = compute_block_gutter_px(
+            self.block_visual_active(),
+            self.renderer.cell_metrics(),
+            self.logical_font_size,
+        );
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics(), gutter_px);
         let viewport = layouts[&pane_id];
         let previous_tab = self.active_tab;
         let previous_idx = self.active_index();
@@ -2844,7 +2888,8 @@ impl AppState {
             .map(|_| ids.new_pane())
             .collect::<Vec<_>>();
         let layout_root = Layout::from_initial_panes(&pane_ids);
-        let layouts = compute_tab_viewports(&layout_root, size, renderer.cell_metrics());
+        // AppState init 시점은 block_capable=false라 gutter 0.
+        let layouts = compute_tab_viewports(&layout_root, size, renderer.cell_metrics(), 0);
         log::info!(
             "startup spawn size={}x{} cell={}x{} panes={} layouts={:?}",
             size.width,
@@ -3514,7 +3559,12 @@ impl AppState {
         self.renderer
             .resize(&self.queue, [size.width as f32, size.height as f32]);
         let root = self.active_tab().root.clone();
-        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics());
+        let gutter_px = compute_block_gutter_px(
+            self.block_visual_active(),
+            self.renderer.cell_metrics(),
+            self.logical_font_size,
+        );
+        let layouts = compute_tab_viewports(&root, size, self.renderer.cell_metrics(), gutter_px);
         log::info!(
             "resize event size={}x{} cell={}x{} layouts={:?}",
             size.width,
@@ -3972,7 +4022,7 @@ mod tests {
     #[test]
     fn compute_tab_viewports_reserves_top_tab_row() {
         let root = Layout::Pane(PaneId(0));
-        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell());
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell(), 0);
         let viewport = layouts[&PaneId(0)];
 
         assert_eq!(viewport.cols, 10);
@@ -3989,7 +4039,7 @@ mod tests {
     #[test]
     fn compute_tab_viewports_shifts_split_status_rows_below_tab_bar() {
         let root = Layout::from_initial_panes(&[PaneId(0), PaneId(1)]);
-        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell());
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell(), 0);
         let left = layouts[&PaneId(0)];
         let right = layouts[&PaneId(1)];
 
@@ -4006,7 +4056,7 @@ mod tests {
     #[test]
     fn compute_tab_viewports_keeps_one_content_row_when_tab_bar_consumes_height() {
         let root = Layout::Pane(PaneId(0));
-        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 10), cell());
+        let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 10), cell(), 0);
         let viewport = layouts[&PaneId(0)];
 
         assert_eq!(viewport.cols, 10);
