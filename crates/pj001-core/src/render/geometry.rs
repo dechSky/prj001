@@ -54,14 +54,21 @@ pub struct BlockOverlay {
 impl BlockOverlay {
     /// row range 안 cell이면 색 반환, 아니면 None. edge cell(top/bottom row, 좌우 끝 col)은
     /// border_color, 안쪽 cell은 bg.
+    ///
+    /// Phase 4b-2c-2: 4 모서리(top/bottom row AND 좌우 끝 col)는 None 반환 — cell의 default
+    /// 색이 그려져 palette.bg(clear color)가 그대로 보임. cell 단위 chunky rounded corner.
+    /// SDF 곡선은 별도 sub-step에서 shader 확장 시 도입.
     pub fn cell_color(&self, row: usize, col: usize, cols: usize) -> Option<[f32; 4]> {
         if row < self.visible_row_start || row > self.visible_row_end {
             return None;
         }
-        let is_edge = row == self.visible_row_start
-            || row == self.visible_row_end
-            || col == 0
-            || col + 1 == cols;
+        let top_or_bottom = row == self.visible_row_start || row == self.visible_row_end;
+        let left_or_right = col == 0 || col + 1 == cols;
+        // 4 모서리는 카드 밖처럼 처리. cell.bg(보통 palette.bg)가 그려진다.
+        if top_or_bottom && left_or_right {
+            return None;
+        }
+        let is_edge = top_or_bottom || left_or_right;
         Some(if is_edge { self.border_color } else { self.bg })
     }
 }
@@ -309,22 +316,48 @@ mod tests {
     }
 
     #[test]
-    fn block_overlay_cell_color_corner_is_border() {
+    fn block_overlay_corner_cells_are_none_chunky_rounded() {
+        // Phase 4b-2c-2: 4 모서리는 None — cell default 색(palette.bg)이 보여 chunky corner.
         let o = overlay(2, 5);
-        // 4 모서리 — top+left, top+right, bottom+left, bottom+right.
-        assert_eq!(o.cell_color(2, 0, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(2, 9, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(5, 0, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(5, 9, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(2, 0, 10), None); // top-left
+        assert_eq!(o.cell_color(2, 9, 10), None); // top-right
+        assert_eq!(o.cell_color(5, 0, 10), None); // bottom-left
+        assert_eq!(o.cell_color(5, 9, 10), None); // bottom-right
     }
 
     #[test]
-    fn block_overlay_single_row_card_all_border() {
-        // row range[3..=3]는 한 행만. 모든 cell이 top+bottom edge → border_color.
+    fn block_overlay_edge_non_corner_still_border() {
+        // edge이지만 corner 아닌 cell은 여전히 border_color.
+        let o = overlay(2, 5);
+        // top row 안쪽 cell (col 1..=8)은 border.
+        assert_eq!(o.cell_color(2, 1, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(2, 8, 10), Some(CARD_BORDER));
+        // 좌측 col 0, 안쪽 row (3,4) → border.
+        assert_eq!(o.cell_color(3, 0, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(4, 0, 10), Some(CARD_BORDER));
+    }
+
+    #[test]
+    fn block_overlay_single_row_card_corners_none_middle_border() {
+        // row range[3..=3]는 한 행만. col 0/9는 corner(top+bottom+left/right) → None.
+        // 가운데 col은 top+bottom edge → border_color.
         let o = overlay(3, 3);
-        for col in 0..10 {
+        assert_eq!(o.cell_color(3, 0, 10), None);
+        assert_eq!(o.cell_color(3, 9, 10), None);
+        for col in 1..9 {
             assert_eq!(o.cell_color(3, col, 10), Some(CARD_BORDER));
         }
+    }
+
+    #[test]
+    fn block_overlay_two_col_card_all_corner_none() {
+        // cols=2면 col 0,1 모두 좌우 끝. row range edge면 모든 cell이 corner → 카드 사라짐.
+        // 비현실적 케이스지만 boundary 안전 검증.
+        let o = overlay(2, 5);
+        assert_eq!(o.cell_color(2, 0, 2), None);
+        assert_eq!(o.cell_color(2, 1, 2), None);
+        assert_eq!(o.cell_color(5, 0, 2), None);
+        assert_eq!(o.cell_color(5, 1, 2), None);
     }
 
     #[test]
