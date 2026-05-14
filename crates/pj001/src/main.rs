@@ -123,10 +123,7 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
                 theme_name = Some(take_eq_value("--theme", &a["--theme=".len()..])?);
             }
             _ if a.starts_with("--block-mode=") => {
-                block_mode = Some(take_eq_value(
-                    "--block-mode",
-                    &a["--block-mode=".len()..],
-                )?);
+                block_mode = Some(take_eq_value("--block-mode", &a["--block-mode=".len()..])?);
             }
             _ if a.starts_with('-') => {
                 return Err(Error::Args(format!("unknown argument: {a}")));

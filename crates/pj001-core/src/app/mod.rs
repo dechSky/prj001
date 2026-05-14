@@ -281,10 +281,11 @@ impl fmt::Debug for AppControl {
 }
 
 impl AppControl {
-    pub fn write_to_session(&self, id: SessionId, bytes: Vec<u8>) -> bool {
-        self.proxy
-            .send_event(UserEvent::WriteToSession { id, bytes })
-            .is_ok()
+    /// WriteToSession variant 제거됨. embedder write path는 별도 정책 영역으로 이전.
+    /// 호출 시 no-op + warn log.
+    pub fn write_to_session(&self, _id: SessionId, _bytes: Vec<u8>) -> bool {
+        log::warn!("AppControl::write_to_session: WriteToSession variant removed, ignored");
+        false
     }
 }
 
@@ -525,6 +526,40 @@ fn clamp_pos_to_viewport_cell(
     let local_col = abs_col.saturating_sub(viewport.col_offset).min(cols_max);
     let local_row = abs_row.saturating_sub(viewport.row_offset).min(rows_max);
     (local_row, local_col)
+}
+
+/// Phase 1: caret 모델 helper. mouse pos를 selection.pane viewport 안 caret 좌표로 clamp.
+///
+/// caret은 글자 사이 위치. col 0..=cols 범위. mouse가 cell N의 왼쪽 절반이면 caret=N,
+/// 오른쪽 절반이면 caret=N+1. 표준 macOS Terminal/iTerm2 selection 모델.
+///
+/// 음수 좌표 → caret 0, viewport 우측 밖 → caret = cols. row는 cell clamp와 동일.
+#[allow(dead_code)]
+fn clamp_pos_to_viewport_caret(
+    pos: PhysicalPosition<f64>,
+    viewport: PaneViewport,
+    cell: CellMetrics,
+) -> (usize, usize) {
+    if cell.width == 0 || cell.height == 0 {
+        return (0, 0);
+    }
+    let cell_w = cell.width as f64;
+    let abs_caret = if pos.x < 0.0 {
+        0
+    } else {
+        // round to nearest caret. (pos.x + cell_w/2) / cell_w를 floor.
+        ((pos.x + cell_w * 0.5) / cell_w).floor() as usize
+    };
+    let abs_row = if pos.y < 0.0 {
+        0
+    } else {
+        (pos.y / cell.height as f64).floor() as usize
+    };
+    let cols_max = viewport.cols; // caret 최대 = cols (cell index가 아닌 boundary count)
+    let rows_max = viewport.rows.saturating_sub(1);
+    let local_caret = abs_caret.saturating_sub(viewport.col_offset).min(cols_max);
+    let local_row = abs_row.saturating_sub(viewport.row_offset).min(rows_max);
+    (local_row, local_caret)
 }
 
 fn status_segment(
@@ -1711,29 +1746,6 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                     }
                 }
-            }
-            UserEvent::WriteToSession { id, bytes } => {
-                if bytes.is_empty() {
-                    log::debug!("WriteToSession ignored for session {}: empty payload", id.0);
-                    return;
-                }
-                let Some(state) = &mut self.state else {
-                    log::debug!("WriteToSession ignored for session {}: app not ready", id.0);
-                    return;
-                };
-                let Some(session) = state.sessions.get_mut(&id) else {
-                    log::warn!("WriteToSession ignored for unknown session {}", id.0);
-                    return;
-                };
-                if !session.alive {
-                    log::warn!("WriteToSession ignored for dead session {}", id.0);
-                    return;
-                }
-                if let Err(e) = session.pty.write(&bytes) {
-                    log::warn!("WriteToSession failed for session {}: {e}", id.0);
-                    return;
-                }
-                log::debug!("WriteToSession: {} bytes to session {}", bytes.len(), id.0);
             }
             UserEvent::SessionExited { id, code } => {
                 log::info!("session {} child exited (code={code})", id.0);

@@ -65,12 +65,18 @@ pub fn build_instances_at(
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
-                (resolve(cell.bg, false, palette), resolve(cell.fg, true, palette))
+                (
+                    resolve(cell.bg, false, palette),
+                    resolve(cell.fg, true, palette),
+                )
             } else if hyperlink {
                 // 슬라이스 6.3b: hyperlink cells는 theme의 ANSI 12(밝은 파랑) — bg는 일반대로.
                 (palette.ansi[12], resolve(cell.bg, false, palette))
             } else {
-                (resolve(cell.fg, true, palette), resolve(cell.bg, false, palette))
+                (
+                    resolve(cell.fg, true, palette),
+                    resolve(cell.bg, false, palette),
+                )
             };
 
             let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
@@ -134,9 +140,15 @@ pub fn build_instances_at(
             1.0
         };
         let (orig_fg, orig_bg) = if cell.attrs.contains(Attrs::REVERSE) {
-            (resolve(cell.bg, false, palette), resolve(cell.fg, true, palette))
+            (
+                resolve(cell.bg, false, palette),
+                resolve(cell.fg, true, palette),
+            )
         } else {
-            (resolve(cell.fg, true, palette), resolve(cell.bg, false, palette))
+            (
+                resolve(cell.fg, true, palette),
+                resolve(cell.bg, false, palette),
+            )
         };
         // reverse: overlay에서 fg ↔ bg swap.
         let overlay_fg = orig_bg;
@@ -324,4 +336,3 @@ fn cube(x: u8) -> f32 {
         (55.0 + x as f32 * 40.0) / 255.0
     }
 }
-
