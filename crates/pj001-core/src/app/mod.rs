@@ -168,11 +168,7 @@ pub(crate) fn sanitize_paste_text(text: &str) -> String {
             '\n' | '\t' => out.push(ch),
             '\r' => out.push('\n'),
             // C0 controls + DEL
-            '\x00'..='\x08'
-            | '\x0B'
-            | '\x0C'
-            | '\x0E'..='\x1F'
-            | '\x7F' => {}
+            '\x00'..='\x08' | '\x0B' | '\x0C' | '\x0E'..='\x1F' | '\x7F' => {}
             // C1 controls (U+0080..U+009F)
             '\u{0080}'..='\u{009F}' => {}
             _ => out.push(ch),
@@ -1119,6 +1115,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let pressed = matches!(button_state, ElementState::Pressed);
                 // 슬라이스 6.6b: button_held 추적 (reporting 흡수와 무관하게 일관 상태).
                 state.track_mouse_button(pressed, 0);
+                // Left release는 어떤 분기로 빠져도(hyperlink/mouse reporting/PTY 흡수 등)
+                // selection.dragging이 stuck 되지 않게 즉시 finish. 두 번 호출돼도 idempotent
+                // (was_dragging=false면 no-op).
+                if !pressed {
+                    state.finish_selection_drag();
+                    state.dragging_divider = None;
+                }
                 // 슬라이스 6.3c: Cmd+click on hyperlink cell → 브라우저로 OSC 8 URI 열기.
                 if pressed && state.modifiers.super_key() && !state.modifiers.shift_key() {
                     if state.try_open_hyperlink_at_mouse() {
@@ -2919,11 +2922,7 @@ impl AppState {
         if self.mouse_buttons_held != 0 {
             return;
         }
-        let selection_was_dragging = self
-            .selection
-            .as_ref()
-            .map(|s| s.dragging)
-            .unwrap_or(false);
+        let selection_was_dragging = self.selection.as_ref().map(|s| s.dragging).unwrap_or(false);
         if selection_was_dragging {
             self.finish_selection_drag();
         }
@@ -2987,11 +2986,7 @@ impl AppState {
             return false;
         };
         // pane_id의 session에서 cell의 hyperlink_id 조회.
-        let idx_opt = self
-            .active_tab()
-            .panes
-            .iter()
-            .position(|p| p.id == pane_id);
+        let idx_opt = self.active_tab().panes.iter().position(|p| p.id == pane_id);
         let Some(idx) = idx_opt else {
             return false;
         };
@@ -3079,9 +3074,7 @@ impl AppState {
         // 버튼 정보 없음 — 0 (drag 시 SGR 인코딩에선 응용프로그램이 hold 상태 추적).
         // 1003 hover는 release(3) — xterm spec.
         let button = if button_held { 0 } else { 3 };
-        let bytes = encode_mouse_report(
-            button, false, true, shift, alt, ctrl, cell.1, cell.0, sgr,
-        );
+        let bytes = encode_mouse_report(button, false, true, shift, alt, ctrl, cell.1, cell.0, sgr);
         let idx = self.active_index();
         let session = self.session_for_pane_idx_mut(idx);
         if let Err(e) = session.pty.write(&bytes) {
@@ -4111,7 +4104,10 @@ mod tests {
     fn sanitize_paste_converts_cr_to_lf() {
         // paste-execution 방어: CR → LF.
         assert_eq!(super::sanitize_paste_text("line1\rline2"), "line1\nline2");
-        assert_eq!(super::sanitize_paste_text("line1\r\nline2"), "line1\n\nline2");
+        assert_eq!(
+            super::sanitize_paste_text("line1\r\nline2"),
+            "line1\n\nline2"
+        );
     }
 
     #[test]
