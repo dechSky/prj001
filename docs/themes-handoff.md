@@ -1,7 +1,7 @@
-# pj001 themes — Claude Design handoff 매핑
+# pj001 themes — 디자인 handoff 매핑
 
 **상태**: 추출본, 2026-05-13.
-**출처**: `claude.ai/design` handoff bundle (Derek가 2026-05-13 07:45 UTC에 시작한 "터미널 UI 디자인" 프로젝트). 압축해제 위치 `/tmp/pj001-design-handoff/remix/`. 6 React variants + 공유 모델 + Tweaks 패널.
+**출처**: 외부 디자인 툴 handoff bundle (2026-05-13). 압축해제 위치 `/tmp/pj001-design-handoff/remix/`. 6 React variants + 공유 모델 + Tweaks 패널.
 **목적**: handoff 디자인을 pj001 (Rust + wgpu/winit, macOS 네이티브)에 어디까지 옮길 수 있는지 매핑. 구현 슬라이스 결정 근거.
 **범위 합의**: Derek가 "전체 야심차게 — theme + tabs + blocks + glass + floating" 선택. 본 문서는 토큰만 정리하며 코드 구현은 별도 milestone.
 

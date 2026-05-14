@@ -1,7 +1,4 @@
-//! 테마 팔레트 — Claude Design handoff 6 테마(themes-handoff.md §2)에서
-//! 추출한 fg/bg/selection 색을 보관한다.
-//! 슬라이스 1.1: fg/bg/selection 도입.
-//! 슬라이스 1.2: ANSI 16색 테마화 (라이트 테마 가독성 해결).
+//! 테마 팔레트 — 6 테마(themes-handoff.md §2)의 fg/bg/selection + ANSI 16색.
 
 use std::fmt;
 

@@ -3796,8 +3796,8 @@ mod tests {
             QuickSpawnPreset {
                 key: 'x',
                 spec: SessionSpec {
-                    title: "Codex".to_string(),
-                    command: CommandSpec::Custom("codex".to_string()),
+                    title: "bash".to_string(),
+                    command: CommandSpec::Custom("/bin/bash".to_string()),
                 },
             },
             QuickSpawnPreset {
@@ -3810,15 +3810,15 @@ mod tests {
             QuickSpawnPreset {
                 key: 'C',
                 spec: SessionSpec {
-                    title: "Claude".to_string(),
-                    command: CommandSpec::Custom("claude".to_string()),
+                    title: "fish".to_string(),
+                    command: CommandSpec::Custom("/usr/local/bin/fish".to_string()),
                 },
             },
             QuickSpawnPreset {
                 key: 'c',
                 spec: SessionSpec {
-                    title: "Claude duplicate".to_string(),
-                    command: CommandSpec::Custom("claude".to_string()),
+                    title: "fish duplicate".to_string(),
+                    command: CommandSpec::Custom("/usr/local/bin/fish".to_string()),
                 },
             },
         ];
@@ -4029,7 +4029,7 @@ mod tests {
     #[test]
     fn tab_label_prefixes_one_based_index() {
         assert_eq!(tab_label(0, "shell"), "1 shell");
-        assert_eq!(tab_label(2, "Codex"), "3 Codex");
+        assert_eq!(tab_label(2, "bash"), "3 bash");
     }
 
     #[test]

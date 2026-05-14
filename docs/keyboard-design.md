@@ -462,7 +462,7 @@ winit가 macOS native에서 Cmd 키를 modifier로 알려줌(`ModifiersState::SU
 | **Cmd+[ / Cmd+]** | active tab 안 이전/다음 pane 전환 | M13 layout |
 | **Cmd+Shift+[ / Cmd+Shift+]** | 이전/다음 tab 전환 | M14 tabs |
 | **Cmd+N** | active tab에 새 shell pane 추가 (vertical split) | M15 dynamic spawn 첫 slice |
-| **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; bridge mode는 `c=Claude`, `x=Codex` 추가. 3초 내 입력 없으면 자동 취소 | M15 dynamic spawn, core는 preset data만 사용 |
+| **Cmd+Shift+N → key** | quick spawn sequence. 기본 `s=shell`; 추가 preset은 외부에서 주입(`Config.quick_spawn_presets`). 3초 내 입력 없으면 자동 취소 | M15 dynamic spawn, core는 preset data만 사용 |
 | **Cmd+R** | active pane의 session을 같은 command로 재시작. SessionId는 새로 발급되고 scrollback은 초기화 | M15 respawn 첫 slice |
 | **Cmd+= / Cmd+- / Cmd+0** | 폰트 크기 확대/축소/기본값 복귀. logical font size는 6~72pt로 clamp하고 monitor scale factor는 렌더 직전 적용 | M15 font zoom 첫 slice |
 | **Cmd+K** | active pane의 scrollback을 clear하고 PTY에 `Ctrl+L`을 보내 shell/readline이 화면과 prompt를 다시 그리게 함. alt screen에서는 TUI 화면 보호를 위해 scrollback만 clear | Terminal clear UX |

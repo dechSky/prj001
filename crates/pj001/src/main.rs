@@ -1,4 +1,4 @@
-use pj001_core::app::{self, CommandSpec, Config, QuickSpawnPreset, SessionSpec};
+use pj001_core::app::{self, Config};
 use pj001_core::error::{self, Error};
 use pj001_core::render::ThemePalette;
 use serde::Deserialize;
@@ -18,9 +18,6 @@ fn main() -> error::Result<()> {
     app::run(config)
 }
 
-/// 슬라이스 6.7: 사용자 config file 파싱 — 현재는 general.theme만.
-/// 우선순위: CLI 플래그 > config 파일 > 빌트인 default.
-/// 경로: `$PJ001_CONFIG` env 또는 `$HOME/.config/pj001/config.toml`.
 #[derive(Debug, Deserialize, Default, Clone)]
 struct FileConfig {
     #[serde(default)]
@@ -96,40 +93,18 @@ fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
     file.write_all(entry.as_bytes())
 }
 
-/// 기존 `--shell` 단일 터미널 모드와 M11-1 `--bridge --left/--right` 모드 지원.
-/// `--theme <name>`로 6 테마(aurora/obsidian/vellum/holo/bento/crystal) 선택.
+/// 단일 터미널 모드. `--shell <path>`로 shell 지정, `--theme <name>`로 6 테마 선택.
 /// `file_config` (~/.config/pj001/config.toml)의 general.theme는 CLI 미지정 시 사용.
 fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Result<Config> {
-    let mut bridge = false;
     let mut shell_override = None;
-    let mut left = None;
-    let mut right = None;
     let mut theme_name = None;
-    let mut saw_bridge_pane_arg = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--bridge" => bridge = true,
             "--shell" | "-s" => shell_override = Some(take_arg_value(a, iter.next())?),
-            "--left" => {
-                saw_bridge_pane_arg = true;
-                left = Some(take_arg_value(a, iter.next())?);
-            }
-            "--right" => {
-                saw_bridge_pane_arg = true;
-                right = Some(take_arg_value(a, iter.next())?);
-            }
             "--theme" => theme_name = Some(take_arg_value(a, iter.next())?),
             _ if a.starts_with("--shell=") => {
                 shell_override = Some(take_eq_value("--shell", &a["--shell=".len()..])?);
-            }
-            _ if a.starts_with("--left=") => {
-                saw_bridge_pane_arg = true;
-                left = Some(take_eq_value("--left", &a["--left=".len()..])?);
-            }
-            _ if a.starts_with("--right=") => {
-                saw_bridge_pane_arg = true;
-                right = Some(take_eq_value("--right", &a["--right=".len()..])?);
             }
             _ if a.starts_with("--theme=") => {
                 theme_name = Some(take_eq_value("--theme", &a["--theme=".len()..])?);
@@ -140,11 +115,7 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
             _ => {}
         }
     }
-    // CLI 우선 → file_config → None
-    let theme = match theme_name.or_else(|| {
-        file_config
-            .and_then(|c| c.general.theme.clone())
-    }) {
+    let theme = match theme_name.or_else(|| file_config.and_then(|c| c.general.theme.clone())) {
         Some(name) => Some(ThemePalette::by_name(&name).ok_or_else(|| {
             Error::Args(format!(
                 "unknown theme: {name} (expected aurora/obsidian/vellum/holo/bento/crystal)"
@@ -152,24 +123,7 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         })?),
         None => None,
     };
-    let config = if bridge {
-        if shell_override.is_some() {
-            return Err(error::Error::Args(
-                "--bridge cannot be combined with --shell/-s".to_string(),
-            ));
-        }
-        bridge_config(
-            left.unwrap_or_else(|| "claude".to_string()),
-            right.unwrap_or_else(|| "codex".to_string()),
-        )
-    } else {
-        if saw_bridge_pane_arg {
-            return Err(error::Error::Args(
-                "--left/--right require --bridge".to_string(),
-            ));
-        }
-        Config::single_shell(shell_override)
-    };
+    let config = Config::single_shell(shell_override);
     Ok(match theme {
         Some(theme) => config.with_theme(theme),
         None => config,
@@ -191,42 +145,6 @@ fn take_eq_value(flag: &str, value: &str) -> error::Result<String> {
         return Err(error::Error::Args(format!("{flag} requires a value")));
     }
     Ok(value.to_string())
-}
-
-fn bridge_config(left: String, right: String) -> Config {
-    Config::vertical_split(
-        SessionSpec {
-            title: "Claude".to_string(),
-            command: CommandSpec::Custom(left.clone()),
-        },
-        SessionSpec {
-            title: "Codex".to_string(),
-            command: CommandSpec::Custom(right.clone()),
-        },
-    )
-    .with_quick_spawn_presets(vec![
-        QuickSpawnPreset {
-            key: 's',
-            spec: SessionSpec {
-                title: "shell".to_string(),
-                command: CommandSpec::Shell,
-            },
-        },
-        QuickSpawnPreset {
-            key: 'c',
-            spec: SessionSpec {
-                title: "Claude".to_string(),
-                command: CommandSpec::Custom(left),
-            },
-        },
-        QuickSpawnPreset {
-            key: 'x',
-            spec: SessionSpec {
-                title: "Codex".to_string(),
-                command: CommandSpec::Custom(right),
-            },
-        },
-    ])
 }
 
 #[cfg(test)]
@@ -286,68 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bridge_defaults() {
-        assert_eq!(
-            parse_config(&args(&["--bridge"]), None).unwrap(),
-            bridge_config("claude".to_string(), "codex".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_bridge_custom_commands() {
-        assert_eq!(
-            parse_config(&args(&[
-                "--bridge",
-                "--left=/bin/zsh",
-                "--right",
-                "/bin/bash"
-            ]), None)
-            .unwrap(),
-            bridge_config("/bin/zsh".to_string(), "/bin/bash".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_bridge_custom_commands_exposes_session_specs() {
-        let config = parse_config(&args(&[
-            "--bridge",
-            "--left=/bin/zsh",
-            "--right",
-            "/bin/bash",
-        ]), None)
-        .unwrap();
-
-        assert_eq!(
-            config.sessions,
-            vec![
-                SessionSpec {
-                    title: "Claude".to_string(),
-                    command: CommandSpec::Custom("/bin/zsh".to_string()),
-                },
-                SessionSpec {
-                    title: "Codex".to_string(),
-                    command: CommandSpec::Custom("/bin/bash".to_string()),
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn parse_rejects_missing_value_before_next_flag() {
-        assert!(parse_config(&args(&["--shell", "--bridge"]), None).is_err());
-        assert!(parse_config(&args(&["--bridge", "--left", "--right=/bin/zsh"]), None).is_err());
-        assert!(parse_config(&args(&["--shell=--bridge"]), None).is_err());
-    }
-
-    #[test]
-    fn parse_rejects_bridge_with_shell_override() {
-        assert!(parse_config(&args(&["--bridge", "--shell", "/bin/zsh"]), None).is_err());
-    }
-
-    #[test]
-    fn parse_rejects_bridge_pane_args_without_bridge() {
-        assert!(parse_config(&args(&["--left", "/bin/zsh"]), None).is_err());
-        assert!(parse_config(&args(&["--right=/bin/zsh"]), None).is_err());
+        assert!(parse_config(&args(&["--shell", "--theme"]), None).is_err());
+        assert!(parse_config(&args(&["--shell=--theme"]), None).is_err());
     }
 
     #[test]
@@ -370,14 +229,6 @@ mod tests {
     #[test]
     fn parse_theme_unknown_rejected() {
         assert!(parse_config(&args(&["--theme", "solarized"]), None).is_err());
-    }
-
-    #[test]
-    fn parse_theme_combines_with_bridge() {
-        let cfg =
-            parse_config(&args(&["--bridge", "--theme", "obsidian", "--left=foo"]), None).unwrap();
-        assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
-        assert_eq!(cfg.sessions.len(), 2);
     }
 
     #[test]
@@ -436,7 +287,6 @@ theme = "aurora"
 
     #[test]
     fn file_config_unknown_key_ignored() {
-        // 알려지지 않은 key는 ignore (forward compat).
         let raw = r#"
 [general]
 theme = "bento"
