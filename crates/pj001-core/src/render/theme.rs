@@ -2,6 +2,22 @@
 
 use std::fmt;
 
+/// Phase 4d: theme별 marker 모양. design §10 themes-handoff 매핑:
+/// - aurora/obsidian: RoundedSquare
+/// - vellum: Dollar (`$` glyph)
+/// - holo: Hex (6각형)
+/// - bento: RunChip (status chip 형태)
+/// - crystal: Bubble (radial gradient circle)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MarkerKind {
+    RoundedSquare = 0,
+    Hex = 1,
+    Dollar = 2,
+    RunChip = 3,
+    Bubble = 4,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThemePalette {
     pub name: &'static str,
@@ -15,6 +31,8 @@ pub struct ThemePalette {
     pub block_bg: [f32; 4],
     /// Phase 4b-2c: 명령 블록 카드 border. edge cell에만 적용.
     pub block_border: [f32; 4],
+    /// Phase 4d: prompt marker 모양 (테마별 시각 차별화).
+    pub block_marker_kind: MarkerKind,
 }
 
 impl ThemePalette {
@@ -60,6 +78,7 @@ impl ThemePalette {
             // bg와 동일값 (visual 효과 0). 4d에서 정식 매핑.
             block_bg: rgb(0xf6, 0xf2, 0xeb),
             block_border: rgb(0xf6, 0xf2, 0xeb),
+            block_marker_kind: MarkerKind::RoundedSquare,
         }
     }
 
@@ -92,6 +111,7 @@ impl ThemePalette {
             // design §12 obsidian이 4b 시각 발동 대상.
             block_bg: rgb(0x14, 0x16, 0x26),
             block_border: rgb(0x28, 0x2a, 0x3a),
+            block_marker_kind: MarkerKind::RoundedSquare,
         }
     }
 
@@ -122,6 +142,7 @@ impl ThemePalette {
             ],
             block_bg: rgb(0xef, 0xe7, 0xd2),
             block_border: rgb(0xef, 0xe7, 0xd2),
+            block_marker_kind: MarkerKind::Dollar,
         }
     }
 
@@ -152,6 +173,7 @@ impl ThemePalette {
             ],
             block_bg: rgb(0x0a, 0x08, 0x1e),
             block_border: rgb(0x0a, 0x08, 0x1e),
+            block_marker_kind: MarkerKind::Hex,
         }
     }
 
@@ -182,6 +204,7 @@ impl ThemePalette {
             ],
             block_bg: rgb(0xe9, 0xdf, 0xc1),
             block_border: rgb(0xe9, 0xdf, 0xc1),
+            block_marker_kind: MarkerKind::RunChip,
         }
     }
 
@@ -212,6 +235,7 @@ impl ThemePalette {
             ],
             block_bg: rgb(0x0a, 0x0f, 0x24),
             block_border: rgb(0x0a, 0x0f, 0x24),
+            block_marker_kind: MarkerKind::Bubble,
         }
     }
 

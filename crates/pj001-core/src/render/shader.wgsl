@@ -3,6 +3,10 @@ struct Uniforms {
     cell: vec2<f32>,
     fg: vec4<f32>,
     palette_bg: vec4<f32>,
+    marker_kind: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -192,21 +196,64 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             card_color = in.block_border_color;
         }
 
-        // Phase 4b-3: prompt marker — cell 중앙에 rounded square SDF. marker 색은 in.fg
-        // (build_instances_at가 marker cell에 palette.fg stamp). marker_half는 cell 크기
-        // 한도 내 — 작은 cell도 마커가 비례.
+        // Phase 4b-3 + 4d: prompt marker — theme별 SDF shape (uniform marker_kind 분기).
+        // 0=RoundedSquare, 1=Hex, 2=Dollar (cross of bars), 3=RunChip, 4=Bubble.
         if ((in.flags & 0x200u) != 0u) {
             let cx = cell_w * 0.5;
             let cy = cell_h * 0.5;
             let marker_half = min(cell_w, cell_h) * 0.4;
-            let marker_radius = max(1.5, marker_half * 0.25);
-            let dx = abs(in.cell_pixel.x - cx);
-            let dy = abs(in.cell_pixel.y - cy);
-            // rounded square SDF: max(|p|-half+r, 0) magnitude - r
-            let qx = max(dx - (marker_half - marker_radius), 0.0);
-            let qy = max(dy - (marker_half - marker_radius), 0.0);
-            let m_dist = sqrt(qx * qx + qy * qy) - marker_radius;
-            if (m_dist < 0.0) {
+            let dx_signed = in.cell_pixel.x - cx;
+            let dy_signed = in.cell_pixel.y - cy;
+            let dx = abs(dx_signed);
+            let dy = abs(dy_signed);
+            var hit = false;
+            switch u.marker_kind {
+                case 1u: {
+                    // Hex (pointy-top): SDF for regular hexagon. 단순 근사.
+                    let k = vec3<f32>(-0.866025404, 0.5, 0.57735);
+                    var px = dx;
+                    var py = dy;
+                    let t = 2.0 * min(k.x * px + k.y * py, 0.0);
+                    px -= t * k.x;
+                    py -= t * k.y;
+                    let clamp_x = clamp(px, -k.z * marker_half, k.z * marker_half);
+                    let len_x = px - clamp_x;
+                    let len_y = py - marker_half;
+                    let d = sqrt(len_x * len_x + len_y * len_y) * sign(py - marker_half);
+                    hit = d < 0.0;
+                }
+                case 2u: {
+                    // Dollar: 수직 막대 + 가로 가운데 줄(단순화된 $ 형태)
+                    let bar_w = max(1.5, marker_half * 0.25);
+                    let v_bar = dx < bar_w && dy < marker_half;
+                    let h_bar = dy < bar_w && dx < marker_half * 0.8;
+                    hit = v_bar || h_bar;
+                }
+                case 3u: {
+                    // RunChip: square chip (rounded square, 더 큰 라운드 X).
+                    hit = dx < marker_half && dy < marker_half * 0.8;
+                }
+                case 4u: {
+                    // Bubble: circle + outer ring 두 톤. 안쪽만 fg, ring은 fg dim.
+                    let dist = sqrt(dx_signed * dx_signed + dy_signed * dy_signed);
+                    hit = dist < marker_half;
+                    if (hit && dist > marker_half * 0.7) {
+                        // ring 부분 — dim fg
+                        card_color = mix(in.bg, in.fg, 0.6);
+                        // glyph layer 건너뛰기 위해 직접 return
+                        return card_color;
+                    }
+                }
+                default: {
+                    // RoundedSquare (0 또는 unknown)
+                    let marker_radius = max(1.5, marker_half * 0.25);
+                    let qx = max(dx - (marker_half - marker_radius), 0.0);
+                    let qy = max(dy - (marker_half - marker_radius), 0.0);
+                    let m_dist = sqrt(qx * qx + qy * qy) - marker_radius;
+                    hit = m_dist < 0.0;
+                }
+            }
+            if (hit) {
                 card_color = in.fg;
             }
         }

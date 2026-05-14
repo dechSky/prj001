@@ -10,7 +10,7 @@ use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
 pub use geometry::{BlockOverlay, CursorRender, SelectionRange};
-pub use theme::ThemePalette;
+pub use theme::{MarkerKind, ThemePalette};
 
 use atlas::GlyphAtlas;
 use font::FontStack;
@@ -24,6 +24,9 @@ struct Uniforms {
     fg: [f32; 4],
     /// Phase 4b-2c-4b: SDF block card corner의 외부 영역(palette.bg = clear color) 처리.
     palette_bg: [f32; 4],
+    /// Phase 4d: MarkerKind enum 값 (0=RoundedSquare/1=Hex/2=Dollar/3=RunChip/4=Bubble).
+    marker_kind: u32,
+    _pad: [u32; 3],
 }
 
 pub struct Renderer {
@@ -67,6 +70,8 @@ impl Renderer {
             cell: [cell.width as f32, cell.height as f32],
             fg: palette.fg,
             palette_bg: palette.bg,
+            marker_kind: palette.block_marker_kind as u32,
+            _pad: [0; 3],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -322,6 +327,8 @@ impl Renderer {
             cell: [self.cell.width as f32, self.cell.height as f32],
             fg: [0.86, 0.86, 0.86, 1.0],
             palette_bg: self.palette.bg,
+            marker_kind: self.palette.block_marker_kind as u32,
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
