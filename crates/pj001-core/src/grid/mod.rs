@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
 
+use crate::block::RowBlockTag;
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct Attrs: u8 {
@@ -27,13 +29,16 @@ bitflags! {
     }
 }
 
-/// scrollback에 보관되는 row. cells와 row 단위 flag.
+/// scrollback에 보관되는 row. cells + row 단위 flag + block boundary tag.
 /// flags는 M17-3/M17-4 reflow 진입 후 사용. push 시점부터 같이 보관.
+/// block_tags는 Block UI Phase 4a — 빈 Vec이 흔하다(보통 0개, prompt row만 entry).
 #[derive(Debug, Clone)]
 pub(crate) struct ScrollbackRow {
     pub cells: Vec<Cell>,
     #[allow(dead_code)]
     pub flags: RowFlags,
+    #[allow(dead_code)]
+    pub block_tags: Vec<RowBlockTag>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +116,9 @@ struct Grid {
     cells: Vec<Cell>,
     /// M17 reflow 인프라. len == rows. cells와 동기 관리.
     row_flags: Vec<RowFlags>,
+    /// Block UI Phase 4a — 한 row에 multiple boundary 가능. 보통 비어있다.
+    /// len == rows. cells/row_flags와 동기.
+    row_block_tags: Vec<Vec<RowBlockTag>>,
     cols: usize,
     rows: usize,
 }
@@ -120,6 +128,7 @@ impl Grid {
         Self {
             cells: vec![Cell::default(); cols * rows],
             row_flags: vec![RowFlags::empty(); rows],
+            row_block_tags: vec![Vec::new(); rows],
             cols,
             rows,
         }
@@ -156,6 +165,13 @@ impl Grid {
         let copy = rows.min(self.row_flags.len());
         new_flags[..copy].copy_from_slice(&self.row_flags[..copy]);
         self.row_flags = new_flags;
+        // row_block_tags도 같이 carry — 4a는 truncate-only (4a reflow remap에서 분기).
+        let mut new_tags = vec![Vec::new(); rows];
+        let copy_t = rows.min(self.row_block_tags.len());
+        for r in 0..copy_t {
+            new_tags[r] = std::mem::take(&mut self.row_block_tags[r]);
+        }
+        self.row_block_tags = new_tags;
         self.cols = cols;
         self.rows = rows;
     }
@@ -168,12 +184,14 @@ impl Grid {
                 self.cells[r * self.cols + c] = self.cells[(r + n) * self.cols + c];
             }
             self.row_flags[r] = self.row_flags[r + n];
+            self.row_block_tags[r] = std::mem::take(&mut self.row_block_tags[r + n]);
         }
         for r in (bottom - n)..bottom {
             for c in 0..self.cols {
                 self.cells[r * self.cols + c] = Cell::default();
             }
             self.row_flags[r] = RowFlags::empty();
+            self.row_block_tags[r].clear();
         }
     }
 
@@ -184,12 +202,14 @@ impl Grid {
                 self.cells[r * self.cols + c] = self.cells[(r - n) * self.cols + c];
             }
             self.row_flags[r] = self.row_flags[r - n];
+            self.row_block_tags[r] = std::mem::take(&mut self.row_block_tags[r - n]);
         }
         for r in top..(top + n) {
             for c in 0..self.cols {
                 self.cells[r * self.cols + c] = Cell::default();
             }
             self.row_flags[r] = RowFlags::empty();
+            self.row_block_tags[r].clear();
         }
     }
 }
@@ -931,8 +951,10 @@ impl Term {
         self.view_offset = self.view_offset.min(self.scrollback.len());
         debug_assert_eq!(self.main.cells.len(), self.main.cols * self.main.rows);
         debug_assert_eq!(self.main.row_flags.len(), self.main.rows);
+        debug_assert_eq!(self.main.row_block_tags.len(), self.main.rows);
         debug_assert_eq!(self.alt.cells.len(), self.alt.cols * self.alt.rows);
         debug_assert_eq!(self.alt.row_flags.len(), self.alt.rows);
+        debug_assert_eq!(self.alt.row_block_tags.len(), self.alt.rows);
     }
 
     /// M17-4: scrollback + main 통합 reflow.
@@ -972,12 +994,14 @@ impl Term {
         };
 
         // 새 scrollback 빌드: NewRow[0..main_start]를 ScrollbackRow로.
+        // block_tags carry는 Step 5(reflow remap)에서 — 현 단계는 빈 Vec placeholder.
         let mut new_scrollback: VecDeque<ScrollbackRow> = VecDeque::with_capacity(main_start);
         for src_idx in 0..main_start {
             let (cells, flags) = &result.new_rows[src_idx];
             new_scrollback.push_back(ScrollbackRow {
                 cells: cells.clone(),
                 flags: *flags,
+                block_tags: Vec::new(),
             });
         }
         while new_scrollback.len() > SCROLLBACK_CAP {
@@ -1007,6 +1031,8 @@ impl Term {
         self.scrollback = new_scrollback;
         self.main.cells = new_cells;
         self.main.row_flags = new_flags;
+        // block_tags는 Step 5에서 logical_offset carry로 채움 — 현 단계는 reset.
+        self.main.row_block_tags = vec![Vec::new(); new_rows];
         self.main.cols = new_cols;
         self.main.rows = new_rows;
 
@@ -1128,7 +1154,12 @@ impl Term {
                 let cols = self.main.cols;
                 let cells: Vec<Cell> = self.main.cells[..cols].to_vec();
                 let flags = self.main.row_flags[0];
-                self.scrollback.push_back(ScrollbackRow { cells, flags });
+                let block_tags = std::mem::take(&mut self.main.row_block_tags[0]);
+                self.scrollback.push_back(ScrollbackRow {
+                    cells,
+                    flags,
+                    block_tags,
+                });
                 while self.scrollback.len() > SCROLLBACK_CAP {
                     self.scrollback.pop_front();
                 }
@@ -1480,6 +1511,25 @@ impl Term {
     #[cfg(test)]
     fn row_flags(&self, row: usize) -> RowFlags {
         self.grid().row_flags[row]
+    }
+
+    /// Block UI Phase 4a: row 단위 block boundary tag 추가/조회.
+    /// Step 4의 OSC 133 dispatch에서 사용. main grid 한정 (alt는 OSC 133 inactive).
+    #[allow(dead_code)]
+    pub(crate) fn push_row_block_tag(&mut self, row: usize, tag: RowBlockTag) {
+        if row < self.main.rows {
+            self.main.row_block_tags[row].push(tag);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn main_row_block_tags(&self, row: usize) -> &[RowBlockTag] {
+        &self.main.row_block_tags[row]
+    }
+
+    #[cfg(test)]
+    fn scrollback_block_tags(&self, row: usize) -> &[RowBlockTag] {
+        &self.scrollback[row].block_tags
     }
 }
 
@@ -2094,5 +2144,75 @@ mod tests {
         term.set_cursor(0, 0);
         term.delete_lines(0);
         assert_eq!(row_chars(&term, 0), "AAAA");
+    }
+
+    // === Block UI Phase 4a Step 2 — RowBlockTag carry ===
+    use crate::block::{BlockBoundary, BlockId, RowBlockTag};
+
+    fn tag(id: u64, kind: BlockBoundary) -> RowBlockTag {
+        RowBlockTag {
+            block_id: BlockId(id),
+            kind,
+        }
+    }
+
+    #[test]
+    fn row_block_tags_initialize_empty() {
+        let term = Term::new(8, 4);
+        for r in 0..4 {
+            assert!(term.main_row_block_tags(r).is_empty());
+        }
+    }
+
+    #[test]
+    fn push_row_block_tag_records_and_persists() {
+        let mut term = Term::new(8, 4);
+        term.push_row_block_tag(2, tag(7, BlockBoundary::PromptStart));
+        term.push_row_block_tag(2, tag(7, BlockBoundary::CommandStart));
+        let tags = term.main_row_block_tags(2);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].block_id, BlockId(7));
+        assert_eq!(tags[1].kind, BlockBoundary::CommandStart);
+        // 다른 row는 영향 없음.
+        assert!(term.main_row_block_tags(0).is_empty());
+    }
+
+    #[test]
+    fn scroll_up_carries_tags_to_lower_indices_and_clears_bottom() {
+        let mut term = Term::new(8, 4);
+        // row 2에 tag → scroll_up 1행 → row 1로 이동, 마지막 row clear.
+        term.push_row_block_tag(2, tag(11, BlockBoundary::PromptStart));
+        term.grid_mut().scroll_up(0, 4, 1);
+        assert_eq!(term.main_row_block_tags(1).len(), 1);
+        assert_eq!(term.main_row_block_tags(1)[0].block_id, BlockId(11));
+        assert!(term.main_row_block_tags(2).is_empty());
+        assert!(term.main_row_block_tags(3).is_empty());
+    }
+
+    #[test]
+    fn newline_with_scrollback_push_carries_tag_to_scrollback() {
+        let mut term = Term::new(4, 2);
+        term.push_row_block_tag(0, tag(42, BlockBoundary::PromptStart));
+        // row 1 끝에서 newline → scroll_up + push_back of row 0.
+        term.set_cursor(1, 0);
+        term.newline();
+        // scrollback 첫 entry가 push된 row 0.
+        assert_eq!(term.scrollback_block_tags(0).len(), 1);
+        assert_eq!(term.scrollback_block_tags(0)[0].block_id, BlockId(42));
+        // main의 row 0/1은 tag 없음 (carry는 row 0 → scrollback, row 1 → row 0 idle).
+        assert!(term.main_row_block_tags(0).is_empty());
+        assert!(term.main_row_block_tags(1).is_empty());
+    }
+
+    #[test]
+    #[ignore = "Step 5(reflow remap)에서 logical_offset carry 도입 후 활성화"]
+    fn resize_preserves_row_block_tags_within_rows() {
+        let mut term = Term::new(8, 5);
+        term.push_row_block_tag(1, tag(1, BlockBoundary::PromptStart));
+        term.push_row_block_tag(3, tag(2, BlockBoundary::PromptStart));
+        term.resize(8, 3);
+        assert_eq!(term.main_row_block_tags(1).len(), 1);
+        assert_eq!(term.main_row_block_tags(1)[0].block_id, BlockId(1));
+        assert!(term.main_row_block_tags(2).is_empty());
     }
 }
