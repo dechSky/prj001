@@ -980,10 +980,10 @@ impl App {
         state.window.set_ime_allowed(true);
         state.window.set_ime_purpose(ImePurpose::Terminal);
         // macOS first-key escape 워크어라운드 — NSTextInputContext.activate() 직접 호출로
-        // IME를 즉시 wake-up. 입력 소스 전환 직후 첫 자모가 KeyboardInput으로 escape되는
-        // winit 동작 회피 (Codex thread 019e2491).
+        // PoC v0.2 — WezTerm 스타일 자체 NSView/NSTextInputClient를 winit view 위에
+        // 덮어쓰고 first responder로 빼앗는다. 첫 자모부터 IME path 정상화 목표.
         #[cfg(target_os = "macos")]
-        macos_ime::wake_input_context(&state.window);
+        macos_ime::install_ime_view(&state.window, self.proxy.clone());
         let window = state.window.clone();
         self.state = Some(state);
         window.request_redraw();
@@ -1083,10 +1083,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if focused {
                     // 포커스 회복 시 즉시 cursor 보이기 (다음 blink phase 기다리지 않음).
                     state.cursor_visible = true;
-                    // 포커스 회복 시점에 입력 소스가 한국어로 바뀌었을 가능성 → IME wake-up
-                    // 재호출. winit set_ime_allowed가 idempotent라 다른 trigger 필요.
-                    #[cfg(target_os = "macos")]
-                    macos_ime::wake_input_context(&state.window);
+                    // PoC v0.2 — PjImeView가 이미 설치되어 first responder이므로 포커스 회복 시
+                    // 별도 wake-up 불필요. (winit 위에 덮은 view가 NSTextInputClient 상태 소유)
                 }
                 state.window.request_redraw();
                 // M10-3: focus reporting on이면 PTY로 송신. lock drop 후 write.
