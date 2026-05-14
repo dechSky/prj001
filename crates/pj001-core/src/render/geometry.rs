@@ -40,12 +40,30 @@ pub struct SelectionRange {
 }
 
 /// Phase 4b-2b: 카드 bg overlay 정보. row range[start..=end] 안 cell의 bg를 약간 변경.
-/// Phase 1 단순 cut — 단일 색만. border/radius는 후속 step.
+/// Phase 4b-2c-1: border_color 추가 — row range의 top/bottom row + col 0/cols-1 edge cell의
+/// bg를 border_color로 stamp. cell 단위 border (1 cell 두께). radius 없음 — 4b-2c-2에서 SDF.
+/// gutter 영역 카드 bg 확장은 별도 sub-step (visible_blocks가 row range만 보유).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockOverlay {
     pub visible_row_start: usize,
     pub visible_row_end: usize,
     pub bg: [f32; 4],
+    pub border_color: [f32; 4],
+}
+
+impl BlockOverlay {
+    /// row range 안 cell이면 색 반환, 아니면 None. edge cell(top/bottom row, 좌우 끝 col)은
+    /// border_color, 안쪽 cell은 bg.
+    pub fn cell_color(&self, row: usize, col: usize, cols: usize) -> Option<[f32; 4]> {
+        if row < self.visible_row_start || row > self.visible_row_end {
+            return None;
+        }
+        let is_edge = row == self.visible_row_start
+            || row == self.visible_row_end
+            || col == 0
+            || col + 1 == cols;
+        Some(if is_edge { self.border_color } else { self.bg })
+    }
 }
 
 pub fn build_instances_at(
@@ -73,11 +91,11 @@ pub fn build_instances_at(
             let selected = selection.is_some_and(|selection| selection.contains(r, c));
             let hyperlink = cell.attrs.contains(Attrs::HYPERLINK);
             // Phase 4b-2b: cell이 어떤 block overlay 범위에 속하면 bg는 overlay.bg로 대체.
-            // selection > reversed > hyperlink > block overlay > default 순서.
+            // Phase 4b-2c-1: row range edge cell이면 border_color로 대체 (cell 단위 border).
+            // selection > reversed > hyperlink > block overlay > default.
             let block_bg = block_overlays
                 .iter()
-                .find(|b| r >= b.visible_row_start && r <= b.visible_row_end)
-                .map(|b| b.bg);
+                .find_map(|b| b.cell_color(r, c, term.cols()));
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
@@ -244,7 +262,70 @@ impl SelectionRange {
 
 #[cfg(test)]
 mod tests {
-    use super::SelectionRange;
+    use super::{BlockOverlay, SelectionRange};
+
+    const CARD_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
+    const CARD_BORDER: [f32; 4] = [0.3, 0.3, 0.4, 1.0];
+
+    fn overlay(start: usize, end: usize) -> BlockOverlay {
+        BlockOverlay {
+            visible_row_start: start,
+            visible_row_end: end,
+            bg: CARD_BG,
+            border_color: CARD_BORDER,
+        }
+    }
+
+    #[test]
+    fn block_overlay_cell_color_outside_range_none() {
+        let o = overlay(2, 5);
+        assert!(o.cell_color(0, 3, 10).is_none());
+        assert!(o.cell_color(1, 3, 10).is_none());
+        assert!(o.cell_color(6, 3, 10).is_none());
+    }
+
+    #[test]
+    fn block_overlay_cell_color_inside_uses_bg() {
+        let o = overlay(2, 5);
+        // row 3, col 5 — top/bottom 모두 아니고 좌우 edge 아님 → bg.
+        assert_eq!(o.cell_color(3, 5, 10), Some(CARD_BG));
+        assert_eq!(o.cell_color(4, 1, 10), Some(CARD_BG));
+    }
+
+    #[test]
+    fn block_overlay_cell_color_top_bottom_edge_is_border() {
+        let o = overlay(2, 5);
+        // top row(=2), bottom row(=5) 안쪽 cells.
+        assert_eq!(o.cell_color(2, 5, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(5, 5, 10), Some(CARD_BORDER));
+    }
+
+    #[test]
+    fn block_overlay_cell_color_left_right_edge_is_border() {
+        let o = overlay(2, 5);
+        // col 0 (좌측), col 9 (=cols-1, 우측). 가운데 row.
+        assert_eq!(o.cell_color(3, 0, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(3, 9, 10), Some(CARD_BORDER));
+    }
+
+    #[test]
+    fn block_overlay_cell_color_corner_is_border() {
+        let o = overlay(2, 5);
+        // 4 모서리 — top+left, top+right, bottom+left, bottom+right.
+        assert_eq!(o.cell_color(2, 0, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(2, 9, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(5, 0, 10), Some(CARD_BORDER));
+        assert_eq!(o.cell_color(5, 9, 10), Some(CARD_BORDER));
+    }
+
+    #[test]
+    fn block_overlay_single_row_card_all_border() {
+        // row range[3..=3]는 한 행만. 모든 cell이 top+bottom edge → border_color.
+        let o = overlay(3, 3);
+        for col in 0..10 {
+            assert_eq!(o.cell_color(3, col, 10), Some(CARD_BORDER));
+        }
+    }
 
     #[test]
     fn selection_range_normalizes_drag_direction() {

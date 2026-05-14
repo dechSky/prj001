@@ -11,6 +11,10 @@ pub struct ThemePalette {
     /// ANSI 16색. [0-7] = 표준 (검정/빨/녹/노/파/마젠타/시안/흰),
     /// [8-15] = bright. 테마별로 톤 매칭 + 라이트 테마는 7/15가 bg와 안 묻히게.
     pub ansi: [[f32; 4]; 16],
+    /// Phase 4b-2c: OSC 133 명령 블록 카드 bg. palette.bg와 다른 약간의 톤 변화.
+    pub block_bg: [f32; 4],
+    /// Phase 4b-2c: 명령 블록 카드 border. edge cell에만 적용.
+    pub block_border: [f32; 4],
 }
 
 impl ThemePalette {
@@ -52,6 +56,10 @@ impl ThemePalette {
                 rgb(0x3a, 0xa6, 0xc8),
                 rgb(0x2b, 0x27, 0x34),
             ],
+            // 4b-2c-1: aurora는 design §12 "obsidian 시각 + 5 테마 raw fallback" 따라
+            // bg와 동일값 (visual 효과 0). 4d에서 정식 매핑.
+            block_bg: rgb(0xf6, 0xf2, 0xeb),
+            block_border: rgb(0xf6, 0xf2, 0xeb),
         }
     }
 
@@ -80,6 +88,10 @@ impl ThemePalette {
                 rgb(0xa0, 0xff, 0xff),
                 rgb(0xe8, 0xe7, 0xef),
             ],
+            // 4b-2c-1: obsidian 카드 — bg는 mix(bg, fg, ~6%) ≈ #14 16 26, border는 ~15% ≈ #28 2a 3a.
+            // design §12 obsidian이 4b 시각 발동 대상.
+            block_bg: rgb(0x14, 0x16, 0x26),
+            block_border: rgb(0x28, 0x2a, 0x3a),
         }
     }
 
@@ -108,6 +120,8 @@ impl ThemePalette {
                 rgb(0x4a, 0x8a, 0x9a),
                 rgb(0x2a, 0x24, 0x19),
             ],
+            block_bg: rgb(0xef, 0xe7, 0xd2),
+            block_border: rgb(0xef, 0xe7, 0xd2),
         }
     }
 
@@ -136,6 +150,8 @@ impl ThemePalette {
                 rgb(0xc0, 0xff, 0xf0),
                 rgb(0xeb, 0xe8, 0xf6),
             ],
+            block_bg: rgb(0x0a, 0x08, 0x1e),
+            block_border: rgb(0x0a, 0x08, 0x1e),
         }
     }
 
@@ -164,6 +180,8 @@ impl ThemePalette {
                 rgb(0x3f, 0xaa, 0xb6),
                 rgb(0x1f, 0x1a, 0x14),
             ],
+            block_bg: rgb(0xe9, 0xdf, 0xc1),
+            block_border: rgb(0xe9, 0xdf, 0xc1),
         }
     }
 
@@ -192,6 +210,8 @@ impl ThemePalette {
                 rgb(0xa0, 0xff, 0xf0),
                 rgb(0xe6, 0xe8, 0xf4),
             ],
+            block_bg: rgb(0x0a, 0x0f, 0x24),
+            block_border: rgb(0x0a, 0x0f, 0x24),
         }
     }
 
@@ -260,6 +280,27 @@ mod tests {
             let bg_lum = p.bg[0] + p.bg[1] + p.bg[2];
             let fg_lum = p.fg[0] + p.fg[1] + p.fg[2];
             assert!(bg_lum < fg_lum, "{n} expected dark theme");
+        }
+    }
+
+    #[test]
+    fn block_tokens_obsidian_distinct_from_bg() {
+        // design §12: obsidian만 4b 시각 발동, 다른 5 테마는 raw fallback (bg와 동일).
+        let obs = ThemePalette::obsidian();
+        assert_ne!(obs.block_bg, obs.bg);
+        assert_ne!(obs.block_border, obs.bg);
+        assert_ne!(obs.block_bg, obs.block_border);
+    }
+
+    #[test]
+    fn block_tokens_other_themes_fallback_to_bg() {
+        for n in ["aurora", "vellum", "holo", "bento", "crystal"] {
+            let p = ThemePalette::by_name(n).unwrap();
+            assert_eq!(p.block_bg, p.bg, "{n} block_bg should match bg (fallback)");
+            assert_eq!(
+                p.block_border, p.bg,
+                "{n} block_border should match bg (fallback)"
+            );
         }
     }
 }
