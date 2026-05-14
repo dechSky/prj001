@@ -83,8 +83,12 @@ pub fn build_instances_at(
     row_offset: usize,
     palette: &ThemePalette,
     block_overlays: &[BlockOverlay],
+    gutter_cells: usize,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
+    // Phase 4b-2c-3: gutter도 카드 영역에 포함. 카드 폭 = gutter_cells + term.cols().
+    // content cell의 cell_color() col 인자는 gutter_cells + c로 환산.
+    let card_cols = gutter_cells + term.cols();
     for r in 0..term.rows() {
         for c in 0..term.cols() {
             let cell = term.cell(r, c);
@@ -99,10 +103,11 @@ pub fn build_instances_at(
             let hyperlink = cell.attrs.contains(Attrs::HYPERLINK);
             // Phase 4b-2b: cell이 어떤 block overlay 범위에 속하면 bg는 overlay.bg로 대체.
             // Phase 4b-2c-1: row range edge cell이면 border_color로 대체 (cell 단위 border).
+            // Phase 4b-2c-3: col 인덱스를 gutter_cells + c로 환산해서 cell_color 호출.
             // selection > reversed > hyperlink > block overlay > default.
             let block_bg = block_overlays
                 .iter()
-                .find_map(|b| b.cell_color(r, c, term.cols()));
+                .find_map(|b| b.cell_color(r, gutter_cells + c, card_cols));
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
@@ -162,6 +167,38 @@ pub fn build_instances_at(
                 flags: 0,
                 _pad: [0.0; 2],
             });
+        }
+    }
+
+    // Phase 4b-2c-3: gutter 영역에 카드 색 fill instance. gutter는 col_offset 좌측의
+    // gutter_cells 폭. block overlay row range에 걸치는 row의 각 gutter cell에 대해
+    // cell_color(r, gc, card_cols) → Some 색이면 fill push.
+    if gutter_cells > 0 && col_offset >= gutter_cells {
+        let gutter_start_col = col_offset - gutter_cells;
+        for r in 0..term.rows() {
+            for gc in 0..gutter_cells {
+                let bg_opt = block_overlays
+                    .iter()
+                    .find_map(|b| b.cell_color(r, gc, card_cols));
+                let Some(bg) = bg_opt else {
+                    continue;
+                };
+                out.push(CellInstance {
+                    cell_xy: [
+                        (gutter_start_col + gc) as f32,
+                        (r + row_offset) as f32,
+                    ],
+                    uv_min: [0.0; 2],
+                    uv_max: [0.0; 2],
+                    glyph_offset: [0.0; 2],
+                    glyph_size: [0.0; 2],
+                    fg: [0.0; 4],
+                    bg,
+                    cell_span: 1.0,
+                    flags: 0,
+                    _pad: [0.0; 2],
+                });
+            }
         }
     }
 
@@ -358,6 +395,31 @@ mod tests {
         assert_eq!(o.cell_color(2, 1, 2), None);
         assert_eq!(o.cell_color(5, 0, 2), None);
         assert_eq!(o.cell_color(5, 1, 2), None);
+    }
+
+    #[test]
+    fn block_overlay_with_gutter_treats_gutter_left_as_card_edge() {
+        // Phase 4b-2c-3: 카드 폭 = gutter_cells + content_cols. col 0이 gutter 좌측 끝(=
+        // 카드의 좌측 edge). 모서리는 (top/bottom row) AND (col 0 OR col cols-1).
+        let o = overlay(2, 5);
+        let gutter_cells = 2;
+        let content_cols = 10;
+        let card_cols = gutter_cells + content_cols; // 12
+
+        // top-left corner: col 0 (gutter 시작) + row 2 (top) → None.
+        assert_eq!(o.cell_color(2, 0, card_cols), None);
+        // top row, gutter 안쪽 col 1 → border (top edge).
+        assert_eq!(o.cell_color(2, 1, card_cols), Some(CARD_BORDER));
+        // gutter 안쪽 row + col 0 (좌측 edge) → border.
+        assert_eq!(o.cell_color(3, 0, card_cols), Some(CARD_BORDER));
+        // gutter 안쪽 row + gutter 두 번째 cell (col 1, 좌우 edge 아님) → bg.
+        assert_eq!(o.cell_color(3, 1, card_cols), Some(CARD_BG));
+        // content 시작 cell (col 2 = gutter_cells) → bg (안쪽).
+        assert_eq!(o.cell_color(3, 2, card_cols), Some(CARD_BG));
+        // content 마지막 cell (col 11 = card_cols-1, 우측 edge) → border.
+        assert_eq!(o.cell_color(3, 11, card_cols), Some(CARD_BORDER));
+        // top-right corner: row 2 + col 11 → None.
+        assert_eq!(o.cell_color(2, 11, card_cols), None);
     }
 
     #[test]

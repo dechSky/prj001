@@ -331,6 +331,7 @@ impl Renderer {
         col_offset: usize,
         row_offset: usize,
         block_overlays: &[geometry::BlockOverlay],
+        gutter_cells: usize,
     ) {
         // atlas miss 글리프를 동적으로 raster + insert
         for r in 0..term.rows() {
@@ -372,6 +373,7 @@ impl Renderer {
             row_offset,
             &self.palette,
             block_overlays,
+            gutter_cells,
         );
         if let Some((preedit_str, col, row)) = preedit {
             let mut preedit_inst = geometry::build_preedit_instances_at(

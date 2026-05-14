@@ -512,7 +512,7 @@ struct PaneViewport {
     height_px: u32,
     /// Block UI Phase 4a — prompt marker gutter 폭. 4a는 강제 0.
     /// 4b에서 block_capable && block_mode==auto일 때 발동.
-    #[allow(dead_code)]
+    /// 4b-2c-3: AppState::render에서 gutter_cells 계산에 사용.
     gutter_px: u16,
     /// `x_px + gutter_px`. mouse/selection 좌표 변환 시 사용. 4a는 x_px와 동일.
     #[allow(dead_code)]
@@ -3676,12 +3676,13 @@ impl AppState {
         let active = self.active_tab().active;
         let pane_count = self.active_tab().panes.len();
         for idx in 0..pane_count {
-            let (pane_id, pane_col_offset, pane_row_offset, session_id) = {
+            let (pane_id, pane_col_offset, pane_row_offset, pane_gutter_px, session_id) = {
                 let p = &self.active_tab().panes[idx];
                 (
                     p.id,
                     p.viewport.col_offset,
                     p.viewport.row_offset,
+                    p.viewport.gutter_px,
                     p.session,
                 )
             };
@@ -3752,6 +3753,10 @@ impl AppState {
                     } else {
                         Vec::new()
                     };
+                // Phase 4b-2c-3: gutter_cells = gutter_px / cell_w. compute_tab_viewports에서
+                // 이미 cell.width 단위로 align됐으므로 정확한 정수 분할.
+                let cell_w = self.renderer.cell_metrics().width.max(1);
+                let pane_gutter_cells = (pane_gutter_px as u32 / cell_w) as usize;
                 self.renderer.append_term(
                     &self.queue,
                     &term,
@@ -3761,6 +3766,7 @@ impl AppState {
                     pane_col_offset,
                     pane_row_offset,
                     &block_overlays,
+                    pane_gutter_cells,
                 );
                 // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
                 if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
