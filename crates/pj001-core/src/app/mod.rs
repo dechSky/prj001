@@ -988,7 +988,8 @@ impl App {
         ))
         .expect("AppState::new");
         state.window.focus_window();
-        // M6-3 Phase 0: IME 이벤트 활성화.
+        // IME 이벤트 활성화. winit 0.30.13에서 macOS set_ime_purpose는 no-op
+        // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
         state.window.set_ime_allowed(true);
         state.window.set_ime_purpose(ImePurpose::Terminal);
         let window = state.window.clone();

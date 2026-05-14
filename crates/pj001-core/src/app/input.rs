@@ -34,8 +34,21 @@ pub fn encode_key(event: &KeyEvent, mode: InputMode) -> Option<Vec<u8>> {
             }
         }
     }
-    // 3. text fallback (한글 IME unicode 등).
-    event.text.as_ref().map(|s| s.as_bytes().to_vec())
+    // 3. text fallback. winit 0.30.13 macOS Korean IME 회귀(setMarkedText 미호출, insertText
+    // 직접) 케이스에서 자모 단위 자모 텍스트가 KeyboardInput.text로 들어와 PTY에 그대로 흘러감.
+    // → non-ASCII는 IME path(WindowEvent::Ime::Commit)만 신뢰하도록 차단.
+    // ASCII는 그대로 통과 (영문 입력 등 정상).
+    event.text.as_ref().and_then(|s| {
+        if s.chars().all(|c| c.is_ascii()) {
+            Some(s.as_bytes().to_vec())
+        } else {
+            log::debug!(
+                "input: drop non-ASCII KeyboardInput.text={:?} (IME path only)",
+                s
+            );
+            None
+        }
+    })
 }
 
 /// xterm modifier 파라미터 (Pm). Shift=1, Alt=2, Ctrl=4 비트 합 + 1.
