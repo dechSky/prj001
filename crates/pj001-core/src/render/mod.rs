@@ -190,6 +190,12 @@ impl Renderer {
                     shader_location: 8,
                     format: wgpu::VertexFormat::Uint32,
                 },
+                // Phase 4b-2c-4a: block_border_color
+                wgpu::VertexAttribute {
+                    offset: 80,
+                    shader_location: 9,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
 
@@ -447,6 +453,7 @@ impl Renderer {
                 bg,
                 cell_span: 1.0,
                 flags: 0,
+                block_border_color: [0.0; 4],
                 _pad: [0.0; 2],
             });
         }
@@ -464,6 +471,7 @@ impl Renderer {
                 bg,
                 cell_span: 1.0,
                 flags: 0,
+                block_border_color: [0.0; 4],
                 _pad: [0.0; 2],
             });
         }
@@ -481,6 +489,7 @@ impl Renderer {
                 bg,
                 cell_span: 1.0,
                 flags: 0,
+                block_border_color: [0.0; 4],
                 _pad: [0.0; 2],
             });
         }

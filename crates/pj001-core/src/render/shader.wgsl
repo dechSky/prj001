@@ -19,6 +19,7 @@ struct VsIn {
     @location(6) bg: vec4<f32>,
     @location(7) cell_span: f32,
     @location(8) flags: u32,
+    @location(9) block_border_color: vec4<f32>,
 };
 
 struct VsOut {
@@ -33,6 +34,7 @@ struct VsOut {
     // 정수 type은 fragment로 보낼 때 flat interpolation 필수.
     @location(7) @interpolate(flat) flags: u32,
     @location(8) cell_span: f32,
+    @location(9) block_border_color: vec4<f32>,
 };
 
 @vertex
@@ -59,6 +61,7 @@ fn vs(input: VsIn) -> VsOut {
     o.bg = input.bg;
     o.flags = input.flags;
     o.cell_span = input.cell_span;
+    o.block_border_color = input.block_border_color;
     return o;
 }
 

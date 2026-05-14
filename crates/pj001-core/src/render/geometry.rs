@@ -21,9 +21,32 @@ pub struct CellInstance {
     /// - bit 0 (0x01): cursor overlay instance 표시
     /// - bit 1-2 (0x06): cursor shape (0=Block, 1=Underscore, 2=Bar)
     /// - bit 3 (0x08): focused (1=focused 일반 shape, 0=outline)
+    /// - bit 4 (0x10): BLOCK_CARD — cell이 카드 영역 (SDF path 발동)
+    /// - bit 5 (0x20): BLOCK_EDGE_TOP
+    /// - bit 6 (0x40): BLOCK_EDGE_BOTTOM
+    /// - bit 7 (0x80): BLOCK_EDGE_LEFT
+    /// - bit 8 (0x100): BLOCK_EDGE_RIGHT
     pub flags: u32,
+    /// Phase 4b-2c-4: SDF block card용 border 색. BLOCK_CARD bit가 unset이면 무시.
+    pub block_border_color: [f32; 4],
     pub _pad: [f32; 2],
 }
+
+/// flag bit 상수 — geometry/shader 양쪽 공유. 일부는 4b-2c-4b/4c step에서 활성화.
+#[allow(dead_code)]
+pub const FLAG_CURSOR: u32 = 0x01;
+#[allow(dead_code)]
+pub const FLAG_CURSOR_SHAPE_MASK: u32 = 0x06;
+#[allow(dead_code)]
+pub const FLAG_BLOCK_CARD: u32 = 0x10;
+#[allow(dead_code)]
+pub const FLAG_BLOCK_EDGE_TOP: u32 = 0x20;
+#[allow(dead_code)]
+pub const FLAG_BLOCK_EDGE_BOTTOM: u32 = 0x40;
+#[allow(dead_code)]
+pub const FLAG_BLOCK_EDGE_LEFT: u32 = 0x80;
+#[allow(dead_code)]
+pub const FLAG_BLOCK_EDGE_RIGHT: u32 = 0x100;
 
 #[derive(Clone, Copy)]
 pub struct CursorRender {
@@ -165,6 +188,7 @@ pub fn build_instances_at(
                 bg,
                 cell_span,
                 flags: 0,
+                block_border_color: [0.0; 4],
                 _pad: [0.0; 2],
             });
         }
@@ -196,6 +220,7 @@ pub fn build_instances_at(
                     bg,
                     cell_span: 1.0,
                     flags: 0,
+                    block_border_color: [0.0; 4],
                     _pad: [0.0; 2],
                 });
             }
@@ -269,6 +294,7 @@ pub fn build_instances_at(
             bg: overlay_bg,
             cell_span: cur_span,
             flags,
+            block_border_color: [0.0; 4],
             _pad: [0.0; 2],
         });
     }
@@ -506,6 +532,7 @@ pub fn build_preedit_instances_at(
             bg: palette.bg,
             cell_span,
             flags: 0,
+            block_border_color: [0.0; 4],
             _pad: [0.0; 2],
         });
         col += w;
