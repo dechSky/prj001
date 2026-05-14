@@ -934,6 +934,77 @@ mod tests {
         assert_eq!(term.prompts_seen(), 1);
     }
 
+    // === Phase 4a end-to-end vte parser fixture — Term API 우회 없이 raw bytes로 검증 ===
+
+    #[test]
+    fn vte_fixture_osc_133_full_lifecycle_populates_blockstream() {
+        use crate::block::BlockState;
+        let mut term = Term::new(40, 5);
+        // 진짜 shell이 보내는 패턴: prompt(A) → command_start(B) → output_start(C) → end(D)
+        run(&mut term, b"\x1b[1;1H");
+        run(&mut term, b"\x1b]133;A\x1b\\");
+        run(&mut term, b"\x1b]133;B\x1b\\");
+        run(&mut term, b"\x1b]133;C\x1b\\");
+        run(&mut term, b"\x1b]133;D;0\x1b\\");
+        assert!(term.block_capable(), "OSC 133 첫 수신 시 latch true");
+        let blocks: Vec<_> = term.blocks().iter().collect();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0].state {
+            BlockState::Completed { exit_code } => assert_eq!(*exit_code, Some(0)),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // 4 boundary 모두 set.
+        assert_eq!(blocks[0].prompt_start_abs, 0);
+        assert!(blocks[0].command_start_abs.is_some());
+        assert!(blocks[0].output_start_abs.is_some());
+        assert!(blocks[0].output_end_abs.is_some());
+    }
+
+    #[test]
+    fn vte_fixture_osc_133_a_after_a_abandons_prior() {
+        use crate::block::{AbandonReason, BlockState};
+        let mut term = Term::new(40, 5);
+        run(&mut term, b"\x1b]133;A\x1b\\");
+        run(&mut term, b"\x1b[2;1H"); // 다음 행으로 cursor 이동.
+        run(&mut term, b"\x1b]133;A\x1b\\"); // 두 번째 prompt, prior는 D 미수신.
+        let blocks: Vec<_> = term.blocks().iter().collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0].state,
+            BlockState::Abandoned {
+                reason: AbandonReason::NewPrompt
+            }
+        );
+        assert_eq!(blocks[1].state, BlockState::Prompt);
+    }
+
+    #[test]
+    fn vte_fixture_decstr_abandons_active_block() {
+        use crate::block::{AbandonReason, BlockState};
+        let mut term = Term::new(40, 3);
+        run(&mut term, b"\x1b]133;A\x1b\\");
+        run(&mut term, b"\x1b]133;B\x1b\\");
+        run(&mut term, b"\x1b[!p"); // DECSTR
+        let blocks: Vec<_> = term.blocks().iter().collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].state,
+            BlockState::Abandoned {
+                reason: AbandonReason::Reset
+            }
+        );
+    }
+
+    #[test]
+    fn vte_fixture_alt_screen_ignores_osc_133() {
+        let mut term = Term::new(40, 3);
+        run(&mut term, b"\x1b[?1049h"); // alt screen 진입.
+        run(&mut term, b"\x1b]133;A\x1b\\");
+        // alt 모드에서는 OSC 133 무시 — BlockStream 비어있음.
+        assert_eq!(term.blocks().iter().count(), 0);
+        assert!(!term.block_capable());
+    }
+
     #[test]
     fn ris_clears_hyperlink_pool() {
         let mut term = Term::new(8, 1);
