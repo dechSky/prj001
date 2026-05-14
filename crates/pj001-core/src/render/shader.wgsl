@@ -72,7 +72,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let cell_w = u.cell.x * in.cell_span;
         let cell_h = u.cell.y;
         let underscore_thick = max(2.0, cell_h * 0.12);
-        let bar_thick = max(2.0, cell_w * 0.15);
+        // bar 두께는 일반 텍스트 caret 수준으로 slim. cell_w*0.10이고 1~2px floor.
+        let bar_thick = max(1.0, min(2.0, cell_w * 0.10));
         let outline_w = max(1.0, cell_w * 0.05);
         let outline_h = max(1.0, cell_h * 0.05);
         var in_shape = false;

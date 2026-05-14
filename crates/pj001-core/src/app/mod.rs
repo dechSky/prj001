@@ -2961,8 +2961,9 @@ impl AppState {
     }
 
     fn update_mouse_cursor(&self) {
-        // 우선순위: divider drag/hover(↔ ↕) > pane 영역(I-beam) > 그 외(Default).
-        // pane 영역은 status row 포함 — 터미널 위면 어디든 텍스트 편집 가능 인상 주기 위해.
+        // 우선순위: divider drag/hover(↔ ↕) > pane content cell(I-beam) > 그 외(Default).
+        // content cell만 I-beam으로 — selection hit-test와 동일 영역. status row/tab bar는
+        // 텍스트 편집 영역이 아니라 I-beam 부적절.
         let hit = self
             .dragging_divider
             .as_ref()
@@ -2972,7 +2973,7 @@ impl AppState {
             Some(SplitAxis::Vertical) => CursorIcon::ColResize,
             Some(SplitAxis::Horizontal) => CursorIcon::RowResize,
             None => {
-                if self.pane_at_mouse(true).is_some() {
+                if self.pane_cell_at_mouse().is_some() {
                     CursorIcon::Text
                 } else {
                     CursorIcon::Default

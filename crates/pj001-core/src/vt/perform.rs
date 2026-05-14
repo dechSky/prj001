@@ -351,8 +351,11 @@ fn home_relative(abs_path: &str) -> String {
 }
 
 fn decscusr_to_shape(n: usize) -> Option<(CursorShape, bool)> {
+    // xterm 표준: 0 = "default cursor shape" (user/terminal default).
+    // pj001 user default는 Bar (blink). 1은 표준대로 blink block 유지.
     match n {
-        0 | 1 => Some((CursorShape::Block, true)),
+        0 => Some((CursorShape::Bar, true)),
+        1 => Some((CursorShape::Block, true)),
         2 => Some((CursorShape::Block, false)),
         3 => Some((CursorShape::Underscore, true)),
         4 => Some((CursorShape::Underscore, false)),
@@ -430,9 +433,9 @@ mod tests {
         assert_eq!(term.cursor().shape, CursorShape::Block);
         assert!(!term.cursor().blinking);
 
-        // n=0: default (blink block)
+        // n=0: user/terminal default. pj001 default = Bar (blink).
         run(&mut term, b"\x1b[0 q");
-        assert_eq!(term.cursor().shape, CursorShape::Block);
+        assert_eq!(term.cursor().shape, CursorShape::Bar);
         assert!(term.cursor().blinking);
     }
 
