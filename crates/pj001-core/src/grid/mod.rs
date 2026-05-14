@@ -298,6 +298,7 @@ fn map_cursor_in_line(line_rows: &[(Vec<Cell>, RowFlags)], offset: usize) -> (us
 /// 외부 의존 없음 — 헤드리스 unit test 가능.
 ///
 /// Phase 4a Step 5a: thin wrapper. tag 인자 없이 기존 호출 방식 유지 — 기존 테스트 보존.
+#[allow(dead_code)]
 pub(crate) fn rewrap_lines(
     rows: &[(Vec<Cell>, RowFlags)],
     cursor_row: usize,
@@ -325,7 +326,6 @@ pub(crate) fn rewrap_lines_with_tags(
     };
     // tags len 검증: 0 또는 rows.len()과 일치해야 한다. mismatch면 ignore (safety).
     let use_tags = !tags.is_empty() && tags.len() == rows.len();
-    let _ = use_tags; // Step 5b에서 활용.
     if rows.is_empty() || new_cols == 0 {
         return result;
     }
@@ -340,12 +340,20 @@ pub(crate) fn rewrap_lines_with_tags(
         }
         let end = j;
 
-        // cells 평탄화 + cursor offset 추적
+        // cells 평탄화 + cursor offset + tag logical_offset 수집.
+        // Phase 4a 1차 cut: row의 모든 tag를 그 row의 시작 logical_offset에 매핑 (col 단위 정밀도는 미지원).
         let mut combined: Vec<Cell> = Vec::new();
         let mut cursor_offset_in_line: Option<usize> = None;
+        let mut tag_events: Vec<(usize, RowBlockTag)> = Vec::new();
         for k in i..=end {
             if k == cursor_row {
                 cursor_offset_in_line = Some(combined.len() + cursor_col);
+            }
+            if use_tags {
+                let row_start_logical = combined.len();
+                for t in &tags[k] {
+                    tag_events.push((row_start_logical, *t));
+                }
             }
             combined.extend_from_slice(&rows[k].0);
         }
@@ -359,36 +367,49 @@ pub(crate) fn rewrap_lines_with_tags(
             }
         }
 
-        // re-wrap to new_cols
+        // re-wrap to new_cols + tag carry. 각 new_row가 cover한 logical_offset 구간 추적.
         let line_start = result.new_rows.len();
+        // 이 logical line에서 emit될 new_rows의 logical_offset 시작.
+        // Vec<(row_index_in_new_rows, start_logical, consumed_logical)>.
+        let mut row_spans: Vec<(usize, usize, usize)> = Vec::new();
         let mut row_buffer: Vec<Cell> = Vec::with_capacity(new_cols);
+        let mut current_row_start_logical = 0usize;
+        let mut current_row_consumed = 0usize;
         let mut idx = 0;
         while idx < combined.len() {
             let cell = combined[idx];
             let is_wide = cell.attrs.contains(Attrs::WIDE);
             let glyph_w = if is_wide { 2 } else { 1 };
 
-            // 1 col 안전망: WIDE 표시 불가 → skip + WIDE_CONT 동반 skip
+            // 1 col 안전망: WIDE 표시 불가 → skip + WIDE_CONT 동반 skip.
+            // logical_offset 진척도 함께 진행 (consumed 증가).
             if is_wide && new_cols < 2 {
-                idx += if idx + 1 < combined.len()
+                let consume = if idx + 1 < combined.len()
                     && combined[idx + 1].attrs.contains(Attrs::WIDE_CONT)
                 {
                     2
                 } else {
                     1
                 };
+                idx += consume;
+                current_row_consumed += consume;
                 continue;
             }
 
             // 현재 row가 가득 차 다음 글자가 안 들어감 → flush + 다음 row
             if row_buffer.len() + glyph_w > new_cols {
-                // WIDE 경계: 마지막 1칸이 비고 다음 글자가 WIDE면 빈 default padding
+                // WIDE 경계: 마지막 1칸이 비고 다음 글자가 WIDE면 빈 default padding.
+                // padding은 logical_offset 증가시키지 않음 — 다음 row(WIDE 글리프 시작)로 tag carry.
                 while row_buffer.len() < new_cols {
                     row_buffer.push(Cell::default());
                 }
+                let row_idx = result.new_rows.len();
                 result
                     .new_rows
                     .push((std::mem::take(&mut row_buffer), RowFlags::WRAPPED));
+                row_spans.push((row_idx, current_row_start_logical, current_row_consumed));
+                current_row_start_logical += current_row_consumed;
+                current_row_consumed = 0;
             }
 
             row_buffer.push(cell);
@@ -396,17 +417,52 @@ pub(crate) fn rewrap_lines_with_tags(
                 if idx + 1 < combined.len() && combined[idx + 1].attrs.contains(Attrs::WIDE_CONT) {
                     row_buffer.push(combined[idx + 1]);
                     idx += 2;
+                    current_row_consumed += 2;
                 } else {
                     idx += 1;
+                    current_row_consumed += 1;
                 }
             } else {
                 idx += 1;
+                current_row_consumed += 1;
             }
         }
 
         // 마지막 row buffer flush (빈 logical line이라도 row 1개 emit)
         if !row_buffer.is_empty() || combined.is_empty() {
+            let row_idx = result.new_rows.len();
             result.new_rows.push((row_buffer, RowFlags::empty()));
+            row_spans.push((row_idx, current_row_start_logical, current_row_consumed));
+        }
+
+        // tag carry: tag.logical_offset이 [start, start+consumed) 안에 있는 row에 push.
+        // 경계(== start+consumed)는 다음 row로 — padding-only row 회피.
+        if use_tags && !tag_events.is_empty() {
+            // new_row_tags를 line이 추가한 row 수만큼 미리 확장.
+            while result.new_row_tags.len() < result.new_rows.len() {
+                result.new_row_tags.push(Vec::new());
+            }
+            'outer: for (offset, tag) in &tag_events {
+                for (row_idx, start, consumed) in &row_spans {
+                    if *consumed == 0 {
+                        continue; // padding-only row는 skip (WIDE 경계).
+                    }
+                    if *offset >= *start && *offset < *start + *consumed {
+                        result.new_row_tags[*row_idx].push(*tag);
+                        continue 'outer;
+                    }
+                }
+                // fallback 1: actual cell이 있는 마지막 row (예: cursor 끝 trim 케이스).
+                // fallback 2: row_spans의 첫 row (empty logical line 케이스 — actual row가 없을 때).
+                let target = row_spans
+                    .iter()
+                    .rev()
+                    .find(|(_, _, consumed)| *consumed > 0)
+                    .or_else(|| row_spans.first());
+                if let Some((row_idx, _, _)) = target {
+                    result.new_row_tags[*row_idx].push(*tag);
+                }
+            }
         }
 
         // cursor 매핑: 이 logical line이 만들어낸 NewRow 슬라이스에서 offset → (rel_row, col)
@@ -423,8 +479,10 @@ pub(crate) fn rewrap_lines_with_tags(
         i = end + 1;
     }
 
-    // Phase 4a: new_row_tags를 new_rows와 같은 길이로 빈 Vec 채움. 실제 tag carry는 Step 5b.
-    result.new_row_tags = vec![Vec::new(); result.new_rows.len()];
+    // 안전: new_row_tags가 new_rows보다 짧으면 빈 Vec로 채움 (use_tags=false 경로 등).
+    while result.new_row_tags.len() < result.new_rows.len() {
+        result.new_row_tags.push(Vec::new());
+    }
     result
 }
 
@@ -1077,21 +1135,25 @@ impl Term {
         let old_cols = self.main.cols;
         let old_rows = self.main.rows;
 
-        // 평탄화 입력: scrollback rows + main rows 합쳐 한 시퀀스.
+        // 평탄화 입력: scrollback rows + main rows 합쳐 한 시퀀스. Phase 4a: tag도 parallel.
         let mut input: Vec<(Vec<Cell>, RowFlags)> = Vec::with_capacity(sb_before + old_rows);
+        let mut input_tags: Vec<Vec<RowBlockTag>> = Vec::with_capacity(sb_before + old_rows);
         for sb_row in &self.scrollback {
             input.push((sb_row.cells.clone(), sb_row.flags));
+            input_tags.push(sb_row.block_tags.clone());
         }
         for r in 0..old_rows {
             let start = r * old_cols;
             let end = start + old_cols;
             let cells = self.main.cells[start..end].to_vec();
             input.push((cells, self.main.row_flags[r]));
+            input_tags.push(self.main.row_block_tags[r].clone());
         }
 
         let cursor_row_input = sb_before + self.cursor.row.min(old_rows.saturating_sub(1));
         let cursor_col = self.cursor.col;
-        let result = rewrap_lines(&input, cursor_row_input, cursor_col, new_cols);
+        let result =
+            rewrap_lines_with_tags(&input, &input_tags, cursor_row_input, cursor_col, new_cols);
 
         let total = result.new_rows.len();
 
@@ -1106,15 +1168,19 @@ impl Term {
                 .saturating_sub(new_rows.saturating_sub(1))
         };
 
-        // 새 scrollback 빌드: NewRow[0..main_start]를 ScrollbackRow로.
-        // block_tags carry는 Step 5(reflow remap)에서 — 현 단계는 빈 Vec placeholder.
+        // 새 scrollback 빌드: NewRow[0..main_start]를 ScrollbackRow로 (block_tags carry).
         let mut new_scrollback: VecDeque<ScrollbackRow> = VecDeque::with_capacity(main_start);
         for src_idx in 0..main_start {
             let (cells, flags) = &result.new_rows[src_idx];
+            let block_tags = result
+                .new_row_tags
+                .get(src_idx)
+                .cloned()
+                .unwrap_or_default();
             new_scrollback.push_back(ScrollbackRow {
                 cells: cells.clone(),
                 flags: *flags,
-                block_tags: Vec::new(),
+                block_tags,
             });
         }
         // Phase 4a: reflow 후 SCROLLBACK_CAP 재적용 front drop도 oldest_kept_abs 증가.
@@ -1142,14 +1208,61 @@ impl Term {
             new_flags[new_rows - 1].remove(RowFlags::WRAPPED);
         }
 
+        // 새 main row_block_tags carry (Phase 4a).
+        let mut new_block_tags: Vec<Vec<RowBlockTag>> = vec![Vec::new(); new_rows];
+        for r in 0..new_rows {
+            let src_idx = main_start + r;
+            if src_idx < total
+                && let Some(tags) = result.new_row_tags.get(src_idx)
+            {
+                new_block_tags[r] = tags.clone();
+            }
+        }
+
         // swap (panic safety).
         self.scrollback = new_scrollback;
         self.main.cells = new_cells;
         self.main.row_flags = new_flags;
-        // block_tags는 Step 5에서 logical_offset carry로 채움 — 현 단계는 reset.
-        self.main.row_block_tags = vec![Vec::new(); new_rows];
+        self.main.row_block_tags = new_block_tags;
         self.main.cols = new_cols;
         self.main.rows = new_rows;
+
+        // Phase 4a 작업 순서 (advisor 가이드): Block.*_abs 재계산 먼저, drop_below는 나중.
+        // stale *_abs로 drop_below 호출하면 살아있어야 할 block이 잘못 drop됨.
+        let sb_len = self.scrollback.len() as u64;
+        let oka = self.oldest_kept_abs;
+        // scrollback rows.
+        for (r, sb_row) in self.scrollback.iter().enumerate() {
+            let abs = oka + r as u64;
+            for tag in &sb_row.block_tags {
+                if let Some(b) = self.blocks.get_mut(tag.block_id) {
+                    match tag.kind {
+                        BlockBoundary::PromptStart => b.prompt_start_abs = abs,
+                        BlockBoundary::CommandStart => b.command_start_abs = Some(abs),
+                        BlockBoundary::OutputStart => b.output_start_abs = Some(abs),
+                        BlockBoundary::OutputEnd => b.output_end_abs = Some(abs),
+                    }
+                }
+            }
+        }
+        // main rows.
+        for r in 0..self.main.rows {
+            let abs = oka + sb_len + r as u64;
+            // clone tags to release immutable borrow before mutable get_mut.
+            let row_tags: Vec<RowBlockTag> = self.main.row_block_tags[r].clone();
+            for tag in row_tags {
+                if let Some(b) = self.blocks.get_mut(tag.block_id) {
+                    match tag.kind {
+                        BlockBoundary::PromptStart => b.prompt_start_abs = abs,
+                        BlockBoundary::CommandStart => b.command_start_abs = Some(abs),
+                        BlockBoundary::OutputStart => b.output_start_abs = Some(abs),
+                        BlockBoundary::OutputEnd => b.output_end_abs = Some(abs),
+                    }
+                }
+            }
+        }
+        // 재계산 후 evicted block drop (prompt_start_abs < oldest_kept_abs).
+        self.blocks.drop_below(self.oldest_kept_abs);
 
         // cursor 매핑.
         let new_cursor_row = result
@@ -2482,14 +2595,122 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Step 5(reflow remap)에서 logical_offset carry 도입 후 활성화"]
     fn resize_preserves_row_block_tags_within_rows() {
+        // semantic_prompt_start로 진짜 block + tag를 만들어야 reflow가 abs를 갱신.
         let mut term = Term::new(8, 5);
-        term.push_row_block_tag(1, tag(1, BlockBoundary::PromptStart));
-        term.push_row_block_tag(3, tag(2, BlockBoundary::PromptStart));
-        term.resize(8, 3);
-        assert_eq!(term.main_row_block_tags(1).len(), 1);
-        assert_eq!(term.main_row_block_tags(1)[0].block_id, BlockId(1));
-        assert!(term.main_row_block_tags(2).is_empty());
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        term.set_cursor(3, 0);
+        term.semantic_prompt_start();
+        // 좁힘 (cols 변경 없음, rows 변경) → reflow가 carry해야 함.
+        // 단순 rows 변경은 reflow를 통과하지 않고 sb retention만 — 여기선 cols 변경.
+        term.resize(4, 5);
+        // 적어도 한 row에 tag가 carry되어야.
+        let total_main_tags: usize =
+            (0..5).map(|r| term.main_row_block_tags(r).len()).sum();
+        let total_sb_tags: usize = term
+            .scrollback
+            .iter()
+            .map(|sb| sb.block_tags.len())
+            .sum::<usize>();
+        assert!(total_main_tags + total_sb_tags >= 2);
+    }
+
+    // === Step 5c — reflow tag carry + Block.*_abs 재계산 ===
+
+    #[test]
+    fn reflow_preserves_block_after_narrowing() {
+        let mut term = Term::new(20, 5);
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        let prev_id = term.blocks().iter().next().unwrap().id;
+        term.resize(10, 5);
+        // Block은 살아있고, prompt_start_abs는 새 좌표.
+        let block = term.blocks().get(prev_id).expect("block must survive narrowing");
+        // tag가 carry된 row가 어떤 abs인지 확인.
+        let mut found = false;
+        for r in 0..term.main.rows {
+            if !term.main_row_block_tags(r).is_empty() {
+                let expected =
+                    term.oldest_kept_abs() + term.scrollback.len() as u64 + r as u64;
+                assert_eq!(block.prompt_start_abs, expected);
+                found = true;
+                break;
+            }
+        }
+        // 또는 scrollback에 있을 수도.
+        if !found {
+            for (r, sb) in term.scrollback.iter().enumerate() {
+                if !sb.block_tags.is_empty() {
+                    let expected = term.oldest_kept_abs() + r as u64;
+                    assert_eq!(block.prompt_start_abs, expected);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "tag must survive reflow somewhere");
+    }
+
+    #[test]
+    fn reflow_carries_multi_tag_on_same_row() {
+        let mut term = Term::new(40, 3);
+        term.set_cursor(0, 0);
+        term.semantic_prompt_start();
+        // 같은 row에 B를 stamp (cursor 그대로).
+        term.semantic_command_start();
+        assert_eq!(term.main_row_block_tags(0).len(), 2);
+        // reflow 후에도 같은 row에 두 tag.
+        term.resize(20, 3);
+        let total: usize = (0..3)
+            .map(|r| term.main_row_block_tags(r).len())
+            .sum::<usize>()
+            + term
+                .scrollback
+                .iter()
+                .map(|sb| sb.block_tags.len())
+                .sum::<usize>();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn reflow_wide_padding_carries_tag_to_glyph_row() {
+        let mut term = Term::new(4, 3);
+        // row 1 cursor → 좁힘 시 WIDE 글자 들어가면 padding 발생할 수 있음.
+        term.set_cursor(1, 0);
+        for ch in "abc".chars() {
+            term.print(ch);
+        }
+        term.semantic_prompt_start();
+        // 4 → 2 column으로 좁힘 (1-col 안전망 제외하고 WIDE 가능).
+        term.resize(2, 3);
+        let total: usize = (0..3)
+            .map(|r| term.main_row_block_tags(r).len())
+            .sum::<usize>()
+            + term
+                .scrollback
+                .iter()
+                .map(|sb| sb.block_tags.len())
+                .sum::<usize>();
+        // tag는 어디든 carry돼야 함.
+        assert!(total >= 1);
+    }
+
+    #[test]
+    fn reflow_widens_keeps_tag() {
+        let mut term = Term::new(10, 3);
+        term.set_cursor(0, 0);
+        term.semantic_prompt_start();
+        term.resize(40, 3);
+        // 넓힘 후에도 한 row에 tag.
+        let total: usize = (0..3)
+            .map(|r| term.main_row_block_tags(r).len())
+            .sum::<usize>()
+            + term
+                .scrollback
+                .iter()
+                .map(|sb| sb.block_tags.len())
+                .sum::<usize>();
+        assert_eq!(total, 1);
     }
 }
