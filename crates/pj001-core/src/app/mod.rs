@@ -937,6 +937,36 @@ fn compute_tab_viewports(
     layouts
 }
 
+/// Phase 5: 색 mix helper. dim scrollbar thumb 등 partial blend에 사용.
+fn mix_palette(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] * (1.0 - t) + b[0] * t,
+        a[1] * (1.0 - t) + b[1] * t,
+        a[2] * (1.0 - t) + b[2] * t,
+        a[3] * (1.0 - t) + b[3] * t,
+    ]
+}
+
+/// Phase 5: scrollback이 있을 때 우측에 표시할 scrollbar thumb 위치/길이(viewport row 단위).
+/// scrollback_len == 0이면 None. view_offset = 0(bottom)이면 thumb이 viewport 바닥, view_offset =
+/// scrollback_len(top)이면 thumb이 viewport 천장.
+fn scrollbar_thumb(
+    viewport_rows: usize,
+    scrollback_len: usize,
+    view_offset: usize,
+) -> Option<(usize, usize)> {
+    if scrollback_len == 0 || viewport_rows == 0 {
+        return None;
+    }
+    let total = scrollback_len + viewport_rows;
+    let thumb_size = ((viewport_rows * viewport_rows) / total).max(1);
+    let bottom_anchored = scrollback_len.saturating_sub(view_offset);
+    let top_offset = (bottom_anchored * viewport_rows) / total;
+    // clamp: thumb이 viewport 안에 들어가도록.
+    let top_offset = top_offset.min(viewport_rows.saturating_sub(thumb_size));
+    Some((top_offset, thumb_size))
+}
+
 /// Phase 4c: BlockState + duration_ms → status badge text. None이면 badge 안 그림.
 fn status_badge_text(state: &BlockState, duration_ms: Option<u64>) -> Option<String> {
     match state {
@@ -3853,6 +3883,32 @@ impl AppState {
                     &block_overlays,
                     pane_gutter_cells,
                 );
+                // Phase 5: scrollbar — scrollback이 있을 때 우측 마지막 col에 thumb 표시.
+                // view_offset 0면 thumb 바닥, scrollback_len이면 천장.
+                let scrollback_len = term.scrollback_len();
+                let view_offset = term.view_offset();
+                let viewport_rows = self.active_tab().panes[idx].viewport.rows;
+                if let Some((thumb_top, thumb_size)) =
+                    scrollbar_thumb(viewport_rows, scrollback_len, view_offset)
+                {
+                    let palette = self.renderer.palette();
+                    // scrollback view 활성 시 더 강조 — view_offset>0면 block_border(밝음),
+                    // 0이면 dim(fg를 bg에 0.3 mix).
+                    let thumb_bg = if view_offset > 0 {
+                        palette.block_border
+                    } else {
+                        mix_palette(palette.bg, palette.fg, 0.3)
+                    };
+                    let scrollbar_col = pane_col_offset + self.active_tab().panes[idx].viewport.cols
+                        - 1;
+                    let scrollbar_row = pane_row_offset + thumb_top;
+                    self.renderer.append_fill_column(
+                        scrollbar_col,
+                        scrollbar_row,
+                        thumb_size,
+                        thumb_bg,
+                    );
+                }
                 // Phase 4c: status badge — 각 카드의 visible_row_start 우측 끝에 chip text.
                 let viewport_cols = {
                     self.active_tab().panes[idx].viewport.cols
@@ -4203,6 +4259,44 @@ mod tests {
         assert_eq!(viewport.row_offset, 1);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.y_px, 20);
+    }
+
+    #[test]
+    fn scrollbar_thumb_none_when_no_scrollback() {
+        assert!(scrollbar_thumb(10, 0, 0).is_none());
+    }
+
+    #[test]
+    fn scrollbar_thumb_bottom_when_view_offset_zero() {
+        // scrollback 100, viewport 10, view_offset 0 (bottom).
+        // total = 110, thumb_size = 10*10/110 = 0 → max(1) = 1.
+        // bottom_anchored = 100, top_offset = 100*10/110 = 9. clamp to (10-1)=9.
+        let (top, size) = scrollbar_thumb(10, 100, 0).unwrap();
+        assert_eq!(size, 1);
+        assert_eq!(top, 9);
+    }
+
+    #[test]
+    fn scrollbar_thumb_top_when_view_offset_max() {
+        // view_offset = scrollback_len → bottom_anchored = 0, top_offset = 0.
+        let (top, size) = scrollbar_thumb(10, 100, 100).unwrap();
+        assert_eq!(top, 0);
+        assert!(size >= 1);
+    }
+
+    #[test]
+    fn scrollbar_thumb_middle_position() {
+        // scrollback 10, view_offset 5 (middle), viewport 10. total 20.
+        // bottom_anchored = 5, top_offset = 5*10/20 = 2.
+        // thumb_size = 10*10/20 = 5. clamp (10-5)=5. top=2.
+        let (top, size) = scrollbar_thumb(10, 10, 5).unwrap();
+        assert_eq!(top, 2);
+        assert_eq!(size, 5);
+    }
+
+    #[test]
+    fn scrollbar_thumb_zero_viewport() {
+        assert!(scrollbar_thumb(0, 100, 50).is_none());
     }
 
     #[test]
