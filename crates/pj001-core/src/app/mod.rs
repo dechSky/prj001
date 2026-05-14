@@ -198,6 +198,16 @@ pub struct Config {
     pub hooks: Hooks,
     /// 활성 테마 팔레트. `None`이면 `ThemePalette::default_theme()` 사용.
     pub theme: Option<ThemePalette>,
+    /// Block UI 렌더 모드. default Auto — OSC 133 수신 시 gutter/card visual ON.
+    /// Off — 절대 visual ON 안 함. Phase 4b부터 실제 시각 분기.
+    pub block_mode: BlockMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BlockMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,6 +357,7 @@ impl Config {
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
+            block_mode: BlockMode::default(),
         }
     }
 
@@ -361,7 +372,13 @@ impl Config {
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
+            block_mode: BlockMode::default(),
         }
+    }
+
+    pub fn with_block_mode(mut self, mode: BlockMode) -> Self {
+        self.block_mode = mode;
+        self
     }
 
     pub fn with_quick_spawn_presets(mut self, presets: Vec<QuickSpawnPreset>) -> Self {
@@ -4587,6 +4604,7 @@ mod tests {
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
+            block_mode: BlockMode::default(),
         };
 
         assert!(config.pane_specs().is_err());
@@ -4607,6 +4625,7 @@ mod tests {
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
+            block_mode: BlockMode::default(),
         };
 
         assert!(config.pane_specs().is_err());

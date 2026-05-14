@@ -1,4 +1,4 @@
-use pj001_core::app::{self, Config};
+use pj001_core::app::{self, BlockMode, Config};
 use pj001_core::error::{self, Error};
 use pj001_core::render::ThemePalette;
 use serde::Deserialize;
@@ -139,21 +139,25 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         })?),
         None => None,
     };
-    // Block mode 파싱 — auto/off만 허용. default "auto". 4a는 검증만, visual은 4b.
+    // Block mode 파싱 — auto/off만 허용. default "auto". Phase 4b부터 시각 발동.
     let resolved_block_mode = block_mode
         .or_else(|| file_config.and_then(|c| c.block.mode.clone()))
         .unwrap_or_else(|| "auto".to_string());
-    if resolved_block_mode != "auto" && resolved_block_mode != "off" {
-        return Err(Error::Args(format!(
-            "unknown block-mode: {resolved_block_mode} (expected auto/off)"
-        )));
-    }
+    let block_mode_enum = match resolved_block_mode.as_str() {
+        "auto" => BlockMode::Auto,
+        "off" => BlockMode::Off,
+        other => {
+            return Err(Error::Args(format!(
+                "unknown block-mode: {other} (expected auto/off)"
+            )));
+        }
+    };
     log::info!("block-mode: {resolved_block_mode}");
-    let config = Config::single_shell(shell_override);
-    Ok(match theme {
-        Some(theme) => config.with_theme(theme),
-        None => config,
-    })
+    let mut config = Config::single_shell(shell_override).with_block_mode(block_mode_enum);
+    if let Some(theme) = theme {
+        config = config.with_theme(theme);
+    }
+    Ok(config)
 }
 
 fn take_arg_value(flag: &str, value: Option<&String>) -> error::Result<String> {
