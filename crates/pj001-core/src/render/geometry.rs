@@ -39,6 +39,15 @@ pub struct SelectionRange {
     pub end: (usize, usize),
 }
 
+/// Phase 4b-2b: 카드 bg overlay 정보. row range[start..=end] 안 cell의 bg를 약간 변경.
+/// Phase 1 단순 cut — 단일 색만. border/radius는 후속 step.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockOverlay {
+    pub visible_row_start: usize,
+    pub visible_row_end: usize,
+    pub bg: [f32; 4],
+}
+
 pub fn build_instances_at(
     term: &Term,
     atlas: &GlyphAtlas,
@@ -48,6 +57,7 @@ pub fn build_instances_at(
     col_offset: usize,
     row_offset: usize,
     palette: &ThemePalette,
+    block_overlays: &[BlockOverlay],
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     for r in 0..term.rows() {
@@ -62,6 +72,12 @@ pub fn build_instances_at(
             let reversed = cell.attrs.contains(Attrs::REVERSE);
             let selected = selection.is_some_and(|selection| selection.contains(r, c));
             let hyperlink = cell.attrs.contains(Attrs::HYPERLINK);
+            // Phase 4b-2b: cell이 어떤 block overlay 범위에 속하면 bg는 overlay.bg로 대체.
+            // selection > reversed > hyperlink > block overlay > default 순서.
+            let block_bg = block_overlays
+                .iter()
+                .find(|b| r >= b.visible_row_start && r <= b.visible_row_end)
+                .map(|b| b.bg);
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
@@ -71,12 +87,14 @@ pub fn build_instances_at(
                 )
             } else if hyperlink {
                 // 슬라이스 6.3b: hyperlink cells는 theme의 ANSI 12(밝은 파랑) — bg는 일반대로.
-                (palette.ansi[12], resolve(cell.bg, false, palette))
-            } else {
                 (
-                    resolve(cell.fg, true, palette),
-                    resolve(cell.bg, false, palette),
+                    palette.ansi[12],
+                    block_bg.unwrap_or_else(|| resolve(cell.bg, false, palette)),
                 )
+            } else {
+                let fg = resolve(cell.fg, true, palette);
+                let bg = block_bg.unwrap_or_else(|| resolve(cell.bg, false, palette));
+                (fg, bg)
             };
 
             let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {

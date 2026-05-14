@@ -932,6 +932,16 @@ fn compute_tab_viewports(
     layouts
 }
 
+/// Phase 4b-2b: 색 linear interpolation. a*(1-t) + b*t.
+fn mix_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] * (1.0 - t) + b[0] * t,
+        a[1] * (1.0 - t) + b[1] * t,
+        a[2] * (1.0 - t) + b[2] * t,
+        a[3] * (1.0 - t) + b[3] * t,
+    ]
+}
+
 /// Phase 4b-1c gutter_px helper. block_visual=true이면 font_size+4를 cell.width 단위로 ceil.
 fn compute_block_gutter_px(
     block_visual: bool,
@@ -3730,6 +3740,23 @@ impl AppState {
                     // false 반환). 별도 skip 분기 불필요. SelectionRange가 자연스럽게 처리.
                     Some(SelectionRange::new(selection.anchor, selection.head))
                 });
+                // Phase 4b-2b: block visual 활성 시 visible_blocks → BlockOverlay 리스트.
+                // 색은 palette.bg에 약간의 fg mix(0.06)로 카드 강조.
+                let block_overlays: Vec<crate::render::BlockOverlay> =
+                    if self.block_mode == BlockMode::Auto {
+                        let palette = self.renderer.palette();
+                        let card_bg = mix_color(palette.bg, palette.fg, 0.06);
+                        term.visible_blocks(term.rows())
+                            .into_iter()
+                            .map(|vb| crate::render::BlockOverlay {
+                                visible_row_start: vb.visible_row_start,
+                                visible_row_end: vb.visible_row_end,
+                                bg: card_bg,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 self.renderer.append_term(
                     &self.queue,
                     &term,
@@ -3738,6 +3765,7 @@ impl AppState {
                     selection,
                     pane_col_offset,
                     pane_row_offset,
+                    &block_overlays,
                 );
                 // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
                 if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {

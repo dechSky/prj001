@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 use crate::grid::{Attrs, Term};
 
 pub use font::CellMetrics;
-pub use geometry::{CursorRender, SelectionRange};
+pub use geometry::{BlockOverlay, CursorRender, SelectionRange};
 pub use theme::ThemePalette;
 
 use atlas::GlyphAtlas;
@@ -330,6 +330,7 @@ impl Renderer {
         selection: Option<geometry::SelectionRange>,
         col_offset: usize,
         row_offset: usize,
+        block_overlays: &[geometry::BlockOverlay],
     ) {
         // atlas miss 글리프를 동적으로 raster + insert
         for r in 0..term.rows() {
@@ -370,6 +371,7 @@ impl Renderer {
             col_offset,
             row_offset,
             &self.palette,
+            block_overlays,
         );
         if let Some((preedit_str, col, row)) = preedit {
             let mut preedit_inst = geometry::build_preedit_instances_at(
