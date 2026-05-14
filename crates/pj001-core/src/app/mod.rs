@@ -3568,7 +3568,10 @@ impl AppState {
                     };
                 let preedit_for_render = if in_scrollback { None } else { preedit_arg };
                 let selection = self.selection.as_ref().and_then(|selection| {
-                    if selection.pane == pane_id {
+                    // 싱글클릭은 anchor==head로 시작 → render 1 cell highlight가 release에
+                    // 사라져 "선택됐다 풀림" 깜빡임 발생. drag로 head가 anchor와 달라진
+                    // 시점부터 visual selection 노출.
+                    if selection.pane == pane_id && selection.anchor != selection.head {
                         Some(SelectionRange::new(selection.anchor, selection.head))
                     } else {
                         None
