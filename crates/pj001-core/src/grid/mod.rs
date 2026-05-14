@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
 
-use crate::block::RowBlockTag;
+use crate::block::{AbandonReason, BlockBoundary, BlockState, BlockStream, RowBlockTag};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -473,6 +473,10 @@ pub struct Term {
     /// scrollback이 SCROLLBACK_CAP에 도달한 후에는 scrollback.len()이 고정되므로
     /// 이 필드가 절대 좌표의 유일한 안정 키.
     oldest_kept_abs: u64,
+    /// 첫 OSC 133 A/B/C/D 수신 시 true로 latch. false → true 한번만 (UX 일관성).
+    block_capable: bool,
+    /// command block 컬렉션. OSC 133 dispatch가 push/update.
+    blocks: BlockStream,
     /// OSC 133;A — 최근 prompt start의 절대 행.
     /// abs = oldest_kept_abs + scrollback.len() + cursor.row.
     /// 차후 Cmd+↑/↓ "prev/next prompt" 점프, block UI 카드 경계 결정에 사용.
@@ -542,6 +546,8 @@ impl Term {
             hyperlink_pool: Vec::new(),
             active_hyperlink_id: 0,
             oldest_kept_abs: 0,
+            block_capable: false,
+            blocks: BlockStream::new(),
             last_prompt_row: None,
             prompts_seen: 0,
             last_command_exit: None,
@@ -573,37 +579,93 @@ impl Term {
         self.oldest_kept_abs + self.scrollback.len() as u64 + self.cursor.row as u64
     }
 
-    /// `OSC 133;A` 시점에 호출. 현재 cursor row를 절대 행 번호로 보관.
+    /// `OSC 133;A` 시점에 호출. 진행 중 block은 Abandoned(NewPrompt)로 종료하고
+    /// 새 Block을 push + 현재 row에 RowBlockTag stamp.
     pub fn semantic_prompt_start(&mut self) {
         if self.use_alt {
             return;
         }
-        self.last_prompt_row = Some(self.current_abs_row());
+        self.block_capable = true;
+        // 진행 중 block이 있으면 새 prompt가 들어왔다 → NewPrompt로 abandon.
+        self.blocks.abandon_active(AbandonReason::NewPrompt);
+        let abs = self.current_abs_row();
+        let id = self.blocks.start_prompt(abs);
+        let row = self.cursor.row;
+        self.main.row_block_tags[row].push(RowBlockTag {
+            block_id: id,
+            kind: BlockBoundary::PromptStart,
+        });
+        self.last_prompt_row = Some(abs);
         self.prompts_seen = self.prompts_seen.saturating_add(1);
     }
-    /// `OSC 133;B` 시점 — 명령어 텍스트 시작.
+    /// `OSC 133;B` 시점 — 명령어 텍스트 시작. active block을 Command 상태로.
     pub fn semantic_command_start(&mut self) {
         if self.use_alt {
             return;
         }
-        self.last_command_start_row = Some(self.current_abs_row());
+        self.block_capable = true;
+        let abs = self.current_abs_row();
+        let row = self.cursor.row;
+        if let Some(b) = self.blocks.active_mut() {
+            b.command_start_abs = Some(abs);
+            b.state = BlockState::Command;
+            b.started_at = Some(std::time::Instant::now());
+            let id = b.id;
+            self.main.row_block_tags[row].push(RowBlockTag {
+                block_id: id,
+                kind: BlockBoundary::CommandStart,
+            });
+        }
+        self.last_command_start_row = Some(abs);
     }
-    /// `OSC 133;C` 시점 — 명령어 출력 시작.
+    /// `OSC 133;C` 시점 — 명령어 출력 시작. active block을 Running 상태로.
     pub fn semantic_output_start(&mut self) {
         if self.use_alt {
             return;
         }
-        self.last_output_start_row = Some(self.current_abs_row());
+        self.block_capable = true;
+        let abs = self.current_abs_row();
+        let row = self.cursor.row;
+        if let Some(b) = self.blocks.active_mut() {
+            b.output_start_abs = Some(abs);
+            b.state = BlockState::Running;
+            let id = b.id;
+            self.main.row_block_tags[row].push(RowBlockTag {
+                block_id: id,
+                kind: BlockBoundary::OutputStart,
+            });
+        }
+        self.last_output_start_row = Some(abs);
     }
-    /// `OSC 133;D[;exit]` 시점에 호출. exit는 None이면 unknown.
+    /// `OSC 133;D[;exit]` 시점에 호출. active block을 Completed로 마감 + 시간 기록.
     pub fn semantic_command_end(&mut self, exit: Option<i32>) {
         if self.use_alt {
             return;
+        }
+        self.block_capable = true;
+        let abs = self.current_abs_row();
+        let row = self.cursor.row;
+        if let Some(b) = self.blocks.active_mut() {
+            b.output_end_abs = Some(abs);
+            b.ended_at = Some(std::time::Instant::now());
+            b.state = BlockState::Completed { exit_code: exit };
+            let id = b.id;
+            self.main.row_block_tags[row].push(RowBlockTag {
+                block_id: id,
+                kind: BlockBoundary::OutputEnd,
+            });
         }
         self.last_command_exit = exit;
     }
     pub fn oldest_kept_abs(&self) -> u64 {
         self.oldest_kept_abs
+    }
+    pub fn block_capable(&self) -> bool {
+        self.block_capable
+    }
+    #[allow(dead_code)]
+    pub(crate) fn blocks(&self) -> &BlockStream {
+        &self.blocks
     }
     pub fn last_prompt_row(&self) -> Option<u64> {
         self.last_prompt_row
@@ -1102,6 +1164,8 @@ impl Term {
         // alt screen 전환 시 scrollback view는 항상 bottom으로 (alt에서 scrollback 안 봄).
         self.view_offset = 0;
         if on {
+            // Phase 4a: alt 진입 — 진행 중 block은 Abandoned(AltScreen).
+            self.blocks.abandon_active(AbandonReason::AltScreen);
             self.saved_main_cursor = self.cursor;
             self.use_alt = true;
             // alt screen 진입 시 alt grid clear + cursor (0,0)
@@ -1195,6 +1259,8 @@ impl Term {
                     self.scrollback.pop_front();
                     self.oldest_kept_abs = self.oldest_kept_abs.saturating_add(1);
                 }
+                // prompt_start_abs가 oldest_kept_abs 미만이 된 block은 drop.
+                self.blocks.drop_below(self.oldest_kept_abs);
             }
             self.grid_mut().scroll_up(top, bottom, 1);
         } else {
@@ -1482,6 +1548,8 @@ impl Term {
     /// DECSTR — Soft Terminal Reset (`CSI ! p`). xterm/VT220 표준.
     /// settable mode + SGR + saved cursor만 default로. 화면 콘텐츠/tab stop/title은 보존.
     pub fn soft_reset(&mut self) {
+        // Phase 4a: 진행 중 block은 Abandoned(Reset). completed history는 유지.
+        self.blocks.abandon_active(AbandonReason::Reset);
         // SGR
         self.reset_sgr();
         // mode flags
@@ -2292,6 +2360,101 @@ mod tests {
         assert!(term.last_prompt_row().is_none());
         assert_eq!(term.prompts_seen(), 0);
         assert!(term.last_command_exit().is_none());
+    }
+
+    // === Step 4 — block_capable latch + BlockStream lifecycle ===
+
+    #[test]
+    fn block_capable_latches_on_first_osc_133() {
+        let mut term = Term::new(8, 3);
+        assert!(!term.block_capable());
+        term.semantic_prompt_start();
+        assert!(term.block_capable());
+    }
+
+    #[test]
+    fn osc_133_a_to_d_transitions_block_state() {
+        use crate::block::BlockState;
+        let mut term = Term::new(8, 3);
+        term.semantic_prompt_start();
+        term.set_cursor(0, 5);
+        term.semantic_command_start();
+        term.semantic_output_start();
+        term.semantic_command_end(Some(0));
+        let blocks: Vec<_> = term.blocks().iter().collect();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0].state {
+            BlockState::Completed { exit_code } => assert_eq!(*exit_code, Some(0)),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(blocks[0].started_at.is_some());
+        assert!(blocks[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn second_prompt_abandons_unfinished_prior_block() {
+        use crate::block::{AbandonReason, BlockState};
+        let mut term = Term::new(8, 3);
+        term.semantic_prompt_start();
+        term.semantic_command_start();
+        // 두 번째 A 도착, 직전 block은 D 미수신.
+        term.set_cursor(1, 0);
+        term.semantic_prompt_start();
+        let blocks: Vec<_> = term.blocks().iter().collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0].state,
+            BlockState::Abandoned {
+                reason: AbandonReason::NewPrompt,
+            }
+        );
+        assert_eq!(blocks[1].state, BlockState::Prompt);
+    }
+
+    #[test]
+    fn alt_screen_entry_abandons_active_block() {
+        use crate::block::{AbandonReason, BlockState};
+        let mut term = Term::new(8, 3);
+        term.semantic_prompt_start();
+        term.semantic_command_start();
+        term.switch_alt_screen(true);
+        let block = &term.blocks().iter().next().unwrap();
+        assert_eq!(
+            block.state,
+            BlockState::Abandoned {
+                reason: AbandonReason::AltScreen,
+            }
+        );
+    }
+
+    #[test]
+    fn soft_reset_abandons_active_block_with_reason_reset() {
+        use crate::block::{AbandonReason, BlockState};
+        let mut term = Term::new(8, 3);
+        term.semantic_prompt_start();
+        term.semantic_command_start();
+        term.soft_reset();
+        let block = &term.blocks().iter().next().unwrap();
+        assert_eq!(
+            block.state,
+            BlockState::Abandoned {
+                reason: AbandonReason::Reset,
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_start_stamps_row_block_tag_at_cursor_row() {
+        use crate::block::BlockBoundary;
+        let mut term = Term::new(8, 3);
+        term.set_cursor(2, 0);
+        term.semantic_prompt_start();
+        let tags = term.main_row_block_tags(2);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].kind, BlockBoundary::PromptStart);
+        // 다른 row는 비어있음.
+        assert!(term.main_row_block_tags(0).is_empty());
+        assert!(term.main_row_block_tags(1).is_empty());
     }
 
     #[test]

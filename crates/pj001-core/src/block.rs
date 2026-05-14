@@ -135,6 +135,22 @@ impl BlockStream {
         self.blocks
             .retain(|b| b.prompt_start_abs >= oldest_kept_abs);
     }
+
+    /// 마지막 block이 진행중(Prompt/Command/Running)이면 mutable 참조 반환. Completed/Abandoned면 None.
+    pub fn active_mut(&mut self) -> Option<&mut Block> {
+        let last = self.blocks.last_mut()?;
+        match last.state {
+            BlockState::Prompt | BlockState::Command | BlockState::Running => Some(last),
+            _ => None,
+        }
+    }
+
+    /// 진행중 block이 있으면 Abandoned로 전환. 없으면 no-op.
+    pub fn abandon_active(&mut self, reason: AbandonReason) {
+        if let Some(b) = self.active_mut() {
+            b.state = BlockState::Abandoned { reason };
+        }
+    }
 }
 
 #[cfg(test)]
