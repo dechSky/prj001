@@ -74,25 +74,42 @@ pub struct BlockOverlay {
     pub border_color: [f32; 4],
 }
 
+/// 카드 cell 정보 — bg, border_color, edge_mask. shader fragment의 SDF branch가
+/// 이 정보로 corner 곡선/border band 처리.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardCellInfo {
+    pub bg: [f32; 4],
+    pub border_color: [f32; 4],
+    /// FLAG_BLOCK_EDGE_TOP/BOTTOM/LEFT/RIGHT 조합.
+    pub edge_mask: u32,
+}
+
 impl BlockOverlay {
-    /// row range 안 cell이면 색 반환, 아니면 None. edge cell(top/bottom row, 좌우 끝 col)은
-    /// border_color, 안쪽 cell은 bg.
-    ///
-    /// Phase 4b-2c-2: 4 모서리(top/bottom row AND 좌우 끝 col)는 None 반환 — cell의 default
-    /// 색이 그려져 palette.bg(clear color)가 그대로 보임. cell 단위 chunky rounded corner.
-    /// SDF 곡선은 별도 sub-step에서 shader 확장 시 도입.
-    pub fn cell_color(&self, row: usize, col: usize, cols: usize) -> Option<[f32; 4]> {
+    /// 카드 row range 안 cell의 정보. 카드 밖이면 None. 4b-2c-4c: corner 처리는 shader SDF로
+    /// 이전된 chunky cell-unit 분기 제거 — edge_mask로 어느 edge인지 표시만, 색 stamping은
+    /// shader fragment가 cell_pixel 단위로 결정.
+    pub fn cell_info(&self, row: usize, col: usize, cols: usize) -> Option<CardCellInfo> {
         if row < self.visible_row_start || row > self.visible_row_end {
             return None;
         }
-        let top_or_bottom = row == self.visible_row_start || row == self.visible_row_end;
-        let left_or_right = col == 0 || col + 1 == cols;
-        // 4 모서리는 카드 밖처럼 처리. cell.bg(보통 palette.bg)가 그려진다.
-        if top_or_bottom && left_or_right {
-            return None;
+        let mut edge_mask = 0u32;
+        if row == self.visible_row_start {
+            edge_mask |= FLAG_BLOCK_EDGE_TOP;
         }
-        let is_edge = top_or_bottom || left_or_right;
-        Some(if is_edge { self.border_color } else { self.bg })
+        if row == self.visible_row_end {
+            edge_mask |= FLAG_BLOCK_EDGE_BOTTOM;
+        }
+        if col == 0 {
+            edge_mask |= FLAG_BLOCK_EDGE_LEFT;
+        }
+        if col + 1 == cols {
+            edge_mask |= FLAG_BLOCK_EDGE_RIGHT;
+        }
+        Some(CardCellInfo {
+            bg: self.bg,
+            border_color: self.border_color,
+            edge_mask,
+        })
     }
 }
 
@@ -124,13 +141,16 @@ pub fn build_instances_at(
             let reversed = cell.attrs.contains(Attrs::REVERSE);
             let selected = selection.is_some_and(|selection| selection.contains(r, c));
             let hyperlink = cell.attrs.contains(Attrs::HYPERLINK);
-            // Phase 4b-2b: cell이 어떤 block overlay 범위에 속하면 bg는 overlay.bg로 대체.
-            // Phase 4b-2c-1: row range edge cell이면 border_color로 대체 (cell 단위 border).
-            // Phase 4b-2c-3: col 인덱스를 gutter_cells + c로 환산해서 cell_color 호출.
-            // selection > reversed > hyperlink > block overlay > default.
-            let block_bg = block_overlays
-                .iter()
-                .find_map(|b| b.cell_color(r, gutter_cells + c, card_cols));
+            // Phase 4b-2c-4c: cell이 카드 영역이면 CardCellInfo + FLAG_BLOCK_CARD 설정.
+            // shader fragment가 edge_mask 기반 border band + corner SDF 처리.
+            // selection > reversed > hyperlink > block card > default.
+            let card_info = if !selected && !reversed && !hyperlink {
+                block_overlays
+                    .iter()
+                    .find_map(|b| b.cell_info(r, gutter_cells + c, card_cols))
+            } else {
+                None
+            };
             let (fg, bg) = if selected {
                 (palette.fg, palette.selection_bg)
             } else if reversed {
@@ -140,14 +160,19 @@ pub fn build_instances_at(
                 )
             } else if hyperlink {
                 // 슬라이스 6.3b: hyperlink cells는 theme의 ANSI 12(밝은 파랑) — bg는 일반대로.
-                (
-                    palette.ansi[12],
-                    block_bg.unwrap_or_else(|| resolve(cell.bg, false, palette)),
-                )
+                (palette.ansi[12], resolve(cell.bg, false, palette))
+            } else if let Some(ref info) = card_info {
+                (resolve(cell.fg, true, palette), info.bg)
             } else {
-                let fg = resolve(cell.fg, true, palette);
-                let bg = block_bg.unwrap_or_else(|| resolve(cell.bg, false, palette));
-                (fg, bg)
+                (
+                    resolve(cell.fg, true, palette),
+                    resolve(cell.bg, false, palette),
+                )
+            };
+            let (card_flags, card_border) = if let Some(info) = card_info {
+                (FLAG_BLOCK_CARD | info.edge_mask, info.border_color)
+            } else {
+                (0u32, [0.0f32; 4])
             };
 
             let entry = if cell.ch == ' ' || (cell.ch as u32) < 0x20 {
@@ -187,8 +212,8 @@ pub fn build_instances_at(
                 fg,
                 bg,
                 cell_span,
-                flags: 0,
-                block_border_color: [0.0; 4],
+                flags: card_flags,
+                block_border_color: card_border,
                 _pad: [0.0; 2],
             });
         }
@@ -196,15 +221,15 @@ pub fn build_instances_at(
 
     // Phase 4b-2c-3: gutter 영역에 카드 색 fill instance. gutter는 col_offset 좌측의
     // gutter_cells 폭. block overlay row range에 걸치는 row의 각 gutter cell에 대해
-    // cell_color(r, gc, card_cols) → Some 색이면 fill push.
+    // cell_info() → Some이면 fill push. Phase 4b-2c-4c: SDF flag 같이 stamp.
     if gutter_cells > 0 && col_offset >= gutter_cells {
         let gutter_start_col = col_offset - gutter_cells;
         for r in 0..term.rows() {
             for gc in 0..gutter_cells {
-                let bg_opt = block_overlays
+                let info_opt = block_overlays
                     .iter()
-                    .find_map(|b| b.cell_color(r, gc, card_cols));
-                let Some(bg) = bg_opt else {
+                    .find_map(|b| b.cell_info(r, gc, card_cols));
+                let Some(info) = info_opt else {
                     continue;
                 };
                 out.push(CellInstance {
@@ -217,10 +242,10 @@ pub fn build_instances_at(
                     glyph_offset: [0.0; 2],
                     glyph_size: [0.0; 2],
                     fg: [0.0; 4],
-                    bg,
+                    bg: info.bg,
                     cell_span: 1.0,
-                    flags: 0,
-                    block_border_color: [0.0; 4],
+                    flags: FLAG_BLOCK_CARD | info.edge_mask,
+                    block_border_color: info.border_color,
                     _pad: [0.0; 2],
                 });
             }
@@ -332,7 +357,10 @@ impl SelectionRange {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockOverlay, SelectionRange};
+    use super::{
+        BlockOverlay, FLAG_BLOCK_EDGE_BOTTOM, FLAG_BLOCK_EDGE_LEFT, FLAG_BLOCK_EDGE_RIGHT,
+        FLAG_BLOCK_EDGE_TOP, SelectionRange,
+    };
 
     const CARD_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
     const CARD_BORDER: [f32; 4] = [0.3, 0.3, 0.4, 1.0];
@@ -347,105 +375,105 @@ mod tests {
     }
 
     #[test]
-    fn block_overlay_cell_color_outside_range_none() {
+    fn block_overlay_cell_info_outside_range_none() {
         let o = overlay(2, 5);
-        assert!(o.cell_color(0, 3, 10).is_none());
-        assert!(o.cell_color(1, 3, 10).is_none());
-        assert!(o.cell_color(6, 3, 10).is_none());
+        assert!(o.cell_info(0, 3, 10).is_none());
+        assert!(o.cell_info(1, 3, 10).is_none());
+        assert!(o.cell_info(6, 3, 10).is_none());
     }
 
     #[test]
-    fn block_overlay_cell_color_inside_uses_bg() {
+    fn block_overlay_cell_info_inside_no_edge_mask() {
         let o = overlay(2, 5);
-        // row 3, col 5 — top/bottom 모두 아니고 좌우 edge 아님 → bg.
-        assert_eq!(o.cell_color(3, 5, 10), Some(CARD_BG));
-        assert_eq!(o.cell_color(4, 1, 10), Some(CARD_BG));
+        // 가운데 cell — top/bottom/left/right 모두 아님 → edge_mask 0.
+        let info = o.cell_info(3, 5, 10).unwrap();
+        assert_eq!(info.bg, CARD_BG);
+        assert_eq!(info.border_color, CARD_BORDER);
+        assert_eq!(info.edge_mask, 0);
     }
 
     #[test]
-    fn block_overlay_cell_color_top_bottom_edge_is_border() {
+    fn block_overlay_cell_info_top_edge_mask() {
         let o = overlay(2, 5);
-        // top row(=2), bottom row(=5) 안쪽 cells.
-        assert_eq!(o.cell_color(2, 5, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(5, 5, 10), Some(CARD_BORDER));
+        let info = o.cell_info(2, 5, 10).unwrap();
+        assert_eq!(info.edge_mask, FLAG_BLOCK_EDGE_TOP);
     }
 
     #[test]
-    fn block_overlay_cell_color_left_right_edge_is_border() {
+    fn block_overlay_cell_info_bottom_edge_mask() {
         let o = overlay(2, 5);
-        // col 0 (좌측), col 9 (=cols-1, 우측). 가운데 row.
-        assert_eq!(o.cell_color(3, 0, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(3, 9, 10), Some(CARD_BORDER));
+        let info = o.cell_info(5, 5, 10).unwrap();
+        assert_eq!(info.edge_mask, FLAG_BLOCK_EDGE_BOTTOM);
     }
 
     #[test]
-    fn block_overlay_corner_cells_are_none_chunky_rounded() {
-        // Phase 4b-2c-2: 4 모서리는 None — cell default 색(palette.bg)이 보여 chunky corner.
+    fn block_overlay_cell_info_left_right_edge_mask() {
         let o = overlay(2, 5);
-        assert_eq!(o.cell_color(2, 0, 10), None); // top-left
-        assert_eq!(o.cell_color(2, 9, 10), None); // top-right
-        assert_eq!(o.cell_color(5, 0, 10), None); // bottom-left
-        assert_eq!(o.cell_color(5, 9, 10), None); // bottom-right
+        let l = o.cell_info(3, 0, 10).unwrap();
+        let r = o.cell_info(3, 9, 10).unwrap();
+        assert_eq!(l.edge_mask, FLAG_BLOCK_EDGE_LEFT);
+        assert_eq!(r.edge_mask, FLAG_BLOCK_EDGE_RIGHT);
     }
 
     #[test]
-    fn block_overlay_edge_non_corner_still_border() {
-        // edge이지만 corner 아닌 cell은 여전히 border_color.
+    fn block_overlay_cell_info_corner_mask_is_combined() {
+        // Phase 4b-2c-4c: corner는 두 edge bit가 같이 set. shader SDF가 곡선 처리.
         let o = overlay(2, 5);
-        // top row 안쪽 cell (col 1..=8)은 border.
-        assert_eq!(o.cell_color(2, 1, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(2, 8, 10), Some(CARD_BORDER));
-        // 좌측 col 0, 안쪽 row (3,4) → border.
-        assert_eq!(o.cell_color(3, 0, 10), Some(CARD_BORDER));
-        assert_eq!(o.cell_color(4, 0, 10), Some(CARD_BORDER));
+        let tl = o.cell_info(2, 0, 10).unwrap();
+        let tr = o.cell_info(2, 9, 10).unwrap();
+        let bl = o.cell_info(5, 0, 10).unwrap();
+        let br = o.cell_info(5, 9, 10).unwrap();
+        assert_eq!(tl.edge_mask, FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_LEFT);
+        assert_eq!(tr.edge_mask, FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_RIGHT);
+        assert_eq!(bl.edge_mask, FLAG_BLOCK_EDGE_BOTTOM | FLAG_BLOCK_EDGE_LEFT);
+        assert_eq!(br.edge_mask, FLAG_BLOCK_EDGE_BOTTOM | FLAG_BLOCK_EDGE_RIGHT);
     }
 
     #[test]
-    fn block_overlay_single_row_card_corners_none_middle_border() {
-        // row range[3..=3]는 한 행만. col 0/9는 corner(top+bottom+left/right) → None.
-        // 가운데 col은 top+bottom edge → border_color.
+    fn block_overlay_single_row_card_all_top_and_bottom() {
+        // row range[3..=3]는 한 행만. 모든 cell이 top+bottom 같이.
         let o = overlay(3, 3);
-        assert_eq!(o.cell_color(3, 0, 10), None);
-        assert_eq!(o.cell_color(3, 9, 10), None);
-        for col in 1..9 {
-            assert_eq!(o.cell_color(3, col, 10), Some(CARD_BORDER));
-        }
-    }
-
-    #[test]
-    fn block_overlay_two_col_card_all_corner_none() {
-        // cols=2면 col 0,1 모두 좌우 끝. row range edge면 모든 cell이 corner → 카드 사라짐.
-        // 비현실적 케이스지만 boundary 안전 검증.
-        let o = overlay(2, 5);
-        assert_eq!(o.cell_color(2, 0, 2), None);
-        assert_eq!(o.cell_color(2, 1, 2), None);
-        assert_eq!(o.cell_color(5, 0, 2), None);
-        assert_eq!(o.cell_color(5, 1, 2), None);
+        // 가운데 col은 top+bottom edge.
+        let mid = o.cell_info(3, 5, 10).unwrap();
+        assert_eq!(
+            mid.edge_mask,
+            FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_BOTTOM
+        );
+        // 좌측 끝은 top+bottom+left (3 비트 corner).
+        let l = o.cell_info(3, 0, 10).unwrap();
+        assert_eq!(
+            l.edge_mask,
+            FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_BOTTOM | FLAG_BLOCK_EDGE_LEFT
+        );
     }
 
     #[test]
     fn block_overlay_with_gutter_treats_gutter_left_as_card_edge() {
         // Phase 4b-2c-3: 카드 폭 = gutter_cells + content_cols. col 0이 gutter 좌측 끝(=
-        // 카드의 좌측 edge). 모서리는 (top/bottom row) AND (col 0 OR col cols-1).
+        // 카드의 좌측 edge). corner는 (top/bottom) AND (col 0 OR cols-1).
         let o = overlay(2, 5);
         let gutter_cells = 2;
         let content_cols = 10;
         let card_cols = gutter_cells + content_cols; // 12
 
-        // top-left corner: col 0 (gutter 시작) + row 2 (top) → None.
-        assert_eq!(o.cell_color(2, 0, card_cols), None);
-        // top row, gutter 안쪽 col 1 → border (top edge).
-        assert_eq!(o.cell_color(2, 1, card_cols), Some(CARD_BORDER));
-        // gutter 안쪽 row + col 0 (좌측 edge) → border.
-        assert_eq!(o.cell_color(3, 0, card_cols), Some(CARD_BORDER));
-        // gutter 안쪽 row + gutter 두 번째 cell (col 1, 좌우 edge 아님) → bg.
-        assert_eq!(o.cell_color(3, 1, card_cols), Some(CARD_BG));
-        // content 시작 cell (col 2 = gutter_cells) → bg (안쪽).
-        assert_eq!(o.cell_color(3, 2, card_cols), Some(CARD_BG));
-        // content 마지막 cell (col 11 = card_cols-1, 우측 edge) → border.
-        assert_eq!(o.cell_color(3, 11, card_cols), Some(CARD_BORDER));
-        // top-right corner: row 2 + col 11 → None.
-        assert_eq!(o.cell_color(2, 11, card_cols), None);
+        // top-left corner: col 0 + row 2 → TOP|LEFT.
+        let tl = o.cell_info(2, 0, card_cols).unwrap();
+        assert_eq!(tl.edge_mask, FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_LEFT);
+        // top row, gutter 안쪽 col 1 → TOP only.
+        let t1 = o.cell_info(2, 1, card_cols).unwrap();
+        assert_eq!(t1.edge_mask, FLAG_BLOCK_EDGE_TOP);
+        // 안쪽 row + col 0 → LEFT only.
+        let l = o.cell_info(3, 0, card_cols).unwrap();
+        assert_eq!(l.edge_mask, FLAG_BLOCK_EDGE_LEFT);
+        // 안쪽 col + 안쪽 row → no edge mask, bg.
+        let inner = o.cell_info(3, 5, card_cols).unwrap();
+        assert_eq!(inner.edge_mask, 0);
+        // content 마지막 cell (col 11) → RIGHT.
+        let r = o.cell_info(3, 11, card_cols).unwrap();
+        assert_eq!(r.edge_mask, FLAG_BLOCK_EDGE_RIGHT);
+        // top-right corner.
+        let tr = o.cell_info(2, 11, card_cols).unwrap();
+        assert_eq!(tr.edge_mask, FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_RIGHT);
     }
 
     #[test]
