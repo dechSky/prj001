@@ -197,6 +197,9 @@ pub fn build_instances_at(
 }
 
 impl SelectionRange {
+    /// Phase 2: caret 모델. `anchor`/`head`는 caret 좌표 (row, caret_col).
+    /// caret_col은 글자 사이 위치 (0..=cols). cell N의 왼쪽 boundary = caret N,
+    /// cell N의 오른쪽 boundary = caret N+1. 표준 macOS Terminal/iTerm2 모델.
     pub fn new(anchor: (usize, usize), head: (usize, usize)) -> Self {
         if anchor <= head {
             Self {
@@ -211,8 +214,13 @@ impl SelectionRange {
         }
     }
 
+    /// cell (row, col)이 selection에 포함되는지. caret 모델 half-open [start, end):
+    /// row == start.row이면 col >= start.col, row == end.row이면 col < end.col.
+    /// start == end (caret 동일)이면 empty range.
     fn contains(self, row: usize, col: usize) -> bool {
-        (row, col) >= self.start && (row, col) <= self.end
+        let after_start = row > self.start.0 || (row == self.start.0 && col >= self.start.1);
+        let before_end = row < self.end.0 || (row == self.end.0 && col < self.end.1);
+        after_start && before_end
     }
 }
 
@@ -222,15 +230,35 @@ mod tests {
 
     #[test]
     fn selection_range_normalizes_drag_direction() {
+        // caret 모델: SelectionRange((1, 2), (3, 8))는 caret 좌표.
+        // row 1: cell col >= 2, row 2: 모든 col, row 3: cell col < 8.
         let range = SelectionRange::new((3, 8), (1, 2));
 
         assert_eq!(range.start, (1, 2));
         assert_eq!(range.end, (3, 8));
         assert!(range.contains(1, 2));
         assert!(range.contains(2, 0));
-        assert!(range.contains(3, 8));
+        assert!(range.contains(3, 7)); // half-open: end caret 8 미포함
+        assert!(!range.contains(3, 8));
         assert!(!range.contains(1, 1));
         assert!(!range.contains(3, 9));
+    }
+
+    #[test]
+    fn selection_range_empty_when_anchor_equals_head() {
+        // caret 동일 → empty range (단순 클릭 / drag 0 cell).
+        let range = SelectionRange::new((1, 5), (1, 5));
+        assert!(!range.contains(1, 5));
+        assert!(!range.contains(1, 4));
+    }
+
+    #[test]
+    fn selection_range_single_cell_when_carets_one_apart() {
+        // cell N 한 글자 선택은 caret [N, N+1).
+        let range = SelectionRange::new((1, 5), (1, 6));
+        assert!(range.contains(1, 5));
+        assert!(!range.contains(1, 6));
+        assert!(!range.contains(1, 4));
     }
 }
 

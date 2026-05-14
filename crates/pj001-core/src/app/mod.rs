@@ -609,6 +609,8 @@ fn quick_spawn_elapsed_timed_out(started_at: Instant, now: Instant) -> bool {
 }
 
 fn selection_text(term: &Term, selection: SelectionRange) -> String {
+    // caret 모델: selection.start/end는 caret 좌표. cell col iterate은 half-open
+    // [start.col, end.col)에서. middle row는 0..cols.
     let mut lines = Vec::new();
     let start_row = selection.start.0.min(term.rows().saturating_sub(1));
     let end_row = selection.end.0.min(term.rows().saturating_sub(1));
@@ -621,10 +623,13 @@ fn selection_text(term: &Term, selection: SelectionRange) -> String {
         let end_col = if row == selection.end.0 {
             selection.end.1
         } else {
-            term.cols().saturating_sub(1)
+            term.cols()
         };
         let mut line = String::new();
-        for col in start_col.min(term.cols())..=end_col.min(term.cols().saturating_sub(1)) {
+        let cols = term.cols();
+        let s = start_col.min(cols);
+        let e = end_col.min(cols);
+        for col in s..e {
             let cell = term.cell(row, col);
             if cell.attrs.contains(crate::grid::Attrs::WIDE_CONT) {
                 continue;
@@ -674,7 +679,8 @@ fn word_selection_range(term: &Term, row: usize, col: usize) -> Option<Selection
         }
         end += 1;
     }
-    Some(SelectionRange::new((row, start), (row, end)))
+    // caret 모델: end caret은 마지막 cell의 다음 boundary (= end_cell + 1).
+    Some(SelectionRange::new((row, start), (row, end + 1)))
 }
 
 fn tab_text(title: &str, cols: usize) -> String {
@@ -961,13 +967,11 @@ struct FindState {
 #[derive(Clone, Debug)]
 struct MouseSelection {
     pane: PaneId,
+    /// caret 좌표 (row, caret_col). caret_col은 0..=cols (글자 사이 boundary).
+    /// word/line selection의 경우 cell index를 caret 변환한 값 (start=cell_start, end=cell_end+1).
     anchor: (usize, usize),
     head: (usize, usize),
     dragging: bool,
-    /// drag 중 cell이 anchor와 한 번이라도 달라졌는지 여부.
-    /// release 시 false면 단순 click → selection=None. true면 single cell이어도 유지.
-    /// 한 글자 선택(drag로 옆 cell 다녀와서 release)을 지원하기 위해 사용.
-    dragged_off_anchor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1235,8 +1239,13 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         if let Some((pane_id, cell)) = state.pane_cell_at_mouse() {
+                            // caret은 mouse pos 기준. caret 못 얻으면 cell의 왼쪽 boundary fallback.
+                            let caret = state
+                                .pane_caret_at_mouse()
+                                .map(|(_, c)| c)
+                                .unwrap_or(cell);
                             state.set_active(pane_id);
-                            state.start_selection_at(pane_id, cell);
+                            state.start_selection_at(pane_id, cell, caret);
                             state.window.request_redraw();
                         } else if let Some(pane_id) = state.pane_at_mouse(true) {
                             state.set_active(pane_id);
@@ -2288,9 +2297,8 @@ impl AppState {
         // mouse drag 충돌 없음. Esc/cancel 시 clear됨.
         if let Some((abs, col_start, visible_row)) = found {
             let query_len = query.chars().count();
-            let head_col = col_start
-                .saturating_add(query_len.saturating_sub(1))
-                .min(cols.saturating_sub(1));
+            // caret 모델: head caret = match start + len (last cell의 다음 boundary).
+            let head_col = col_start.saturating_add(query_len).min(cols);
             log::info!(
                 "find: match abs={} visible_row={} col={}..={} query=\"{}\"",
                 abs,
@@ -2304,7 +2312,6 @@ impl AppState {
                 anchor: (visible_row, col_start),
                 head: (visible_row, head_col),
                 dragging: false,
-                dragged_off_anchor: false,
             });
             if let Some(find) = self.pending_find.as_mut() {
                 find.last_match_abs = Some((abs, col_start));
@@ -2952,6 +2959,32 @@ impl AppState {
         None
     }
 
+    /// Phase 2 caret 모델: mouse pos → (pane, (row, caret_col)). caret_col은 글자 사이
+    /// 위치(0..=cols). pane_cell_at_mouse와 같은 viewport hit-test이나 col 차이가 caret 단위.
+    fn pane_caret_at_mouse(&self) -> Option<(PaneId, (usize, usize))> {
+        let pos = self.last_mouse_pos?;
+        let cell = self.renderer.cell_metrics();
+        if cell.width == 0 || cell.height == 0 || pos.x < 0.0 || pos.y < 0.0 {
+            return None;
+        }
+        let cell_w = cell.width as f64;
+        let abs_caret = ((pos.x + cell_w * 0.5) / cell_w).floor() as usize;
+        let abs_row = (pos.y / cell.height as f64).floor() as usize;
+        for pane in &self.active_tab().panes {
+            let viewport = pane.viewport;
+            let Some(local_caret) = abs_caret.checked_sub(viewport.col_offset) else {
+                continue;
+            };
+            let Some(local_row) = abs_row.checked_sub(viewport.row_offset) else {
+                continue;
+            };
+            if local_caret <= viewport.cols && local_row < viewport.rows {
+                return Some((pane.id, (local_row, local_caret)));
+            }
+        }
+        None
+    }
+
     fn mouse_cell(&self) -> Option<(usize, usize)> {
         let pos = self.last_mouse_pos?;
         let cell = self.renderer.cell_metrics();
@@ -3029,10 +3062,9 @@ impl AppState {
     }
 
     fn update_selection_to_mouse(&mut self) -> bool {
-        // 드래그 중일 때만 cursor → selection head 갱신. dragging=false면 즉시 return —
-        // release 후 hover로 selection이 따라가는 stuck 방지 (word/line/find selection도
-        // dragging=false라 자연스럽게 고정).
-        // dragging 중에는 selection.pane viewport 가장자리로 clamp해 창 밖 좌표도 처리.
+        // Phase 2 caret 모델: dragging 중에만 mouse caret 위치로 head 갱신.
+        // caret 모델은 cell A↔A+1 사이 boundary로 head가 잡혀 한 글자 선택은 cell의
+        // 왼쪽 절반→오른쪽 절반 drag로 자연스럽게 시작. dragged_off_anchor latch 불필요.
         let Some(selection) = self.selection.as_ref() else {
             return false;
         };
@@ -3053,7 +3085,7 @@ impl AppState {
             return false;
         };
         let cell = self.renderer.cell_metrics();
-        let new_head = clamp_pos_to_viewport_cell(pos, viewport, cell);
+        let new_head = clamp_pos_to_viewport_caret(pos, viewport, cell);
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
@@ -3061,11 +3093,6 @@ impl AppState {
             return false;
         }
         selection.head = new_head;
-        // 한 글자 선택 지원: drag로 anchor 외 cell을 한 번이라도 방문하면 latch.
-        // release 시 head가 anchor로 돌아와도 single cell selection 유지.
-        if selection.head != selection.anchor {
-            selection.dragged_off_anchor = true;
-        }
         true
     }
 
@@ -3183,7 +3210,9 @@ impl AppState {
             .unwrap_or((MouseProtocol::Off, false))
     }
 
-    fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize)) {
+    /// Phase 2 caret 모델: word/line selection은 cell 기반 (double/triple click),
+    /// single click drag selection은 caret 기반 (anchor=caret, head=caret).
+    fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize), caret: (usize, usize)) {
         let click_count = self.next_click_count(pane, cell);
         let range = match click_count {
             2 => self.word_selection_at(pane, cell),
@@ -3196,15 +3225,13 @@ impl AppState {
                 anchor: range.start,
                 head: range.end,
                 dragging: false,
-                dragged_off_anchor: false,
             })
         } else {
             Some(MouseSelection {
                 pane,
-                anchor: cell,
-                head: cell,
+                anchor: caret,
+                head: caret,
                 dragging: true,
-                dragged_off_anchor: false,
             })
         };
     }
@@ -3250,7 +3277,8 @@ impl AppState {
             .find(|candidate| candidate.id == pane)
             .map(|pane| pane.viewport.cols)
             .unwrap_or(1);
-        SelectionRange::new((row, 0), (row, cols.saturating_sub(1)))
+        // caret 모델: line 전체 = [0, cols).
+        SelectionRange::new((row, 0), (row, cols))
     }
 
     fn finish_selection_drag(&mut self) {
@@ -3258,11 +3286,10 @@ impl AppState {
             return;
         };
         let was_dragging = selection.dragging;
-        let dragged_off = selection.dragged_off_anchor;
         selection.dragging = false;
-        // 단순 클릭(drag 없음)이면 selection 비움. drag로 anchor 밖에 한 번이라도 갔다면
-        // 결과적으로 head==anchor여도 single-cell selection 유지 (한 글자 선택).
-        if was_dragging && selection.anchor == selection.head && !dragged_off {
+        // caret 모델: head == anchor (caret 동일) 시 selection은 empty range.
+        // 단순 click이든 한 글자 선택 후 origin 복귀든 동일하게 selection 비움.
+        if was_dragging && selection.anchor == selection.head {
             self.selection = None;
         }
         self.window.request_redraw();
@@ -3610,12 +3637,8 @@ impl AppState {
                     if selection.pane != pane_id {
                         return None;
                     }
-                    // drag 중일 때만 single-cell highlight 숨김 (싱글클릭 깜빡임 방지).
-                    // dragging=false면 word/line/find/한-글자-drag 모두 의도된 selection이라
-                    // single cell이어도 그대로 노출.
-                    if selection.dragging && selection.anchor == selection.head {
-                        return None;
-                    }
+                    // caret 모델: anchor == head면 빈 range(SelectionRange.contains가
+                    // false 반환). 별도 skip 분기 불필요. SelectionRange가 자연스럽게 처리.
                     Some(SelectionRange::new(selection.anchor, selection.head))
                 });
                 self.renderer.append_term(
@@ -4107,6 +4130,8 @@ mod tests {
 
     #[test]
     fn selection_text_serializes_visible_cells() {
+        // caret 모델: end caret은 마지막 cell의 다음 boundary. row 0 col 1~7 + row 1 col 0~2.
+        // 즉 "ello" (row 0 col 1..8, cell 1~7) + "wor" (row 1 col 0..3, cell 0~2).
         let mut term = Term::new(8, 3);
         for ch in "hello".chars() {
             term.print(ch);
@@ -4117,32 +4142,34 @@ mod tests {
         }
 
         assert_eq!(
-            selection_text(&term, SelectionRange::new((0, 1), (1, 2))),
+            selection_text(&term, SelectionRange::new((0, 1), (1, 3))),
             "ello\nwor"
         );
     }
 
     #[test]
     fn selection_text_skips_wide_continuation_cells() {
+        // caret 모델: "한"(WIDE, cell 0-1) + "a"(cell 2) → caret [0, 3).
         let mut term = Term::new(6, 2);
         term.print('한');
         term.print('a');
 
         assert_eq!(
-            selection_text(&term, SelectionRange::new((0, 0), (0, 2))),
+            selection_text(&term, SelectionRange::new((0, 0), (0, 3))),
             "한a"
         );
     }
 
     #[test]
     fn word_selection_range_selects_alnum_and_underscore() {
+        // caret 모델: "foo_bar"는 cell 4~10. caret [4, 11).
         let mut term = Term::new(16, 1);
         for ch in "run foo_bar!".chars() {
             term.print(ch);
         }
 
         let range = word_selection_range(&term, 0, 6).expect("word range");
-        assert_eq!(range, SelectionRange::new((0, 4), (0, 10)));
+        assert_eq!(range, SelectionRange::new((0, 4), (0, 11)));
         assert_eq!(selection_text(&term, range), "foo_bar");
         assert!(word_selection_range(&term, 0, 11).is_none());
     }
