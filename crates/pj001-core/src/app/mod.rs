@@ -235,12 +235,15 @@ pub enum SplitDirection {
 
 /// Optional integration hooks for embedders.
 ///
-/// `lifecycle_sink` is invoked for session start and child-exit events. PTY
-/// errors currently mark panes dead but are not reported as lifecycle events.
-/// `route_sink` is reserved for the future generic routing primitive and is not
-/// invoked yet.
+/// `control_sink` receives an `AppControl` after the event loop proxy exists,
+/// so embedders can send policy-approved bytes to a known session. `lifecycle_sink`
+/// is invoked for session start and child-exit events. PTY errors currently mark
+/// panes dead but are not reported as lifecycle events.
+/// `route_sink` is reserved for future in-core route gestures and is not invoked
+/// by `AppControl::write_to_session`.
 #[derive(Clone, Default)]
 pub struct Hooks {
+    pub control_sink: Option<Arc<dyn ControlSink>>,
     pub route_sink: Option<Arc<dyn RouteSink>>,
     pub lifecycle_sink: Option<Arc<dyn LifecycleSink>>,
 }
@@ -248,6 +251,10 @@ pub struct Hooks {
 impl fmt::Debug for Hooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Hooks")
+            .field(
+                "control_sink",
+                &self.control_sink.as_ref().map(|_| "<ControlSink>"),
+            )
             .field(
                 "route_sink",
                 &self.route_sink.as_ref().map(|_| "<RouteSink>"),
@@ -258,6 +265,29 @@ impl fmt::Debug for Hooks {
             )
             .finish()
     }
+}
+
+#[derive(Clone)]
+pub struct AppControl {
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+impl fmt::Debug for AppControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppControl").finish_non_exhaustive()
+    }
+}
+
+impl AppControl {
+    pub fn write_to_session(&self, id: SessionId, bytes: Vec<u8>) -> bool {
+        self.proxy
+            .send_event(UserEvent::WriteToSession { id, bytes })
+            .is_ok()
+    }
+}
+
+pub trait ControlSink: Send + Sync {
+    fn on_control(&self, control: AppControl);
 }
 
 pub trait RouteSink: Send + Sync {
@@ -402,6 +432,11 @@ pub fn run(config: Config) -> Result<()> {
     }
     let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
+    if let Some(sink) = &config.hooks.control_sink {
+        sink.on_control(AppControl {
+            proxy: proxy.clone(),
+        });
+    }
     let mut app = App::new(proxy, config);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1660,6 +1695,29 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                     }
                 }
+            }
+            UserEvent::WriteToSession { id, bytes } => {
+                if bytes.is_empty() {
+                    log::debug!("WriteToSession ignored for session {}: empty payload", id.0);
+                    return;
+                }
+                let Some(state) = &mut self.state else {
+                    log::debug!("WriteToSession ignored for session {}: app not ready", id.0);
+                    return;
+                };
+                let Some(session) = state.sessions.get_mut(&id) else {
+                    log::warn!("WriteToSession ignored for unknown session {}", id.0);
+                    return;
+                };
+                if !session.alive {
+                    log::warn!("WriteToSession ignored for dead session {}", id.0);
+                    return;
+                }
+                if let Err(e) = session.pty.write(&bytes) {
+                    log::warn!("WriteToSession failed for session {}: {e}", id.0);
+                    return;
+                }
+                log::debug!("WriteToSession: {} bytes to session {}", bytes.len(), id.0);
             }
             UserEvent::SessionExited { id, code } => {
                 log::info!("session {} child exited (code={code})", id.0);
@@ -2933,49 +2991,38 @@ impl AppState {
     }
 
     fn update_selection_to_mouse(&mut self) -> bool {
-        // Drag 중이면 cursor가 창/pane 밖으로 나가도 selection.pane viewport 가장자리로
-        // clamp해 head를 계속 업데이트. 비-drag(double/triple click highlight 등)는
-        // cell-exact 매칭이라 기존 동작 유지.
+        // 드래그 중일 때만 cursor → selection head 갱신. dragging=false면 즉시 return —
+        // release 후 hover로 selection이 따라가는 stuck 방지 (word/line/find selection도
+        // dragging=false라 자연스럽게 고정).
+        // dragging 중에는 selection.pane viewport 가장자리로 clamp해 창 밖 좌표도 처리.
         let Some(selection) = self.selection.as_ref() else {
             return false;
         };
-        if selection.dragging {
-            let pane = selection.pane;
-            let Some(viewport) = self
-                .active_tab()
-                .panes
-                .iter()
-                .find(|p| p.id == pane)
-                .map(|p| p.viewport)
-            else {
-                return false;
-            };
-            let Some(pos) = self.last_mouse_pos else {
-                return false;
-            };
-            let cell = self.renderer.cell_metrics();
-            let new_head = clamp_pos_to_viewport_cell(pos, viewport, cell);
-            // Mut borrow.
-            let Some(selection) = self.selection.as_mut() else {
-                return false;
-            };
-            if selection.head == new_head {
-                return false;
-            }
-            selection.head = new_head;
-            return true;
+        if !selection.dragging {
+            return false;
         }
-        // 비-drag: 기존 cell-exact 동작.
-        let Some((pane, cell)) = self.pane_cell_at_mouse() else {
+        let pane = selection.pane;
+        let Some(viewport) = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|p| p.id == pane)
+            .map(|p| p.viewport)
+        else {
             return false;
         };
+        let Some(pos) = self.last_mouse_pos else {
+            return false;
+        };
+        let cell = self.renderer.cell_metrics();
+        let new_head = clamp_pos_to_viewport_cell(pos, viewport, cell);
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        if selection.pane != pane || selection.head == cell {
+        if selection.head == new_head {
             return false;
         }
-        selection.head = cell;
+        selection.head = new_head;
         true
     }
 
