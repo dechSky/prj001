@@ -271,6 +271,8 @@ impl fmt::Debug for Hooks {
 
 #[derive(Clone)]
 pub struct AppControl {
+    /// Embedder write path 폐기 후 미사용. struct 자체는 외부 API 호환성 위해 유지.
+    #[allow(dead_code)]
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -503,6 +505,9 @@ struct PaneViewport {
 /// Drag 중 cursor의 physical position을 selection.pane viewport 안 cell 좌표로 clamp.
 /// 음수 좌표(창 위/왼쪽 밖) → 0, 너무 큰 좌표(아래/오른쪽 밖) → 가장자리 cell.
 /// 결과는 viewport-local (row, col).
+/// cell 단위 clamp helper. Phase 2 caret 전환으로 selection은 caret 사용 → 호출처 없음.
+/// 다른 컨텍스트에서 활용 가능하니 보존(테스트 6개로 동작 검증).
+#[allow(dead_code)]
 fn clamp_pos_to_viewport_cell(
     pos: PhysicalPosition<f64>,
     viewport: PaneViewport,
