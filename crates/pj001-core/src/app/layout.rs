@@ -392,6 +392,7 @@ fn resolve(
 ) {
     match node {
         Layout::Pane(id) => {
+            let x_px = rect.col as u32 * cell.width;
             out.insert(
                 *id,
                 PaneViewport {
@@ -400,10 +401,13 @@ fn resolve(
                     col_offset: rect.col,
                     row_offset: rect.row,
                     status_row,
-                    x_px: rect.col as u32 * cell.width,
+                    x_px,
                     y_px: rect.row as u32 * cell.height,
                     width_px: rect_width_px(rect, size, cell),
                     height_px: rect_height_px(rect, cell),
+                    // Phase 4a — gutter_px=0 강제. 4b에서 latch && block_mode=auto면 발동.
+                    gutter_px: 0,
+                    content_x_px: x_px,
                 },
             );
         }

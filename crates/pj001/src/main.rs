@@ -22,12 +22,22 @@ fn main() -> error::Result<()> {
 struct FileConfig {
     #[serde(default)]
     general: FileGeneral,
+    #[serde(default)]
+    block: FileBlock,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 struct FileGeneral {
     #[serde(default)]
     theme: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileBlock {
+    /// Block UI render mode. "auto" (default) — OSC 133 수신 시 ON.
+    /// "off" — 절대 visual ON 안 함. Phase 4a는 파싱만, visual은 4b부터.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -94,20 +104,29 @@ fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
 }
 
 /// 단일 터미널 모드. `--shell <path>`로 shell 지정, `--theme <name>`로 6 테마 선택.
-/// `file_config` (~/.config/pj001/config.toml)의 general.theme는 CLI 미지정 시 사용.
+/// `--block-mode <auto|off>` Block UI 모드 (4a는 파싱만, visual은 4b부터).
+/// `file_config` (~/.config/pj001/config.toml)의 general.theme / block.mode는 CLI 미지정 시 사용.
 fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Result<Config> {
     let mut shell_override = None;
     let mut theme_name = None;
+    let mut block_mode = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--shell" | "-s" => shell_override = Some(take_arg_value(a, iter.next())?),
             "--theme" => theme_name = Some(take_arg_value(a, iter.next())?),
+            "--block-mode" => block_mode = Some(take_arg_value(a, iter.next())?),
             _ if a.starts_with("--shell=") => {
                 shell_override = Some(take_eq_value("--shell", &a["--shell=".len()..])?);
             }
             _ if a.starts_with("--theme=") => {
                 theme_name = Some(take_eq_value("--theme", &a["--theme=".len()..])?);
+            }
+            _ if a.starts_with("--block-mode=") => {
+                block_mode = Some(take_eq_value(
+                    "--block-mode",
+                    &a["--block-mode=".len()..],
+                )?);
             }
             _ if a.starts_with('-') => {
                 return Err(Error::Args(format!("unknown argument: {a}")));
@@ -123,6 +142,16 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         })?),
         None => None,
     };
+    // Block mode 파싱 — auto/off만 허용. default "auto". 4a는 검증만, visual은 4b.
+    let resolved_block_mode = block_mode
+        .or_else(|| file_config.and_then(|c| c.block.mode.clone()))
+        .unwrap_or_else(|| "auto".to_string());
+    if resolved_block_mode != "auto" && resolved_block_mode != "off" {
+        return Err(Error::Args(format!(
+            "unknown block-mode: {resolved_block_mode} (expected auto/off)"
+        )));
+    }
+    log::info!("block-mode: {resolved_block_mode}");
     let config = Config::single_shell(shell_override);
     Ok(match theme {
         Some(theme) => config.with_theme(theme),
@@ -243,6 +272,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
             },
+            block: FileBlock::default(),
         };
         let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
@@ -254,6 +284,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
             },
+            block: FileBlock::default(),
         };
         let cfg = parse_config(&args(&["--theme", "obsidian"]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
@@ -265,6 +296,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("nope".to_string()),
             },
+            block: FileBlock::default(),
         };
         assert!(parse_config(&args(&[]), Some(&fc)).is_err());
     }
@@ -295,5 +327,47 @@ something = "value"
 "#;
         let parsed: FileConfig = toml::from_str(raw).unwrap();
         assert_eq!(parsed.general.theme.as_deref(), Some("bento"));
+    }
+
+    // === Block UI 4a Step 6 — block_mode TOML/CLI ===
+
+    #[test]
+    fn block_mode_default_is_auto_no_error() {
+        // CLI 미지정 + file 미지정 → "auto" 적용, 에러 없음.
+        let cfg = parse_config(&args(&[]), None);
+        assert!(cfg.is_ok());
+    }
+
+    #[test]
+    fn block_mode_cli_accepts_auto_and_off() {
+        assert!(parse_config(&args(&["--block-mode", "auto"]), None).is_ok());
+        assert!(parse_config(&args(&["--block-mode=off"]), None).is_ok());
+    }
+
+    #[test]
+    fn block_mode_cli_rejects_invalid_value() {
+        assert!(parse_config(&args(&["--block-mode", "magic"]), None).is_err());
+        assert!(parse_config(&args(&["--block-mode=neither"]), None).is_err());
+    }
+
+    #[test]
+    fn block_mode_toml_off_parses() {
+        let raw = r#"
+[block]
+mode = "off"
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.block.mode.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn block_mode_toml_invalid_rejected_at_parse_config() {
+        let fc = FileConfig {
+            general: FileGeneral { theme: None },
+            block: FileBlock {
+                mode: Some("nonsense".to_string()),
+            },
+        };
+        assert!(parse_config(&args(&[]), Some(&fc)).is_err());
     }
 }

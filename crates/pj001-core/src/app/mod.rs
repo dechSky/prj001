@@ -457,6 +457,13 @@ struct PaneViewport {
     y_px: u32,
     width_px: u32,
     height_px: u32,
+    /// Block UI Phase 4a — prompt marker gutter 폭. 4a는 강제 0.
+    /// 4b에서 block_capable && block_mode==auto일 때 발동.
+    #[allow(dead_code)]
+    gutter_px: u16,
+    /// `x_px + gutter_px`. mouse/selection 좌표 변환 시 사용. 4a는 x_px와 동일.
+    #[allow(dead_code)]
+    content_x_px: u32,
 }
 
 fn status_segment(
@@ -938,6 +945,8 @@ fn compute_viewports(
             y_px: 0,
             width_px: size.width,
             height_px: size.height,
+            gutter_px: 0,
+            content_x_px: 0,
         }];
     }
 
