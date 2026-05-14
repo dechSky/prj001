@@ -20,6 +20,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, ImePurpose, Window, WindowId};
 
+use crate::block::BlockState;
 use crate::error::{Error, Result};
 use crate::grid::{MouseProtocol, Term};
 use crate::pty::PtyHandle;
@@ -934,6 +935,20 @@ fn compute_tab_viewports(
         }
     }
     layouts
+}
+
+/// Phase 4c: BlockState + duration_ms → status badge text. None이면 badge 안 그림.
+fn status_badge_text(state: &BlockState, duration_ms: Option<u64>) -> Option<String> {
+    match state {
+        BlockState::Prompt => None,
+        BlockState::Command | BlockState::Running => Some(" RUN ".to_string()),
+        BlockState::Completed { exit_code: Some(0) } => duration_ms.map(|ms| format!(" {}ms ", ms)),
+        BlockState::Completed {
+            exit_code: Some(code),
+        } => Some(format!(" x {} ", code)),
+        BlockState::Completed { exit_code: None } => Some(" ? ".to_string()),
+        BlockState::Abandoned { .. } => Some(" -- ".to_string()),
+    }
 }
 
 /// Phase 4b-1c gutter_px helper. block_visual=true이면 font_size+4를 cell.width 단위로 ceil.
@@ -3738,21 +3753,24 @@ impl AppState {
                 // Phase 4b-2b: block visual 활성 시 visible_blocks → BlockOverlay 리스트.
                 // Phase 4b-2c-1: theme token 도입. palette.block_bg/block_border 사용.
                 // obsidian만 bg와 다른 값(시각 발동), 나머지 5 테마는 bg와 동일(raw fallback).
-                let block_overlays: Vec<crate::render::BlockOverlay> =
-                    if self.block_mode == BlockMode::Auto {
-                        let palette = self.renderer.palette();
-                        term.visible_blocks(term.rows())
-                            .into_iter()
-                            .map(|vb| crate::render::BlockOverlay {
-                                visible_row_start: vb.visible_row_start,
-                                visible_row_end: vb.visible_row_end,
-                                bg: palette.block_bg,
-                                border_color: palette.block_border,
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                // Phase 4c: status badge용 visible_blocks 정보도 같이 보존.
+                let visible_blocks = if self.block_mode == BlockMode::Auto {
+                    term.visible_blocks(term.rows())
+                } else {
+                    Vec::new()
+                };
+                let block_overlays: Vec<crate::render::BlockOverlay> = {
+                    let palette = self.renderer.palette();
+                    visible_blocks
+                        .iter()
+                        .map(|vb| crate::render::BlockOverlay {
+                            visible_row_start: vb.visible_row_start,
+                            visible_row_end: vb.visible_row_end,
+                            bg: palette.block_bg,
+                            border_color: palette.block_border,
+                        })
+                        .collect()
+                };
                 // Phase 4b-2c-3: gutter_cells = gutter_px / cell_w. compute_tab_viewports에서
                 // 이미 cell.width 단위로 align됐으므로 정확한 정수 분할.
                 let cell_w = self.renderer.cell_metrics().width.max(1);
@@ -3768,6 +3786,31 @@ impl AppState {
                     &block_overlays,
                     pane_gutter_cells,
                 );
+                // Phase 4c: status badge — 각 카드의 visible_row_start 우측 끝에 chip text.
+                let viewport_cols = {
+                    self.active_tab().panes[idx].viewport.cols
+                };
+                let palette = self.renderer.palette();
+                for vb in &visible_blocks {
+                    let Some(badge) = status_badge_text(&vb.state, vb.duration_ms) else {
+                        continue;
+                    };
+                    let badge_width = badge.chars().count();
+                    if badge_width == 0 || badge_width > viewport_cols {
+                        continue;
+                    }
+                    let badge_col = pane_col_offset + viewport_cols - badge_width;
+                    let badge_row = pane_row_offset + vb.visible_row_start;
+                    self.renderer.append_text_line(
+                        &self.queue,
+                        &badge,
+                        badge_col,
+                        badge_row,
+                        badge_width,
+                        palette.bg,
+                        palette.block_border,
+                    );
+                }
                 // M6-3b: active pane 기준으로 IME composition window 위치 갱신.
                 if is_active && !in_scrollback && self.last_ime_cursor != Some((cur.row, cur.col)) {
                     let cell = self.renderer.cell_metrics();
@@ -4093,6 +4136,65 @@ mod tests {
         assert_eq!(viewport.row_offset, 1);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.y_px, 20);
+    }
+
+    #[test]
+    fn status_badge_text_prompt_none() {
+        assert!(status_badge_text(&BlockState::Prompt, None).is_none());
+        assert!(status_badge_text(&BlockState::Prompt, Some(100)).is_none());
+    }
+
+    #[test]
+    fn status_badge_text_running_run_chip() {
+        assert_eq!(
+            status_badge_text(&BlockState::Command, None),
+            Some(" RUN ".to_string())
+        );
+        assert_eq!(
+            status_badge_text(&BlockState::Running, Some(500)),
+            Some(" RUN ".to_string())
+        );
+    }
+
+    #[test]
+    fn status_badge_text_completed_success_with_duration() {
+        let state = BlockState::Completed {
+            exit_code: Some(0),
+        };
+        assert_eq!(
+            status_badge_text(&state, Some(123)),
+            Some(" 123ms ".to_string())
+        );
+        // duration None → None badge (값 없으면 표시 X)
+        assert!(status_badge_text(&state, None).is_none());
+    }
+
+    #[test]
+    fn status_badge_text_completed_failure_shows_exit_code() {
+        let state = BlockState::Completed {
+            exit_code: Some(1),
+        };
+        assert_eq!(
+            status_badge_text(&state, Some(50)),
+            Some(" x 1 ".to_string())
+        );
+    }
+
+    #[test]
+    fn status_badge_text_completed_unknown_exit_question() {
+        let state = BlockState::Completed { exit_code: None };
+        assert_eq!(
+            status_badge_text(&state, Some(50)),
+            Some(" ? ".to_string())
+        );
+    }
+
+    #[test]
+    fn status_badge_text_abandoned_dash_dash() {
+        let state = BlockState::Abandoned {
+            reason: crate::block::AbandonReason::Reset,
+        };
+        assert_eq!(status_badge_text(&state, None), Some(" -- ".to_string()));
     }
 
     #[test]

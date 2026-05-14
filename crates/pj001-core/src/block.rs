@@ -79,12 +79,14 @@ pub enum BlockBoundary {
 /// Phase 4b-2: visible viewport에 매핑된 block 정보. Term::visible_blocks 출력.
 /// `visible_row_*`은 viewport-local row (0..viewport_rows). render path가 cell quad 좌표로
 /// 변환해 카드 bg overlay 그릴 때 사용.
+/// Phase 4c: `duration_ms` = ended_at - started_at(B~D), Completed 카드의 badge text 용도.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisibleBlock {
     pub id: BlockId,
     pub state: BlockState,
     pub visible_row_start: usize,
     pub visible_row_end: usize,
+    pub duration_ms: Option<u64>,
 }
 
 /// append-only block 컬렉션. eviction은 oldest first.

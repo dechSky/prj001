@@ -791,11 +791,17 @@ impl Term {
             let clip_bottom = block_bottom.min(bottom_abs);
             let visible_top = (clip_top - top_abs) as usize;
             let visible_bottom = (clip_bottom - top_abs) as usize;
+            // Phase 4c: duration = ended_at - started_at. B/D 둘 다 받은 후에만 Some.
+            let duration_ms = block
+                .started_at
+                .zip(block.ended_at)
+                .map(|(start, end)| end.duration_since(start).as_millis() as u64);
             out.push(VisibleBlock {
                 id: block.id,
                 state: block.state.clone(),
                 visible_row_start: visible_top,
                 visible_row_end: visible_bottom,
+                duration_ms,
             });
         }
         out
