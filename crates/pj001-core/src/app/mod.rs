@@ -1089,6 +1089,8 @@ struct AppState {
     last_mouse_pos: Option<PhysicalPosition<f64>>,
     dragging_divider: Option<layout::DividerHit>,
     selection: Option<MouseSelection>,
+    /// Phase 5: drag 중 마우스 viewport 밖 sticky scroll throttle. 마지막 auto-scroll 시점.
+    last_auto_scroll_at: Option<Instant>,
     last_click: Option<MouseClick>,
     /// M17-5: resize coalesce. winit Resized burst를 about_to_wait에서 마지막 size로만 처리.
     /// 매번 reflow + PTY size 갱신하면 zsh가 따라잡지 못해 redraw 시퀀스가 잘못된 size에 적용 → tearing.
@@ -1914,6 +1916,15 @@ impl ApplicationHandler<UserEvent> for App {
         };
         if let Some(deadline) = quick_spawn_deadline {
             next = next.min(deadline);
+        }
+        // Phase 5: continuous auto-scroll — drag 중 마우스 viewport 밖이면 마우스 멈춰 있어도
+        // 50ms마다 sticky scroll. update_selection_to_mouse가 자체 throttle 처리.
+        if state.is_auto_scrolling() {
+            if state.update_selection_to_mouse() {
+                state.window.request_redraw();
+            }
+            let scroll_next = Instant::now() + Duration::from_millis(50);
+            next = next.min(scroll_next);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
@@ -3126,6 +3137,7 @@ impl AppState {
             last_mouse_pos: None,
             dragging_divider: None,
             selection: None,
+            last_auto_scroll_at: None,
             last_click: None,
             pending_resize: None,
             logical_font_size: DEFAULT_FONT_SIZE,
@@ -3298,6 +3310,32 @@ impl AppState {
         }
     }
 
+    /// Phase 5: continuous auto-scroll 활성 조건 — selection.dragging + 마우스 viewport 밖.
+    /// about_to_wait가 매 50ms 호출해 sticky scroll 유지.
+    fn is_auto_scrolling(&self) -> bool {
+        let Some(selection) = self.selection.as_ref() else {
+            return false;
+        };
+        if !selection.dragging {
+            return false;
+        }
+        let Some(pos) = self.last_mouse_pos else {
+            return false;
+        };
+        let Some(viewport) = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|p| p.id == selection.pane)
+            .map(|p| p.viewport)
+        else {
+            return false;
+        };
+        let vp_top = viewport.y_px as f64;
+        let vp_bottom = vp_top + viewport.height_px as f64;
+        pos.y < vp_top || pos.y >= vp_bottom
+    }
+
     fn update_selection_to_mouse(&mut self) -> bool {
         // Phase 2 caret 모델: dragging 중에만 mouse caret 위치로 head 갱신.
         // caret 모델은 cell A↔A+1 사이 boundary로 head가 잡혀 한 글자 선택은 cell의
@@ -3340,11 +3378,27 @@ impl AppState {
             .find(|p| p.id == pane)
             .map(|p| p.session);
         if scroll_delta != 0 {
-            if let Some(sid) = session_id_for_scroll {
-                if let Some(mut term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok()) {
-                    term.scroll_view_by(scroll_delta);
+            // Phase 5: throttle — 50ms 간격으로만 scroll. 마우스 빨리 움직여도 over-scroll 방지
+            // + about_to_wait sticky scroll에서 같은 throttle 재사용 (continuous scroll).
+            const SCROLL_THROTTLE_MS: u64 = 50;
+            let now = Instant::now();
+            let throttle_ok = self
+                .last_auto_scroll_at
+                .map_or(true, |last| {
+                    now.duration_since(last) >= Duration::from_millis(SCROLL_THROTTLE_MS)
+                });
+            if throttle_ok {
+                if let Some(sid) = session_id_for_scroll {
+                    if let Some(mut term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok())
+                    {
+                        term.scroll_view_by(scroll_delta);
+                    }
                 }
+                self.last_auto_scroll_at = Some(now);
             }
+        } else {
+            // viewport 안으로 돌아오면 throttle 리셋.
+            self.last_auto_scroll_at = None;
         }
         let cell = self.renderer.cell_metrics();
         let new_head_viewport = clamp_pos_to_viewport_caret(pos, viewport, cell);
