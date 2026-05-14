@@ -3270,15 +3270,14 @@ impl AppState {
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        // line_drag 모드: head를 line whole로 — drag head row >= anchor row이면 head=(row, cols),
-        // 아니면 head=(row, 0). anchor도 line 시작에 정렬 (line_drag start_selection_at에서 이미
-        // anchor=(row, 0) 또는 (row, cols)로 시작).
-        let target_head = if selection.line_drag {
+        // line_drag 모드: head row가 anchor row와 다를 때만 line whole 발동. 같은 row 안
+        // micro-drag(trackpad 떨림 등)에는 char-level 동작 유지 — 단순 click 후 미세 흔들림
+        // 으로 line 전체가 잡히는 회귀 방지.
+        let target_head = if selection.line_drag && new_head_abs.0 != selection.anchor.0 {
             let head_row = new_head_abs.0;
             let anchor_row = selection.anchor.0;
-            // anchor를 line의 적절 끝으로 재정렬 (drag 방향 따라).
-            if head_row >= anchor_row {
-                // 정방향 drag — anchor=(anchor_row, 0), head=(head_row, cols).
+            if head_row > anchor_row {
+                // 정방향 drag (아래로) — anchor=(anchor_row, 0), head=(head_row, cols).
                 selection.anchor = (anchor_row, 0);
                 (head_row, viewport_cols)
             } else {
