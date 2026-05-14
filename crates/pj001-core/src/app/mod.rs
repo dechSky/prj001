@@ -822,6 +822,8 @@ enum CmdShortcut {
     ClearScrollback,
     /// 슬라이스 6.5: Cmd+F find.
     Find,
+    /// Phase 5: Cmd+A — 활성 pane의 scrollback+viewport 전체 selection.
+    SelectAll,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -938,6 +940,9 @@ fn cmd_shortcut(
     }
     if lower == Some("f") || physical_code == Some(KeyCode::KeyF) {
         return Some(CmdShortcut::Find);
+    }
+    if lower == Some("a") || physical_code == Some(KeyCode::KeyA) {
+        return Some(CmdShortcut::SelectAll);
     }
     None
 }
@@ -1781,6 +1786,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::Find) => {
                             state.start_find();
+                            return;
+                        }
+                        Some(CmdShortcut::SelectAll) => {
+                            state.handle_select_all();
                             return;
                         }
                         Some(CmdShortcut::ClearBuffer) => {
@@ -3717,6 +3726,35 @@ impl AppState {
             self.apply_layout_viewports();
             self.window.request_redraw();
         }
+    }
+
+    /// Phase 5: Cmd+A — 활성 pane의 scrollback + main 전체 selection.
+    /// anchor=(oldest_kept_abs, 0), head=(last_abs_row+1, 0) caret 의미. Cmd+C로 전체 copy.
+    fn handle_select_all(&mut self) {
+        let idx = self.active_index();
+        let pane = &self.active_tab().panes[idx];
+        let pane_id = pane.id;
+        let session_id = pane.session;
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let Ok(term) = session.term.lock() else {
+            return;
+        };
+        let cols = term.cols();
+        let rows = term.rows();
+        let scrollback_len = term.scrollback_len();
+        let oldest_abs = term.oldest_kept_abs() as usize;
+        let last_main_abs = oldest_abs + scrollback_len + rows.saturating_sub(1);
+        drop(term);
+        self.selection = Some(MouseSelection {
+            pane: pane_id,
+            anchor: (oldest_abs, 0),
+            head: (last_main_abs, cols),
+            dragging: false,
+            line_drag: false,
+        });
+        self.window.request_redraw();
     }
 
     /// M12-6 design §5: 마우스 hit-test로 SessionId 반환. pane_at_mouse → SessionId 매핑.
