@@ -467,7 +467,14 @@ pub struct Term {
     hyperlink_pool: Vec<String>,
     /// 현재 active OSC 8 URI의 pool index. 0 = inactive (cells에 stamp 안 됨).
     active_hyperlink_id: u16,
-    /// OSC 133;A — 최근 prompt start row (절대 = scrollback rows + main grid row).
+    /// Block UI Phase 4a — scrollback eviction 보정 offset.
+    /// abs_row = oldest_kept_abs + scrollback.len() + cursor.row (main grid 한정).
+    /// scrollback pop_front 시점마다 +1 증가. session 시작 시 0.
+    /// scrollback이 SCROLLBACK_CAP에 도달한 후에는 scrollback.len()이 고정되므로
+    /// 이 필드가 절대 좌표의 유일한 안정 키.
+    oldest_kept_abs: u64,
+    /// OSC 133;A — 최근 prompt start의 절대 행.
+    /// abs = oldest_kept_abs + scrollback.len() + cursor.row.
     /// 차후 Cmd+↑/↓ "prev/next prompt" 점프, block UI 카드 경계 결정에 사용.
     last_prompt_row: Option<u64>,
     /// OSC 133;A 누적 카운터 — 디버깅 + 테스트 검증용.
@@ -534,6 +541,7 @@ impl Term {
             hyperlink_uri: None,
             hyperlink_pool: Vec::new(),
             active_hyperlink_id: 0,
+            oldest_kept_abs: 0,
             last_prompt_row: None,
             prompts_seen: 0,
             last_command_exit: None,
@@ -557,26 +565,45 @@ impl Term {
         self.mouse_sgr_encoding = on;
     }
 
-    // OSC 133 — semantic prompt 이벤트. 1차 cut은 메타데이터 추적만(block UI 인프라).
+    // OSC 133 — semantic prompt 이벤트. Phase 4a: oldest_kept_abs로 좌표 안정화.
+    // alt screen 모드(vim/htop 등)에서는 OSC 133 무시 — main grid 좌표와 cursor.row 의미 다름.
+
+    /// 현재 main grid 기준 절대 행. scrollback eviction과 무관한 안정 키.
+    pub(crate) fn current_abs_row(&self) -> u64 {
+        self.oldest_kept_abs + self.scrollback.len() as u64 + self.cursor.row as u64
+    }
+
     /// `OSC 133;A` 시점에 호출. 현재 cursor row를 절대 행 번호로 보관.
     pub fn semantic_prompt_start(&mut self) {
-        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
-        self.last_prompt_row = Some(absolute);
+        if self.use_alt {
+            return;
+        }
+        self.last_prompt_row = Some(self.current_abs_row());
         self.prompts_seen = self.prompts_seen.saturating_add(1);
     }
     /// `OSC 133;B` 시점 — 명령어 텍스트 시작.
     pub fn semantic_command_start(&mut self) {
-        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
-        self.last_command_start_row = Some(absolute);
+        if self.use_alt {
+            return;
+        }
+        self.last_command_start_row = Some(self.current_abs_row());
     }
     /// `OSC 133;C` 시점 — 명령어 출력 시작.
     pub fn semantic_output_start(&mut self) {
-        let absolute = self.scrollback.len() as u64 + self.cursor.row as u64;
-        self.last_output_start_row = Some(absolute);
+        if self.use_alt {
+            return;
+        }
+        self.last_output_start_row = Some(self.current_abs_row());
     }
     /// `OSC 133;D[;exit]` 시점에 호출. exit는 None이면 unknown.
     pub fn semantic_command_end(&mut self, exit: Option<i32>) {
+        if self.use_alt {
+            return;
+        }
         self.last_command_exit = exit;
+    }
+    pub fn oldest_kept_abs(&self) -> u64 {
+        self.oldest_kept_abs
     }
     pub fn last_prompt_row(&self) -> Option<u64> {
         self.last_prompt_row
@@ -1004,8 +1031,10 @@ impl Term {
                 block_tags: Vec::new(),
             });
         }
+        // Phase 4a: reflow 후 SCROLLBACK_CAP 재적용 front drop도 oldest_kept_abs 증가.
         while new_scrollback.len() > SCROLLBACK_CAP {
             new_scrollback.pop_front();
+            self.oldest_kept_abs = self.oldest_kept_abs.saturating_add(1);
         }
 
         // 새 main cells / row_flags 빌드.
@@ -1160,8 +1189,11 @@ impl Term {
                     flags,
                     block_tags,
                 });
+                // Phase 4a: cap 도달 후 매 pop_front마다 oldest_kept_abs 증가 →
+                // 절대 좌표 안정. semantic_*가 보관한 last_*_row가 drift 없이 유효.
                 while self.scrollback.len() > SCROLLBACK_CAP {
                     self.scrollback.pop_front();
+                    self.oldest_kept_abs = self.oldest_kept_abs.saturating_add(1);
                 }
             }
             self.grid_mut().scroll_up(top, bottom, 1);
@@ -2202,6 +2234,64 @@ mod tests {
         // main의 row 0/1은 tag 없음 (carry는 row 0 → scrollback, row 1 → row 0 idle).
         assert!(term.main_row_block_tags(0).is_empty());
         assert!(term.main_row_block_tags(1).is_empty());
+    }
+
+    // === Step 3 — oldest_kept_abs + OSC 133 좌표 안정화 ===
+
+    #[test]
+    fn oldest_kept_abs_starts_at_zero_and_grows_with_cap_eviction() {
+        let mut term = Term::new(4, 2);
+        assert_eq!(term.oldest_kept_abs(), 0);
+        // SCROLLBACK_CAP + 5번 newline → cap 초과 5회 → oldest_kept_abs = 5.
+        for _ in 0..(SCROLLBACK_CAP + 5) {
+            term.set_cursor(1, 0);
+            term.newline();
+        }
+        assert_eq!(term.oldest_kept_abs(), 5);
+        assert_eq!(term.scrollback.len(), SCROLLBACK_CAP);
+    }
+
+    #[test]
+    fn semantic_prompt_row_uses_absolute_coordinate_after_eviction() {
+        let mut term = Term::new(4, 2);
+        // 잠시 prompt 마킹 후 cap 초과 newline. last_prompt_row가 절대 행으로 안정.
+        term.semantic_prompt_start();
+        let first_abs = term.last_prompt_row().unwrap();
+        assert_eq!(first_abs, 0); // cursor.row=0, scrollback.len()=0
+        // cap 도달 직전까지 newline.
+        for _ in 0..SCROLLBACK_CAP {
+            term.set_cursor(1, 0);
+            term.newline();
+        }
+        // 이제 새 prompt — scrollback이 SCROLLBACK_CAP이고 cursor.row=1 가정.
+        term.semantic_prompt_start();
+        let second_abs = term.last_prompt_row().unwrap();
+        // first_abs=0, second_abs는 first_abs와 명확히 다르고 단조 증가.
+        assert!(second_abs > first_abs);
+        // cap을 5회 더 넘김 → 절대 좌표 안정성: oldest_kept_abs 증가하지만
+        // 이전 last_prompt_row 값은 그대로 유지되어 비교 가능.
+        let captured = term.last_prompt_row().unwrap();
+        for _ in 0..5 {
+            term.set_cursor(1, 0);
+            term.newline();
+        }
+        assert_eq!(term.oldest_kept_abs(), 5);
+        assert_eq!(term.last_prompt_row(), Some(captured)); // drift 없음
+    }
+
+    #[test]
+    fn semantic_callbacks_no_op_on_alt_screen() {
+        let mut term = Term::new(4, 3);
+        term.switch_alt_screen(true);
+        assert!(term.last_prompt_row().is_none());
+        term.semantic_prompt_start();
+        term.semantic_command_start();
+        term.semantic_output_start();
+        term.semantic_command_end(Some(0));
+        // alt 모드에서는 호출 무시.
+        assert!(term.last_prompt_row().is_none());
+        assert_eq!(term.prompts_seen(), 0);
+        assert!(term.last_command_exit().is_none());
     }
 
     #[test]
