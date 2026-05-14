@@ -3250,17 +3250,36 @@ impl AppState {
         let Some(pos) = self.last_mouse_pos else {
             return false;
         };
+        // Phase 5: drag 중 마우스가 viewport 위/아래로 벗어나면 auto-scroll. 위는 view_offset
+        // 증가(scrollback 위로), 아래는 view_offset 감소(현재 컨텐츠로). pos.y가 viewport y_px
+        // 미만이면 위, y_px + height_px 이상이면 아래.
+        let viewport_top = viewport.y_px as f64;
+        let viewport_bottom = (viewport.y_px as f64) + (viewport.height_px as f64);
+        let scroll_delta: isize = if pos.y < viewport_top {
+            1
+        } else if pos.y >= viewport_bottom {
+            -1
+        } else {
+            0
+        };
+        let session_id_for_scroll = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|p| p.id == pane)
+            .map(|p| p.session);
+        if scroll_delta != 0 {
+            if let Some(sid) = session_id_for_scroll {
+                if let Some(mut term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok()) {
+                    term.scroll_view_by(scroll_delta);
+                }
+            }
+        }
         let cell = self.renderer.cell_metrics();
         let new_head_viewport = clamp_pos_to_viewport_caret(pos, viewport, cell);
-        // Phase 5: viewport caret → abs caret.
+        // Phase 5: viewport caret → abs caret. scroll 후 새 view_offset 기준으로 변환.
         let new_head_abs = {
-            let session_id = self
-                .active_tab()
-                .panes
-                .iter()
-                .find(|p| p.id == pane)
-                .map(|p| p.session);
-            session_id
+            session_id_for_scroll
                 .and_then(|sid| self.sessions.get(&sid))
                 .and_then(|s| s.term.lock().ok())
                 .map(|t| caret_to_abs(&t, new_head_viewport))
