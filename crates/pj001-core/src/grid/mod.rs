@@ -1112,6 +1112,15 @@ impl Term {
         self.view_offset
     }
 
+    /// Phase 5(selection abs): viewport row 0의 absolute row 좌표.
+    /// view_offset=0이면 main grid 시작점(oldest_kept_abs + scrollback.len()).
+    /// view_offset>0이면 그만큼 scrollback으로 시점 위로.
+    pub fn top_visible_abs(&self) -> u64 {
+        self.oldest_kept_abs
+            .saturating_add(self.scrollback.len() as u64)
+            .saturating_sub(self.view_offset as u64)
+    }
+
     /// scrollback view 스크롤. delta > 0 = 위로, delta < 0 = 아래로.
     pub fn scroll_view_by(&mut self, delta: isize) {
         let max = self.scrollback.len();

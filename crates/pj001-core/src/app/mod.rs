@@ -1037,11 +1037,31 @@ struct FindState {
 #[derive(Clone, Debug)]
 struct MouseSelection {
     pane: PaneId,
-    /// caret 좌표 (row, caret_col). caret_col은 0..=cols (글자 사이 boundary).
-    /// word/line selection의 경우 cell index를 caret 변환한 값 (start=cell_start, end=cell_end+1).
+    /// caret 좌표 (abs_row, caret_col). Phase 5: viewport-local row → abs_row(= term.top_visible_abs()
+    /// + viewport_row) 기반으로 변경. 스크롤해도 selection이 텍스트와 같이 움직이게 함.
+    /// caret_col은 0..=cols (글자 사이 boundary).
+    /// word/line selection의 경우 cell index를 caret 변환 (start=cell_start, end=cell_end+1).
     anchor: (usize, usize),
     head: (usize, usize),
     dragging: bool,
+}
+
+/// Phase 5: viewport-local caret → abs caret. abs_row = top_visible_abs + viewport_row.
+fn caret_to_abs(term: &Term, viewport_caret: (usize, usize)) -> (usize, usize) {
+    let top_abs = term.top_visible_abs() as usize;
+    (top_abs.saturating_add(viewport_caret.0), viewport_caret.1)
+}
+
+/// Phase 5: abs caret → viewport caret. abs_row < top_abs면 row=0(viewport 위 clip),
+/// > top_abs + rows이면 row=rows(viewport 아래 clip). caret_col은 그대로.
+fn abs_to_viewport_caret(term: &Term, abs_caret: (usize, usize)) -> (usize, usize) {
+    let top_abs = term.top_visible_abs() as usize;
+    let rows = term.rows();
+    let row = abs_caret
+        .0
+        .saturating_sub(top_abs)
+        .min(rows.saturating_sub(1).max(0));
+    (row, abs_caret.1)
 }
 
 #[derive(Clone, Debug)]
@@ -3188,14 +3208,28 @@ impl AppState {
             return false;
         };
         let cell = self.renderer.cell_metrics();
-        let new_head = clamp_pos_to_viewport_caret(pos, viewport, cell);
+        let new_head_viewport = clamp_pos_to_viewport_caret(pos, viewport, cell);
+        // Phase 5: viewport caret → abs caret.
+        let new_head_abs = {
+            let session_id = self
+                .active_tab()
+                .panes
+                .iter()
+                .find(|p| p.id == pane)
+                .map(|p| p.session);
+            session_id
+                .and_then(|sid| self.sessions.get(&sid))
+                .and_then(|s| s.term.lock().ok())
+                .map(|t| caret_to_abs(&t, new_head_viewport))
+                .unwrap_or(new_head_viewport)
+        };
         let Some(selection) = self.selection.as_mut() else {
             return false;
         };
-        if selection.head == new_head {
+        if selection.head == new_head_abs {
             return false;
         }
-        selection.head = new_head;
+        selection.head = new_head_abs;
         true
     }
 
@@ -3317,6 +3351,22 @@ impl AppState {
     /// single click drag selection은 caret 기반 (anchor=caret, head=caret).
     fn start_selection_at(&mut self, pane: PaneId, cell: (usize, usize), caret: (usize, usize)) {
         let click_count = self.next_click_count(pane, cell);
+        // Phase 5: cell/caret은 viewport-local. abs row로 변환해 anchor/head 저장.
+        let session_id = self
+            .active_tab()
+            .panes
+            .iter()
+            .find(|p| p.id == pane)
+            .map(|p| p.session);
+        let abs_caret = if let Some(sid) = session_id {
+            if let Some(term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok()) {
+                caret_to_abs(&term, caret)
+            } else {
+                caret
+            }
+        } else {
+            caret
+        };
         let range = match click_count {
             2 => self.word_selection_at(pane, cell),
             3.. => Some(self.line_selection_at(pane, cell.0)),
@@ -3332,8 +3382,8 @@ impl AppState {
         } else {
             Some(MouseSelection {
                 pane,
-                anchor: caret,
-                head: caret,
+                anchor: abs_caret,
+                head: abs_caret,
                 dragging: true,
             })
         };
@@ -3369,19 +3419,30 @@ impl AppState {
             .map(|pane| pane.session)?;
         let session = self.sessions.get(&session_id)?;
         let term = session.term.lock().ok()?;
-        word_selection_range(&term, cell.0, cell.1)
+        // Phase 5: viewport-local row/col → abs row로 변환해서 반환.
+        let viewport_range = word_selection_range(&term, cell.0, cell.1)?;
+        let top_abs = term.top_visible_abs() as usize;
+        Some(SelectionRange::new(
+            (top_abs + viewport_range.start.0, viewport_range.start.1),
+            (top_abs + viewport_range.end.0, viewport_range.end.1),
+        ))
     }
 
     fn line_selection_at(&self, pane: PaneId, row: usize) -> SelectionRange {
-        let cols = self
+        let pane_info = self
             .active_tab()
             .panes
             .iter()
-            .find(|candidate| candidate.id == pane)
-            .map(|pane| pane.viewport.cols)
-            .unwrap_or(1);
-        // caret 모델: line 전체 = [0, cols).
-        SelectionRange::new((row, 0), (row, cols))
+            .find(|candidate| candidate.id == pane);
+        let cols = pane_info.map(|p| p.viewport.cols).unwrap_or(1);
+        let session_id = pane_info.map(|p| p.session);
+        let top_abs = session_id
+            .and_then(|sid| self.sessions.get(&sid))
+            .and_then(|s| s.term.lock().ok())
+            .map(|t| t.top_visible_abs() as usize)
+            .unwrap_or(0);
+        // caret 모델: line 전체 = [0, cols). Phase 5: row를 abs로 변환.
+        SelectionRange::new((top_abs + row, 0), (top_abs + row, cols))
     }
 
     fn finish_selection_drag(&mut self) {
@@ -3453,7 +3514,11 @@ impl AppState {
         };
         let text = match session.term.lock() {
             Ok(term) => {
-                selection_text(&term, SelectionRange::new(selection.anchor, selection.head))
+                // Phase 5: abs → viewport caret 변환 후 selection_text. viewport 밖 부분은
+                // clip되어 viewport 안 텍스트만 추출 (scrollback 텍스트 복사는 후속 작업).
+                let anchor_vp = abs_to_viewport_caret(&term, selection.anchor);
+                let head_vp = abs_to_viewport_caret(&term, selection.head);
+                selection_text(&term, SelectionRange::new(anchor_vp, head_vp))
             }
             Err(e) => {
                 log::warn!("copy ignored: term lock failed: {e}");
@@ -3746,9 +3811,11 @@ impl AppState {
                     if selection.pane != pane_id {
                         return None;
                     }
-                    // caret 모델: anchor == head면 빈 range(SelectionRange.contains가
-                    // false 반환). 별도 skip 분기 불필요. SelectionRange가 자연스럽게 처리.
-                    Some(SelectionRange::new(selection.anchor, selection.head))
+                    // Phase 5: anchor/head는 abs caret. viewport-local로 변환 후 SelectionRange.
+                    // caret 모델: anchor == head면 빈 range(SelectionRange.contains 자연 처리).
+                    let anchor_vp = abs_to_viewport_caret(&term, selection.anchor);
+                    let head_vp = abs_to_viewport_caret(&term, selection.head);
+                    Some(SelectionRange::new(anchor_vp, head_vp))
                 });
                 // Phase 4b-2b: block visual 활성 시 visible_blocks → BlockOverlay 리스트.
                 // Phase 4b-2c-1: theme token 도입. palette.block_bg/block_border 사용.
