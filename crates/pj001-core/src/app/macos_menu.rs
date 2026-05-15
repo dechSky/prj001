@@ -322,6 +322,22 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
             "",
             NSEventModifierFlags::empty(),
         );
+        window_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        // Tab navigation — winit chain에 이미 매핑됨 (PrevTab/NextTab). keyEquivalent만 표시.
+        window_menu.addItem(&make_item(
+            mtm,
+            "Previous Tab",
+            None,
+            "[",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+        ));
+        window_menu.addItem(&make_item(
+            mtm,
+            "Next Tab",
+            None,
+            "]",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+        ));
         attach_submenu(mtm, &main, "Window", &window_menu);
         // Apple이 자동으로 윈도우 목록을 windowsMenu에 채움.
         app.setWindowsMenu(Some(&window_menu));
