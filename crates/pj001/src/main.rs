@@ -28,6 +28,18 @@ struct FileConfig {
     backdrop: FileBackdrop,
     #[serde(default)]
     font: FileFont,
+    #[serde(default)]
+    bell: FileBell,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileBell {
+    /// Visual bell (dock bounce on background). default true.
+    #[serde(default)]
+    visible: Option<bool>,
+    /// Audible bell (NSBeep). default false (macOS Terminal.app 표준).
+    #[serde(default)]
+    audible: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -192,6 +204,13 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         config = config.with_font_size(Some(size));
         log::info!("font.size={size} applied from config");
     }
+    // [bell] visible/audible 적용. default visible=true, audible=false (Terminal.app 표준).
+    if let Some(fc) = file_config {
+        let visible = fc.bell.visible.unwrap_or(true);
+        let audible = fc.bell.audible.unwrap_or(false);
+        config = config.with_bell(visible, audible);
+        log::info!("bell.visible={visible} bell.audible={audible} (from config)");
+    }
     Ok(config)
 }
 
@@ -312,6 +331,7 @@ mod tests {
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
@@ -327,6 +347,7 @@ mod tests {
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         let cfg = parse_config(&args(&["--theme", "obsidian"]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
@@ -342,6 +363,7 @@ mod tests {
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         assert!(parse_config(&args(&[]), Some(&fc)).is_err());
     }
@@ -417,6 +439,7 @@ mode = "off"
             },
             backdrop: FileBackdrop::default(),
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         assert!(parse_config(&args(&[]), Some(&fc)).is_err());
     }
@@ -433,6 +456,7 @@ mode = "off"
                 enabled: Some(false),
             },
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
         assert_eq!(cfg.backdrop_enabled, Some(false));
@@ -448,6 +472,7 @@ mode = "off"
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
             font: FileFont::default(),
+            bell: FileBell::default(),
         };
         // 단순 parse 성공만 확인 (Config 내부 shell은 SessionSpec 안)
         let _ = parse_config(&args(&[]), Some(&fc)).unwrap();
@@ -463,6 +488,7 @@ mode = "off"
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
             font: FileFont { size: Some(18.0) },
+            bell: FileBell::default(),
         };
         let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
         assert_eq!(cfg.font_size, Some(18.0));
@@ -481,6 +507,7 @@ mode = "off"
                 block: FileBlock::default(),
                 backdrop: FileBackdrop::default(),
                 font: FileFont { size: Some(v) },
+            bell: FileBell::default(),
             };
             let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
             assert_eq!(cfg.font_size, Some(v), "parse_config should not clamp");

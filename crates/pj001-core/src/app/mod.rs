@@ -216,6 +216,10 @@ pub struct Config {
     pub backdrop_enabled: Option<bool>,
     /// 초기 logical font size (pt). None = `DEFAULT_FONT_SIZE` (14.0). MIN/MAX clamp 적용.
     pub font_size: Option<f32>,
+    /// Bell 정책: visible(dock bounce, default true), audible(NSBeep, default false).
+    /// macOS Terminal.app 기본값과 동일. config [bell] section.
+    pub bell_visible: bool,
+    pub bell_audible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -381,6 +385,8 @@ impl Config {
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
             font_size: None,
+            bell_visible: true,
+            bell_audible: false,
         }
     }
 
@@ -398,6 +404,8 @@ impl Config {
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
             font_size: None,
+            bell_visible: true,
+            bell_audible: false,
         }
     }
 
@@ -430,6 +438,13 @@ impl Config {
     /// 초기 logical font size 지정. None = DEFAULT_FONT_SIZE (14.0). clamp는 init 시점에.
     pub fn with_font_size(mut self, size: Option<f32>) -> Self {
         self.font_size = size;
+        self
+    }
+
+    /// Bell 정책 설정. visible=dock bounce, audible=NSBeep.
+    pub fn with_bell(mut self, visible: bool, audible: bool) -> Self {
+        self.bell_visible = visible;
+        self.bell_audible = audible;
         self
     }
 
@@ -1166,6 +1181,9 @@ struct AppState {
     ids: IdAllocator,
     /// 슬라이스 6.5: Cmd+F find 진행 중 상태. None이면 비활성.
     pending_find: Option<FindState>,
+    /// Bell 정책 (Config에서 복사 — App.config access conflict 회피).
+    bell_visible: bool,
+    bell_audible: bool,
     /// M-P3-2a: macOS WgpuOverlay attach. Retained NSView/CAMetalLayer 보관 — drop 시
     /// AppKit 객체 자동 release. AppState가 main thread 전용이라 Send 불필요.
     #[cfg(target_os = "macos")]
@@ -2087,12 +2105,21 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         // Visual Bell — 매 about_to_wait에서 모든 session의 bell_pending drain.
-        // 하나라도 있으면 NSApp.requestUserAttention (dock bounce) 호출 + log.
+        // 정책에 따라 dock bounce + NSBeep. 둘 다 off면 silent.
         let bell_seen = state.drain_bell_pending();
         if bell_seen {
+            let visible = state.bell_visible;
+            let audible = state.bell_audible;
             #[cfg(target_os = "macos")]
-            macos_bell::request_user_attention();
-            log::info!("BEL → visual bell (dock bounce)");
+            {
+                if visible {
+                    macos_bell::request_user_attention();
+                }
+                if audible {
+                    macos_bell::ns_beep();
+                }
+            }
+            log::info!("BEL → visible={visible} audible={audible}");
         }
         // M17-5: 누적된 resize를 한 번만 처리.
         if let Some(size) = state.pending_resize.take() {
@@ -3412,6 +3439,8 @@ impl AppState {
             ids,
             pending_find: None,
             mouse_buttons_held: 0,
+            bell_visible: config.bell_visible,
+            bell_audible: config.bell_audible,
             #[cfg(target_os = "macos")]
             overlay_attach,
         };
@@ -5690,6 +5719,8 @@ mod tests {
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
             font_size: None,
+            bell_visible: true,
+            bell_audible: false,
         };
 
         assert!(config.pane_specs().is_err());
@@ -5804,6 +5835,8 @@ mod tests {
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
             font_size: None,
+            bell_visible: true,
+            bell_audible: false,
         };
 
         assert!(config.pane_specs().is_err());

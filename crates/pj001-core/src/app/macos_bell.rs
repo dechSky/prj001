@@ -19,3 +19,12 @@ pub fn request_user_attention() {
         let _: i64 = msg_send![app, requestUserAttention: NS_INFORMATIONAL_REQUEST];
     }
 }
+
+/// NSBeep — system audible bell. AppKit C function `NSBeep()`.
+/// objc2-app-kit이 NSBeep typed binding 제공 안 함. extern "C" 직접 호출.
+pub fn ns_beep() {
+    unsafe extern "C" {
+        fn NSBeep();
+    }
+    unsafe { NSBeep() };
+}
