@@ -530,6 +530,36 @@ struct App {
     startup_waited_once: bool,
     proxy: EventLoopProxy<UserEvent>,
     config: Config,
+    /// M-W-6: wgpu Instance/Adapter/Device/Queue + first surface format 공유 핸들.
+    /// 첫 윈도우 finish_startup에서 채워짐. Cmd+N 이후 윈도우는 reuse → request_adapter/
+    /// request_device 동기 호출 회피 (Cmd+N 메인 스레드 freeze 차단).
+    /// design: docs/multi-window-shared-wgpu.md.
+    wgpu_shared: Option<WgpuShared>,
+}
+
+/// M-W-6: `WindowState::create_surface`이 반환하는 overlay 핸들. macOS만 실제 데이터.
+/// 다른 OS는 `()` — 분기 코드 중복 차단.
+#[cfg(target_os = "macos")]
+type OverlayAttachment = Option<macos_overlay::OverlayAttach>;
+#[cfg(not(target_os = "macos"))]
+type OverlayAttachment = ();
+
+/// M-W-6: 첫 윈도우 init에서 채워지고 이후 윈도우 init에서 reuse하는 wgpu 핸들.
+///
+/// wgpu의 `Device`/`Queue`는 내부적으로 Arc — `.clone()`이 cheap. multi-Surface
+/// 사용은 wgpu의 표준 패턴. macOS Metal에서 단일 GPU 가정 (compatible_surface 결정).
+///
+/// `preferred_surface_format` / `preferred_alpha_mode`는 첫 surface가 선택한 값.
+/// 이후 surface도 같은 값을 우선 시도 — Codex M-W-6 1차 critical: caps에 없으면 panic
+/// 방지를 위해 caps에서 재선택. 이름이 "preferred"인 이유.
+struct WgpuShared {
+    #[allow(dead_code)]
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    preferred_surface_format: wgpu::TextureFormat,
+    preferred_alpha_mode: wgpu::CompositeAlphaMode,
 }
 
 impl App {
@@ -1410,13 +1440,24 @@ impl App {
             startup_waited_once: false,
             proxy,
             config,
+            wgpu_shared: None,
         }
     }
 
     /// M-W-3: Cmd+N으로 새 NSWindow 생성. 첫 윈도우와 같은 attrs (transparent, min size),
-    /// WindowState::new_with_size로 wgpu surface + PTY shell + NSVisualEffectView attach.
+    /// WindowState::new_with_shared로 wgpu surface + PTY shell + NSVisualEffectView attach.
     /// macOS Window 메뉴에 자동 추가 (Apple `windowsMenu` setMainMenu 효과).
+    ///
+    /// M-W-6 Codex 1차 개선: wgpu_shared guard를 window 생성 전에 — invariant를 코드로 고정.
+    /// startup 전 NewWindow event가 들어와도 untracked NSWindow 생성 차단.
     fn create_new_window(&mut self, event_loop: &ActiveEventLoop) {
+        // M-W-6: wgpu_shared invariant — finish_startup 이전엔 None. Cmd+N 무시.
+        let Some(shared) = self.wgpu_shared.as_ref() else {
+            log::warn!(
+                "create_new_window: wgpu_shared not initialized — Cmd+N ignored (startup not finished)"
+            );
+            return;
+        };
         log::info!("M-W-3: creating new window via Cmd+N");
         let attrs = Window::default_attributes()
             .with_title("pj001")
@@ -1438,12 +1479,14 @@ impl App {
             MIN_WINDOW_HEIGHT as f64,
         )));
         let size = window.inner_size();
-        let state = match pollster::block_on(WindowState::new_with_size(
+        // M-W-6: 공유 wgpu로 동기 init — pollster::block_on 제거.
+        let state = match WindowState::new_with_shared(
+            shared,
             window.clone(),
             self.proxy.clone(),
             self.config.clone(),
             size,
-        )) {
+        ) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("create_new_window: WindowState init failed: {e}");
@@ -1494,13 +1537,16 @@ impl App {
             window.inner_size().width,
             window.inner_size().height,
         );
-        let state = pollster::block_on(WindowState::new_with_size(
+        // M-W-6: 첫 윈도우 init만 async (request_adapter/request_device). 반환된 WgpuShared를
+        // App에 보관 → 이후 Cmd+N은 동기 호출.
+        let (state, shared) = pollster::block_on(WindowState::new_first(
             window,
             self.proxy.clone(),
             self.config.clone(),
             size,
         ))
-        .expect("WindowState::new");
+        .expect("WindowState::new_first");
+        self.wgpu_shared = Some(shared);
         state.window.focus_window();
         // macOS NSMenu attach — 상단 menu bar 6개 (App/Shell/Edit/View/Window/Help).
         // Apple 표준 selector + custom 항목 keyEquivalent + tag dispatch 하이브리드.
@@ -3373,46 +3419,18 @@ impl WindowState {
         );
     }
 
-    /// M12-5 회귀 fix v3: 호출 시점에 알려진 final size로 PTY를 spawn. 호출자는
-    /// 첫 winit Resized를 받아 그 size를 넘기거나 (preferred), `inner_size()` fallback.
-    #[allow(dead_code)]
-    async fn new(
-        window: Arc<Window>,
-        proxy: EventLoopProxy<UserEvent>,
-        config: Config,
-    ) -> Result<Self> {
-        let size = window.inner_size();
-        Self::new_with_size(window, proxy, config, size).await
-    }
-
-    async fn new_with_size(
+    /// M-W-6: 첫 윈도우 init. wgpu Instance/Adapter/Device/Queue 새로 생성 + first surface.
+    /// 반환된 `WgpuShared`을 App.wgpu_shared에 보관 → 이후 윈도우는 `new_with_shared` 동기 호출.
+    /// design: docs/multi-window-shared-wgpu.md.
+    async fn new_first(
         window: Arc<Window>,
         proxy: EventLoopProxy<UserEvent>,
         config: Config,
         size: PhysicalSize<u32>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, WgpuShared)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        // M-P3-2a (옵션 F): macOS에선 winit_view의 backing layer를 wgpu가 점유하지 않도록
-        // WgpuOverlay sibling subview를 만들고 그 CAMetalLayer로 surface 직접 생성.
-        // 다른 OS는 기존 path (winit window → wgpu) 그대로.
-        #[cfg(target_os = "macos")]
-        let (surface, overlay_attach) = match macos_overlay::attach_overlay(&window) {
-            Some(attach) => {
-                let surf = unsafe {
-                    instance.create_surface_unsafe(
-                        wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(attach.metal_layer_ptr),
-                    )?
-                };
-                macos_overlay::log_layer_class_after_surface(&window);
-                (surf, Some(attach))
-            }
-            None => {
-                log::warn!("macos_overlay: attach 실패 — fallback create_surface(window)");
-                (instance.create_surface(window.clone())?, None)
-            }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let surface = instance.create_surface(window.clone())?;
+        let (surface, overlay_attach) = Self::create_surface(&instance, &window)?;
+
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -3443,8 +3461,6 @@ impl WindowState {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
         // Phase 3 step 1: alpha_mode 명시 선택. macOS Metal은 PostMultiplied 흔히 지원.
-        // PostMultiplied: compositor가 src.rgb * src.a. PreMultiplied: src.rgb 이미 a 곱해진 가정.
-        // shader가 srgb space에서 일반 RGBA 출력하므로 PostMultiplied가 자연.
         let preferred_alpha = [
             wgpu::CompositeAlphaMode::PostMultiplied,
             wgpu::CompositeAlphaMode::PreMultiplied,
@@ -3456,10 +3472,11 @@ impl WindowState {
             .find(|m| caps.alpha_modes.contains(m))
             .unwrap_or(caps.alpha_modes[0]);
         log::info!(
-            "surface alpha modes available={:?} selected={:?}",
+            "M-W-6 first window: surface alpha modes available={:?} selected={:?}",
             caps.alpha_modes,
             alpha_mode
         );
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -3472,6 +3489,169 @@ impl WindowState {
         };
         surface.configure(&device, &surface_config);
 
+        let state = Self::assemble(
+            window,
+            proxy,
+            config,
+            size,
+            surface,
+            surface_config,
+            device.clone(),
+            queue.clone(),
+            format,
+            overlay_attach,
+        )?;
+
+        let shared = WgpuShared {
+            instance,
+            adapter,
+            device,
+            queue,
+            preferred_surface_format: format,
+            preferred_alpha_mode: alpha_mode,
+        };
+        Ok((state, shared))
+    }
+
+    /// M-W-6: 두 번째 이후 윈도우 init — 동기 호출. await 없음 → `pollster::block_on` 불필요.
+    /// 공유된 wgpu Instance/Adapter/Device/Queue 재사용. Cmd+N 시 메인 스레드 freeze 차단.
+    ///
+    /// Codex M-W-6 1차 critical fix: format/alpha는 "선호값" — caps에 없으면 caps에서
+    /// 재선택 (Surface::configure는 unsupported format이면 panic). caps empty면 Err.
+    /// Renderer는 per-window라 실 surface format을 assemble에 전달.
+    fn new_with_shared(
+        shared: &WgpuShared,
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self> {
+        let (surface, overlay_attach) = Self::create_surface(&shared.instance, &window)?;
+
+        let caps = surface.get_capabilities(&shared.adapter);
+        if caps.formats.is_empty() || caps.present_modes.is_empty() {
+            log::error!(
+                "M-W-6 second window: surface caps empty — adapter/surface incompatible. formats={:?} present_modes={:?}",
+                caps.formats,
+                caps.present_modes
+            );
+            return Err(Error::NoAdapter);
+        }
+        // 선호값(첫 surface 선택)이 caps에 있으면 사용. 없으면 caps에서 재선택 (첫 윈도우와 같은 정책).
+        let format = if caps.formats.contains(&shared.preferred_surface_format) {
+            shared.preferred_surface_format
+        } else {
+            let fallback = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| f.is_srgb())
+                .unwrap_or(caps.formats[0]);
+            log::warn!(
+                "M-W-6 second window: preferred format {:?} not in caps {:?} — falling back to {:?}",
+                shared.preferred_surface_format,
+                caps.formats,
+                fallback
+            );
+            fallback
+        };
+        let alpha_mode = if caps.alpha_modes.contains(&shared.preferred_alpha_mode) {
+            shared.preferred_alpha_mode
+        } else {
+            let preferred_alpha = [
+                wgpu::CompositeAlphaMode::PostMultiplied,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Opaque,
+            ];
+            let fallback = preferred_alpha
+                .iter()
+                .copied()
+                .find(|m| caps.alpha_modes.contains(m))
+                .unwrap_or(caps.alpha_modes[0]);
+            log::warn!(
+                "M-W-6 second window: preferred alpha_mode {:?} not in caps {:?} — falling back to {:?}",
+                shared.preferred_alpha_mode,
+                caps.alpha_modes,
+                fallback
+            );
+            fallback
+        };
+
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: caps.present_modes[0],
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&shared.device, &surface_config);
+        log::info!(
+            "M-W-6 second window: reusing shared wgpu Device — Cmd+N freeze 회피 (format={:?} alpha={:?})",
+            format,
+            alpha_mode
+        );
+
+        Self::assemble(
+            window,
+            proxy,
+            config,
+            size,
+            surface,
+            surface_config,
+            shared.device.clone(),
+            shared.queue.clone(),
+            format,
+            overlay_attach,
+        )
+    }
+
+    /// M-W-6 helper: macOS WgpuOverlay 시도 + fallback. 첫/이후 윈도우 공통.
+    fn create_surface(
+        instance: &wgpu::Instance,
+        window: &Arc<Window>,
+    ) -> Result<(wgpu::Surface<'static>, OverlayAttachment)> {
+        #[cfg(target_os = "macos")]
+        {
+            match macos_overlay::attach_overlay(window) {
+                Some(attach) => {
+                    let surf = unsafe {
+                        instance.create_surface_unsafe(
+                            wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(attach.metal_layer_ptr),
+                        )?
+                    };
+                    macos_overlay::log_layer_class_after_surface(window);
+                    Ok((surf, Some(attach)))
+                }
+                None => {
+                    log::warn!("macos_overlay: attach 실패 — fallback create_surface(window)");
+                    Ok((instance.create_surface(window.clone())?, None))
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok((instance.create_surface(window.clone())?, ()))
+        }
+    }
+
+    /// M-W-6 helper: surface/wgpu가 준비된 후 Renderer/sessions/PTY까지 조립.
+    /// `new_first` + `new_with_shared` 공통 path — 코드 중복 차단.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+        size: PhysicalSize<u32>,
+        surface: wgpu::Surface<'static>,
+        surface_config: wgpu::SurfaceConfiguration,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        overlay_attach: OverlayAttachment,
+    ) -> Result<Self> {
         // Phase 3 step 3: config.font_size가 있으면 사용, 없으면 default. clamp 적용.
         let logical_font_size_init = clamp_font_size(config.font_size.unwrap_or(DEFAULT_FONT_SIZE));
         let renderer = Renderer::new(
