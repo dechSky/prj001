@@ -416,23 +416,30 @@ mod tests {
     /// 출처: docs/fuzz-harness.md에 cargo-fuzz 전환 가이드.
     #[test]
     fn fuzz_random_bytes_no_panic() {
-        // deterministic LCG (no rand crate dep).
-        let mut seed: u64 = 0xDEADBEEF_CAFEBABE;
-        for _ in 0..1000 {
-            let len = ((seed >> 8) % 200 + 1) as usize;
-            let bytes: Vec<u8> = (0..len)
-                .map(|_| {
-                    seed = seed
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    (seed >> 24) as u8
-                })
-                .collect();
-            let mut term = Term::new(80, 24);
-            run(&mut term, &bytes);
-            // 결과 검증 — panic 없으면 통과. cell rows/cols invariant 확인.
-            assert_eq!(term.rows(), 24);
-            assert_eq!(term.cols(), 80);
+        // Codex 2차 권 5: seed 다양화로 coverage 폭 확대. 4 seeds × 1000 iter.
+        let seeds: [u64; 4] = [
+            0xDEADBEEF_CAFEBABE,
+            0x0123456789ABCDEF,
+            0xFEDCBA9876543210,
+            0x55AAFF00CCBB2244,
+        ];
+        for &seed_start in &seeds {
+            let mut seed = seed_start;
+            for _ in 0..1000 {
+                let len = ((seed >> 8) % 200 + 1) as usize;
+                let bytes: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        (seed >> 24) as u8
+                    })
+                    .collect();
+                let mut term = Term::new(80, 24);
+                run(&mut term, &bytes);
+                assert_eq!(term.rows(), 24);
+                assert_eq!(term.cols(), 80);
+            }
         }
     }
 

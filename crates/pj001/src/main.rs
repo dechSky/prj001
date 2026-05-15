@@ -454,6 +454,40 @@ mode = "off"
     }
 
     #[test]
+    fn file_config_font_size_applied() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: None,
+                shell: None,
+            },
+            block: FileBlock::default(),
+            backdrop: FileBackdrop::default(),
+            font: FileFont { size: Some(18.0) },
+        };
+        let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
+        assert_eq!(cfg.font_size, Some(18.0));
+    }
+
+    #[test]
+    fn file_config_font_size_extreme_values_passthrough_to_clamp() {
+        // Codex 권 검증 부족 2: parse는 clamp 안 함 (AppState init 시 clamp).
+        // parse_config는 그대로 전달, clamp는 init 단계.
+        for v in [0.0_f32, -5.0, 999.0] {
+            let fc = FileConfig {
+                general: FileGeneral {
+                    theme: None,
+                    shell: None,
+                },
+                block: FileBlock::default(),
+                backdrop: FileBackdrop::default(),
+                font: FileFont { size: Some(v) },
+            };
+            let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
+            assert_eq!(cfg.font_size, Some(v), "parse_config should not clamp");
+        }
+    }
+
+    #[test]
     fn full_toml_schema_roundtrip() {
         let raw = r#"
 [general]

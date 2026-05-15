@@ -349,9 +349,15 @@ pub enum LifecycleEvent {
 /// useful value equality.
 impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
+        // Codex 2차 권 3: 비교 대상에 theme/block_mode/backdrop_enabled/font_size 추가.
+        // hooks는 trait object라 비교 X. Equality 기반 회귀 감지 폭 확대.
         self.sessions == other.sessions
             && self.initial_layout == other.initial_layout
             && self.quick_spawn_presets == other.quick_spawn_presets
+            && self.theme == other.theme
+            && self.block_mode == other.block_mode
+            && self.backdrop_enabled == other.backdrop_enabled
+            && self.font_size == other.font_size
     }
 }
 
@@ -1215,14 +1221,38 @@ fn detect_url_at(row_text: &str, col: usize) -> Option<String> {
             }
             end += 1;
         }
-        // 끝에 붙은 문장 부호(. , ; : ? ! ) ] }) trim — URL 자체엔 거의 안 들어감.
+        // Codex 2차 권 1: trailing punctuation trim 보수적으로. ?/)/]/}는 URL 내부에
+        // 합법(query string, Wikipedia 괄호 URL). 단순 sentence terminator만 trim.
+        // balanced bracket이면 유지, unmatched trailing만 trim.
         while end > start + proto_len {
             let c = chars[end - 1];
-            if matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '}') {
+            // 항상 trim: . , ; : ! (문장 끝)
+            if matches!(c, '.' | ',' | ';' | ':' | '!') {
                 end -= 1;
-            } else {
-                break;
+                continue;
             }
+            // unmatched closing bracket만 trim (열린 개수 < 닫힌 개수).
+            if matches!(c, ')' | ']' | '}') {
+                let (open, close) = match c {
+                    ')' => ('(', ')'),
+                    ']' => ('[', ']'),
+                    '}' => ('{', '}'),
+                    _ => unreachable!(),
+                };
+                let url_slice = &chars[start..end];
+                let open_count = url_slice.iter().filter(|&&ch| ch == open).count();
+                let close_count = url_slice.iter().filter(|&&ch| ch == close).count();
+                if close_count > open_count {
+                    end -= 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        // Codex 2차 권 2: prefix만 있고 host 0글자면 reject.
+        if end <= start + proto_len {
+            start = end.max(start + 1);
+            continue;
         }
         if col >= start && col < end {
             return Some(chars[start..end].iter().collect());
@@ -5536,6 +5566,39 @@ mod tests {
         assert!(super::detect_url_at(s, 0).is_none());
         // col=7 'h' — URL 안.
         assert!(super::detect_url_at(s, 7).is_some());
+    }
+
+    #[test]
+    fn url_detect_at_keeps_query_question_mark() {
+        // Codex 권 1: ? 는 URL 내부 합법 (query string). 끝에 있어도 유지.
+        let s = "https://example.com/search?q=1";
+        let url = super::detect_url_at(s, 10).unwrap();
+        assert_eq!(url, "https://example.com/search?q=1");
+    }
+
+    #[test]
+    fn url_detect_at_balanced_paren_kept() {
+        // Codex 권 1: Wikipedia 식 (foo_bar) 같은 balanced parenthesis URL.
+        let s = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        let url = super::detect_url_at(s, 10).unwrap();
+        assert_eq!(url, "https://en.wikipedia.org/wiki/Foo_(bar)");
+    }
+
+    #[test]
+    fn url_detect_at_unbalanced_trailing_paren_trimmed() {
+        // 매칭된 ( 없으면 끝 )는 trim.
+        let s = "see https://example.com).";
+        let url = super::detect_url_at(s, 5).unwrap();
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_detect_at_proto_only_rejected() {
+        // Codex 권 2: host 없는 prefix만은 reject.
+        let s = "https://";
+        assert!(super::detect_url_at(s, 0).is_none());
+        let s2 = "http://";
+        assert!(super::detect_url_at(s2, 0).is_none());
     }
 
     #[test]
