@@ -17,11 +17,12 @@ mod session;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::PtySize;
+use serde::Serialize;
 use unicode_width::UnicodeWidthStr;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -54,6 +55,7 @@ const USE_NATIVE_OS_TABS: bool = cfg!(target_os = "macos");
 const CURSOR_BLINK_MS: u64 = 500;
 const QUICK_SPAWN_TIMEOUT_MS: u64 = 3_000;
 const MULTI_CLICK_MS: u64 = 500;
+const RESTORE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const TAB_BAR_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
 const TAB_ACTIVE_BG: [f32; 4] = [0.18, 0.32, 0.42, 1.0];
 const TAB_INACTIVE_BG: [f32; 4] = [0.15, 0.16, 0.18, 1.0];
@@ -206,6 +208,8 @@ fn log_page_dispatch_once(target: &'static str) {
 pub struct Config {
     pub sessions: Vec<SessionSpec>,
     pub initial_layout: InitialLayout,
+    pub restored_windows: Vec<RestoredWindowSpec>,
+    pub restore_state_path: Option<PathBuf>,
     pub quick_spawn_presets: Vec<QuickSpawnPreset>,
     pub hooks: Hooks,
     /// 활성 테마 팔레트. `None`이면 `ThemePalette::default_theme()` 사용.
@@ -236,6 +240,12 @@ pub enum BlockMode {
 pub struct SessionSpec {
     pub title: String,
     pub command: CommandSpec,
+    pub cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredWindowSpec {
+    pub panes: Vec<SessionSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +264,9 @@ pub enum CommandSpec {
 pub enum InitialLayout {
     Single {
         session: usize,
+    },
+    Panes {
+        sessions: Vec<usize>,
     },
     Split {
         direction: SplitDirection,
@@ -364,11 +377,15 @@ impl PartialEq for Config {
         // hooks는 trait object라 비교 X. Equality 기반 회귀 감지 폭 확대.
         self.sessions == other.sessions
             && self.initial_layout == other.initial_layout
+            && self.restored_windows == other.restored_windows
+            && self.restore_state_path == other.restore_state_path
             && self.quick_spawn_presets == other.quick_spawn_presets
             && self.theme == other.theme
             && self.block_mode == other.block_mode
             && self.backdrop_enabled == other.backdrop_enabled
             && self.font_size == other.font_size
+            && self.bell_visible == other.bell_visible
+            && self.bell_audible == other.bell_audible
     }
 }
 
@@ -380,8 +397,11 @@ impl Config {
             sessions: vec![SessionSpec {
                 title: "shell".to_string(),
                 command: shell.map_or(CommandSpec::Shell, CommandSpec::Custom),
+                cwd: None,
             }],
             initial_layout: InitialLayout::Single { session: 0 },
+            restored_windows: Vec::new(),
+            restore_state_path: None,
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
@@ -401,6 +421,8 @@ impl Config {
                 first: 0,
                 second: 1,
             },
+            restored_windows: Vec::new(),
+            restore_state_path: None,
             quick_spawn_presets: default_quick_spawn_presets(),
             hooks: Hooks::default(),
             theme: None,
@@ -451,9 +473,35 @@ impl Config {
         self
     }
 
+    pub fn with_restore_state_path(mut self, path: Option<PathBuf>) -> Self {
+        self.restore_state_path = path;
+        self
+    }
+
+    pub fn with_restored_windows(mut self, windows: Vec<RestoredWindowSpec>) -> Self {
+        self.restored_windows = windows;
+        self
+    }
+
     fn pane_specs(&self) -> Result<Vec<SessionSpec>> {
-        let indices = match self.initial_layout {
-            InitialLayout::Single { session } => vec![session],
+        let indices = match &self.initial_layout {
+            InitialLayout::Single { session } => vec![*session],
+            InitialLayout::Panes { sessions } => {
+                if sessions.is_empty() {
+                    return Err(Error::Args(
+                        "pane layout requires at least one session".to_string(),
+                    ));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for session in sessions {
+                    if !seen.insert(*session) {
+                        return Err(Error::Args(
+                            "pane layout requires distinct sessions".to_string(),
+                        ));
+                    }
+                }
+                sessions.clone()
+            }
             InitialLayout::Split {
                 direction: SplitDirection::Vertical,
                 first,
@@ -464,7 +512,7 @@ impl Config {
                         "split layout requires two distinct sessions".to_string(),
                     ));
                 }
-                vec![first, second]
+                vec![*first, *second]
             }
         };
 
@@ -485,6 +533,7 @@ fn default_quick_spawn_presets() -> Vec<QuickSpawnPreset> {
         spec: SessionSpec {
             title: "shell".to_string(),
             command: CommandSpec::Shell,
+            cwd: None,
         },
     }]
 }
@@ -538,6 +587,8 @@ struct App {
     /// request_device 동기 호출 회피 (Cmd+N 메인 스레드 freeze 차단).
     /// design: docs/multi-window-shared-wgpu.md.
     wgpu_shared: Option<WgpuShared>,
+    pending_restored_windows: Vec<RestoredWindowSpec>,
+    last_restore_save_at: Option<Instant>,
 }
 
 /// M-W-6: `WindowState::create_surface`이 반환하는 overlay 핸들. macOS만 실제 데이터.
@@ -565,6 +616,25 @@ struct WgpuShared {
     preferred_alpha_mode: wgpu::CompositeAlphaMode,
 }
 
+#[derive(Serialize)]
+struct RestoreStateFile {
+    version: u32,
+    windows: Vec<RestoreWindowFile>,
+}
+
+#[derive(Serialize)]
+struct RestoreWindowFile {
+    panes: Vec<RestorePaneFile>,
+}
+
+#[derive(Serialize)]
+struct RestorePaneFile {
+    title: String,
+    command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+}
+
 impl App {
     /// 현재 활성 윈도우의 WindowState mutable ref. 없으면 None.
     fn active_state_mut(&mut self) -> Option<&mut WindowState> {
@@ -583,6 +653,53 @@ impl App {
     fn all_states_mut(&mut self) -> impl Iterator<Item = &mut WindowState> {
         self.windows.values_mut()
     }
+
+    fn persist_restore_state(&self) {
+        let Some(path) = self.config.restore_state_path.as_ref() else {
+            return;
+        };
+        let mut windows = Vec::new();
+        if let Some(active) = self.active_window.and_then(|id| self.windows.get(&id))
+            && let Some(snapshot) = active.restore_snapshot()
+        {
+            windows.push(snapshot);
+        }
+        for (id, state) in &self.windows {
+            if Some(*id) == self.active_window {
+                continue;
+            }
+            if let Some(snapshot) = state.restore_snapshot() {
+                windows.push(snapshot);
+            }
+        }
+        if windows.is_empty() {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("session restore remove failed at {}: {e}", path.display());
+            }
+            return;
+        }
+        let state = RestoreStateFile {
+            version: 1,
+            windows,
+        };
+        if let Err(e) = write_restore_state(path, &state) {
+            log::warn!("session restore save failed at {}: {e}", path.display());
+        }
+    }
+}
+
+fn write_restore_state(path: &Path, state: &RestoreStateFile) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw = toml::to_string_pretty(state)
+        .map_err(|e| std::io::Error::other(format!("serialize restore state: {e}")))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 struct Pane {
@@ -1442,6 +1559,7 @@ struct MouseClick {
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, config: Config) -> Self {
+        let pending_restored_windows = config.restored_windows.clone();
         Self {
             windows: std::collections::HashMap::new(),
             active_window: None,
@@ -1450,6 +1568,8 @@ impl App {
             proxy,
             config,
             wgpu_shared: None,
+            pending_restored_windows,
+            last_restore_save_at: None,
         }
     }
 
@@ -1460,6 +1580,34 @@ impl App {
     /// M-W-6 Codex 1차 개선: wgpu_shared guard를 window 생성 전에 — invariant를 코드로 고정.
     /// startup 전 NewWindow event가 들어와도 untracked NSWindow 생성 차단.
     fn create_new_window(&mut self, event_loop: &ActiveEventLoop, tab_with_active: bool) {
+        self.create_window_from_config(
+            event_loop,
+            self.config.clone(),
+            tab_with_active,
+            tab_with_active,
+        );
+    }
+
+    fn create_restored_window(&mut self, event_loop: &ActiveEventLoop, spec: RestoredWindowSpec) {
+        if spec.panes.is_empty() {
+            return;
+        }
+        let mut config = self.config.clone();
+        config.sessions = spec.panes;
+        config.initial_layout = InitialLayout::Panes {
+            sessions: (0..config.sessions.len()).collect(),
+        };
+        config.restored_windows.clear();
+        self.create_window_from_config(event_loop, config, true, false);
+    }
+
+    fn create_window_from_config(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        config: Config,
+        tab_with_active: bool,
+        inherit_active_cwd: bool,
+    ) {
         // M-W-6: wgpu_shared invariant — finish_startup 이전엔 None. Cmd+N 무시.
         let Some(shared) = self.wgpu_shared.as_ref() else {
             log::warn!(
@@ -1474,7 +1622,7 @@ impl App {
         } else {
             None
         };
-        let startup_cwd = if tab_with_active {
+        let startup_cwd = if inherit_active_cwd {
             self.active_state().and_then(WindowState::active_cwd)
         } else {
             None
@@ -1513,7 +1661,7 @@ impl App {
             shared,
             window.clone(),
             self.proxy.clone(),
-            self.config.clone(),
+            config,
             size,
             startup_cwd,
         ) {
@@ -1562,6 +1710,7 @@ impl App {
             "M-W-3: new window {window_id:?} created, total windows={}",
             self.windows.len()
         );
+        self.persist_restore_state();
     }
 
     #[cfg(target_os = "macos")]
@@ -1585,11 +1734,12 @@ impl App {
             "{label}: closed window {window_id:?}, remaining={}",
             self.windows.len()
         );
+        self.persist_restore_state();
     }
 
     /// M12-5 회귀 fix v3: 첫 winit `Resized` 받은 후 그 size로 PTY spawn.
     /// startup SIGWINCH 0회 보장. Codex thread 019e1659.
-    fn finish_startup(&mut self, size: PhysicalSize<u32>) {
+    fn finish_startup(&mut self, event_loop: &ActiveEventLoop, size: PhysicalSize<u32>) {
         let Some(window) = self.pending_window.take() else {
             return;
         };
@@ -1668,6 +1818,11 @@ impl App {
         self.windows.insert(window_id, state);
         self.active_window = Some(window_id);
         window.request_redraw();
+        let restored = std::mem::take(&mut self.pending_restored_windows);
+        for spec in restored {
+            self.create_restored_window(event_loop, spec);
+        }
+        self.persist_restore_state();
     }
 }
 
@@ -1751,7 +1906,7 @@ impl ApplicationHandler<UserEvent> for App {
         // M12-5 회귀 fix v3: 첫 윈도우 없을 때 첫 Resized만 startup trigger로 소비.
         if self.windows.is_empty() {
             if let WindowEvent::Resized(size) = event {
-                self.finish_startup(size);
+                self.finish_startup(event_loop, size);
             }
             return;
         }
@@ -2411,7 +2566,7 @@ impl ApplicationHandler<UserEvent> for App {
             if let Some(window) = self.pending_window.as_ref() {
                 if self.startup_waited_once {
                     let size = window.inner_size();
-                    self.finish_startup(size);
+                    self.finish_startup(event_loop, size);
                 } else {
                     self.startup_waited_once = true;
                     event_loop.set_control_flow(ControlFlow::Poll);
@@ -2455,6 +2610,13 @@ impl ApplicationHandler<UserEvent> for App {
         // 모든 윈도우 자체적으로 처리. ControlFlow는 모든 윈도우 wake 요청을 fold.
         // Codex 1차 개선: 단일 now를 모든 tick이 공유 — 결정성/테스트성.
         let now = Instant::now();
+        if self
+            .last_restore_save_at
+            .is_none_or(|last| now.duration_since(last) >= RESTORE_SAVE_INTERVAL)
+        {
+            self.persist_restore_state();
+            self.last_restore_save_at = Some(now);
+        }
         let mut next = WindowNextWake::Idle;
         for state in self.windows.values_mut() {
             next = next.merge(state.tick_at(now));
@@ -2934,6 +3096,7 @@ impl WindowState {
         let session_id = self.ids.new_session();
         let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
         let shell = spec.command.resolve();
+        let cwd = spec.cwd.clone();
         log::info!("pane {} shell: {}", pane_id.0, shell);
         let pty = PtyHandle::spawn(
             &shell,
@@ -2947,7 +3110,7 @@ impl WindowState {
             self.proxy.clone(),
             self.window.id(),
             session_id,
-            None,
+            cwd.as_deref(),
         )?;
         let title = spec.title;
         self.sessions.insert(
@@ -3016,6 +3179,7 @@ impl WindowState {
             SessionSpec {
                 title: "shell".to_string(),
                 command: CommandSpec::Shell,
+                cwd: self.active_cwd(),
             },
         )
     }
@@ -3344,6 +3508,7 @@ impl WindowState {
             SessionSpec {
                 title: "shell".to_string(),
                 command: CommandSpec::Shell,
+                cwd: self.active_cwd(),
             },
             viewport,
         );
@@ -3856,6 +4021,7 @@ impl WindowState {
             let viewport = layouts[&pane_id];
             let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
             let shell = spec.command.resolve();
+            let cwd = startup_cwd.as_deref().or(spec.cwd.as_deref());
             log::info!("pane {} shell: {}", pane_id.0, shell);
             let pty = PtyHandle::spawn(
                 &shell,
@@ -3869,7 +4035,7 @@ impl WindowState {
                 proxy.clone(),
                 window.id(),
                 session_id,
-                startup_cwd.as_deref(),
+                cwd,
             )?;
             let title = spec.title;
             sessions.insert(
@@ -3980,6 +4146,37 @@ impl WindowState {
             .lock()
             .ok()
             .and_then(|term| term.cwd().map(str::to_string))
+    }
+
+    fn restore_snapshot(&self) -> Option<RestoreWindowFile> {
+        let tab = self.active_tab();
+        let panes = tab
+            .root
+            .pane_order()
+            .into_iter()
+            .filter_map(|pane_id| {
+                let pane = tab.panes.iter().find(|pane| pane.id == pane_id)?;
+                let session = self.sessions.get(&pane.session)?;
+                if !session.alive {
+                    return None;
+                }
+                let cwd = session
+                    .term
+                    .lock()
+                    .ok()
+                    .and_then(|term| term.cwd().map(str::to_string));
+                Some(RestorePaneFile {
+                    title: session.title.clone(),
+                    command: session.command.clone(),
+                    cwd,
+                })
+            })
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            None
+        } else {
+            Some(RestoreWindowFile { panes })
+        }
     }
 
     /// M12-6 design §5: 마우스 hit-test로 PaneId 반환. click site에서 idx 거치지 않고 사용.
@@ -5938,6 +6135,7 @@ mod tests {
                 spec: SessionSpec {
                     title: "bash".to_string(),
                     command: CommandSpec::Custom("/bin/bash".to_string()),
+                    cwd: None,
                 },
             },
             QuickSpawnPreset {
@@ -5945,6 +6143,7 @@ mod tests {
                 spec: SessionSpec {
                     title: "shell".to_string(),
                     command: CommandSpec::Shell,
+                    cwd: None,
                 },
             },
             QuickSpawnPreset {
@@ -5952,6 +6151,7 @@ mod tests {
                 spec: SessionSpec {
                     title: "fish".to_string(),
                     command: CommandSpec::Custom("/usr/local/bin/fish".to_string()),
+                    cwd: None,
                 },
             },
             QuickSpawnPreset {
@@ -5959,6 +6159,7 @@ mod tests {
                 spec: SessionSpec {
                     title: "fish duplicate".to_string(),
                     command: CommandSpec::Custom("/usr/local/bin/fish".to_string()),
+                    cwd: None,
                 },
             },
         ];
@@ -6489,10 +6690,12 @@ mod tests {
             SessionSpec {
                 title: "left".to_string(),
                 command: CommandSpec::Custom("/bin/zsh".to_string()),
+                cwd: None,
             },
             SessionSpec {
                 title: "right".to_string(),
                 command: CommandSpec::Custom("/bin/bash".to_string()),
+                cwd: None,
             },
         );
         let sessions = config.pane_specs().unwrap();
@@ -6516,6 +6719,7 @@ mod tests {
             sessions: vec![SessionSpec {
                 title: "one".to_string(),
                 command: CommandSpec::Shell,
+                cwd: None,
             }],
             initial_layout: InitialLayout::Split {
                 direction: SplitDirection::Vertical,
@@ -6523,6 +6727,8 @@ mod tests {
                 second: 1,
             },
             quick_spawn_presets: default_quick_spawn_presets(),
+            restored_windows: Vec::new(),
+            restore_state_path: None,
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),
@@ -6632,6 +6838,7 @@ mod tests {
             sessions: vec![SessionSpec {
                 title: "one".to_string(),
                 command: CommandSpec::Shell,
+                cwd: None,
             }],
             initial_layout: InitialLayout::Split {
                 direction: SplitDirection::Vertical,
@@ -6639,6 +6846,8 @@ mod tests {
                 second: 0,
             },
             quick_spawn_presets: default_quick_spawn_presets(),
+            restored_windows: Vec::new(),
+            restore_state_path: None,
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),

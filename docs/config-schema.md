@@ -14,6 +14,8 @@ pj001은 in-app Preferences GUI 대신 표준 TOML 설정 파일을 사용한다
 theme = "obsidian"
 # Shell 경로. 미지정 시 CLI --shell, $SHELL, /bin/zsh 순.
 shell = "/bin/zsh"
+# 마지막 창/탭/패널 cwd layout을 다음 실행 때 복원. default true.
+restore_session = true
 
 [block]
 # OSC 133 명령 블록 UI 렌더 모드. "auto" (default) | "off"
@@ -42,6 +44,7 @@ audible = false
 |---|---|
 | `PJ001_CONFIG=<path>` | config 파일 경로 override |
 | `PJ001_NO_BACKDROP=1` | vibrancy backdrop 비활성 (config.backdrop.enabled 무시) |
+| `PJ001_NO_RESTORE=1` | 이번 실행에서 session restore 비활성 |
 | `RUST_LOG=info` 등 | log level |
 | `LANG=ko_KR.UTF-8` | 한국어 menu 강제 (NSLocale 외) |
 
@@ -60,6 +63,7 @@ audible = false
 ### `[general]`
 - `theme`: 시각 즉시 변경 (재시작 안 필요한 cut은 차후).
 - `shell`: PTY spawn 시 사용. 재시작 필요.
+- `restore_session`: `true`면 `~/.config/pj001/session.toml`을 읽어 마지막 OS 탭/패널 cwd 구조에서 새 shell을 시작. 실제 실행 중이던 프로세스/출력/scrollback은 복원하지 않음.
 
 ### `[block]`
 - `mode = "auto"`: OSC 133;A 수신 시 gutter + 카드 시각 발동.

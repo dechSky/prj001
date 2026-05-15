@@ -1,4 +1,6 @@
-use pj001_core::app::{self, BlockMode, Config};
+use pj001_core::app::{
+    self, BlockMode, CommandSpec, Config, InitialLayout, RestoredWindowSpec, SessionSpec,
+};
 use pj001_core::error::{self, Error};
 use pj001_core::render::ThemePalette;
 use serde::Deserialize;
@@ -23,12 +25,13 @@ OPTIONS:
 
 ENV:
     PJ001_NO_BACKDROP=1         Disable macOS NSVisualEffectView vibrancy backdrop
+    PJ001_NO_RESTORE=1          Disable session restore for this launch
     PJ001_CONFIG=<path>         Override config file location
     RUST_LOG=<level>            Logging level (info / debug / warn / error)
 
 CONFIG:
     ~/.config/pj001/config.toml — TOML schema:
-        [general]   theme = \"...\", shell = \"...\"
+        [general]   theme = \"...\", shell = \"...\", restore_session = true | false
         [block]     mode = \"auto\" | \"off\"
         [backdrop]  enabled = true | false
         [font]      size = 14.0
@@ -39,7 +42,12 @@ DOCS:
 ";
 
 fn version_string() -> String {
-    format!("pj001 {} (wgpu {} winit {})", env!("CARGO_PKG_VERSION"), "29", "0.30")
+    format!(
+        "pj001 {} (wgpu {} winit {})",
+        env!("CARGO_PKG_VERSION"),
+        "29",
+        "0.30"
+    )
 }
 
 fn main() -> error::Result<()> {
@@ -97,6 +105,9 @@ struct FileGeneral {
     /// shell 경로 override. CLI --shell이 더 우선.
     #[serde(default)]
     shell: Option<String>,
+    /// Restart shells from the last saved window/tab/pane cwd layout. default true.
+    #[serde(default)]
+    restore_session: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -191,15 +202,20 @@ fn append_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
 /// `file_config` (~/.config/pj001/config.toml)의 general.theme / block.mode는 CLI 미지정 시 사용.
 fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Result<Config> {
     let mut shell_override = None;
+    let mut cli_shell_override = false;
     let mut theme_name = None;
     let mut block_mode = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--shell" | "-s" => shell_override = Some(take_arg_value(a, iter.next())?),
+            "--shell" | "-s" => {
+                cli_shell_override = true;
+                shell_override = Some(take_arg_value(a, iter.next())?);
+            }
             "--theme" => theme_name = Some(take_arg_value(a, iter.next())?),
             "--block-mode" => block_mode = Some(take_arg_value(a, iter.next())?),
             _ if a.starts_with("--shell=") => {
+                cli_shell_override = true;
                 shell_override = Some(take_eq_value("--shell", &a["--shell=".len()..])?);
             }
             _ if a.starts_with("--theme=") => {
@@ -237,8 +253,8 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
     };
     log::info!("block-mode: {resolved_block_mode}");
     // shell file_config override (CLI > config). CLI 미지정 + config 있으면 config 사용.
-    let resolved_shell = shell_override
-        .or_else(|| file_config.and_then(|c| c.general.shell.clone()));
+    let resolved_shell =
+        shell_override.or_else(|| file_config.and_then(|c| c.general.shell.clone()));
     let mut config = Config::single_shell(resolved_shell).with_block_mode(block_mode_enum);
     if let Some(theme) = theme {
         config = config.with_theme(theme);
@@ -259,7 +275,110 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         config = config.with_bell(visible, audible);
         log::info!("bell.visible={visible} bell.audible={audible} (from config)");
     }
+    let restore_enabled = file_config
+        .and_then(|c| c.general.restore_session)
+        .unwrap_or(true)
+        && !env_flag_enabled("PJ001_NO_RESTORE");
+    if restore_enabled && let Some(path) = session_restore_path() {
+        if !cli_shell_override && let Some(state) = load_restore_state(&path) {
+            config = apply_restore_state(config, state);
+        }
+        config = config.with_restore_state_path(Some(path));
+    }
     Ok(config)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes")
+        })
+        .unwrap_or(false)
+}
+
+fn session_restore_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/pj001/session.toml"))
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreStateFile {
+    version: u32,
+    #[serde(default)]
+    windows: Vec<RestoreWindowFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreWindowFile {
+    #[serde(default)]
+    panes: Vec<RestorePaneFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestorePaneFile {
+    title: Option<String>,
+    command: Option<String>,
+    cwd: Option<String>,
+}
+
+fn load_restore_state(path: &Path) -> Option<RestoreStateFile> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("session restore read failed at {}: {e}", path.display());
+            return None;
+        }
+    };
+    let state = match toml::from_str::<RestoreStateFile>(&raw) {
+        Ok(state) => state,
+        Err(e) => {
+            log::warn!("session restore parse failed at {}: {e}", path.display());
+            return None;
+        }
+    };
+    if state.version != 1 || state.windows.is_empty() {
+        return None;
+    }
+    Some(state)
+}
+
+fn apply_restore_state(mut config: Config, state: RestoreStateFile) -> Config {
+    let mut windows = state
+        .windows
+        .into_iter()
+        .filter_map(|window| {
+            let panes = window
+                .panes
+                .into_iter()
+                .filter_map(|pane| {
+                    let command = pane.command?;
+                    Some(SessionSpec {
+                        title: pane.title.unwrap_or_else(|| "shell".to_string()),
+                        command: CommandSpec::Custom(command),
+                        cwd: pane.cwd,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if panes.is_empty() {
+                None
+            } else {
+                Some(RestoredWindowSpec { panes })
+            }
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        return config;
+    }
+    let first = windows.remove(0);
+    config.sessions = first.panes;
+    config.initial_layout = InitialLayout::Panes {
+        sessions: (0..config.sessions.len()).collect(),
+    };
+    config = config.with_restored_windows(windows);
+    config
 }
 
 fn take_arg_value(flag: &str, value: Option<&String>) -> error::Result<String> {
@@ -321,18 +440,19 @@ mod tests {
 
     #[test]
     fn parse_default_single_mode() {
-        assert_eq!(
-            parse_config(&args(&[]), None).unwrap(),
-            Config::single_shell(None)
-        );
+        let cfg = parse_config(&args(&[]), None).unwrap();
+        assert_eq!(cfg.sessions, Config::single_shell(None).sessions);
+        assert!(cfg.restore_state_path.is_some());
     }
 
     #[test]
     fn parse_single_shell_override() {
+        let cfg = parse_config(&args(&["--shell", "/bin/zsh"]), None).unwrap();
         assert_eq!(
-            parse_config(&args(&["--shell", "/bin/zsh"]), None).unwrap(),
-            Config::single_shell(Some("/bin/zsh".to_string()))
+            cfg.sessions,
+            Config::single_shell(Some("/bin/zsh".to_string())).sessions
         );
+        assert!(cfg.restore_state_path.is_some());
     }
 
     #[test]
@@ -375,6 +495,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
@@ -391,6 +512,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
@@ -407,6 +529,7 @@ mod tests {
             general: FileGeneral {
                 theme: Some("nope".to_string()),
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
@@ -481,6 +604,7 @@ mode = "off"
             general: FileGeneral {
                 theme: None,
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock {
                 mode: Some("nonsense".to_string()),
@@ -498,6 +622,7 @@ mode = "off"
             general: FileGeneral {
                 theme: None,
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop {
@@ -516,6 +641,7 @@ mode = "off"
             general: FileGeneral {
                 theme: None,
                 shell: Some("/bin/bash".to_string()),
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
@@ -532,6 +658,7 @@ mode = "off"
             general: FileGeneral {
                 theme: None,
                 shell: None,
+                restore_session: None,
             },
             block: FileBlock::default(),
             backdrop: FileBackdrop::default(),
@@ -551,11 +678,12 @@ mode = "off"
                 general: FileGeneral {
                     theme: None,
                     shell: None,
+                    restore_session: None,
                 },
                 block: FileBlock::default(),
                 backdrop: FileBackdrop::default(),
                 font: FileFont { size: Some(v) },
-            bell: FileBell::default(),
+                bell: FileBell::default(),
             };
             let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
             assert_eq!(cfg.font_size, Some(v), "parse_config should not clamp");
@@ -568,6 +696,7 @@ mode = "off"
 [general]
 theme = "obsidian"
 shell = "/bin/zsh"
+restore_session = true
 
 [block]
 mode = "auto"
@@ -581,8 +710,40 @@ size = 14.0
         let parsed: FileConfig = toml::from_str(raw).unwrap();
         assert_eq!(parsed.general.theme.as_deref(), Some("obsidian"));
         assert_eq!(parsed.general.shell.as_deref(), Some("/bin/zsh"));
+        assert_eq!(parsed.general.restore_session, Some(true));
         assert_eq!(parsed.block.mode.as_deref(), Some("auto"));
         assert_eq!(parsed.backdrop.enabled, Some(true));
         assert_eq!(parsed.font.size, Some(14.0));
+    }
+
+    #[test]
+    fn restore_state_applies_first_window_and_extra_tabs() {
+        let state = RestoreStateFile {
+            version: 1,
+            windows: vec![
+                RestoreWindowFile {
+                    panes: vec![RestorePaneFile {
+                        title: Some("one".to_string()),
+                        command: Some("/bin/zsh".to_string()),
+                        cwd: Some("/tmp".to_string()),
+                    }],
+                },
+                RestoreWindowFile {
+                    panes: vec![RestorePaneFile {
+                        title: Some("two".to_string()),
+                        command: Some("/bin/bash".to_string()),
+                        cwd: Some("/var".to_string()),
+                    }],
+                },
+            ],
+        };
+
+        let config = apply_restore_state(Config::single_shell(None), state);
+
+        assert_eq!(config.sessions.len(), 1);
+        assert_eq!(config.sessions[0].title, "one");
+        assert_eq!(config.sessions[0].cwd.as_deref(), Some("/tmp"));
+        assert_eq!(config.restored_windows.len(), 1);
+        assert_eq!(config.restored_windows[0].panes[0].title, "two");
     }
 }
