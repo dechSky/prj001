@@ -542,10 +542,20 @@ impl App {
         self.active_window.and_then(|id| self.windows.get(&id))
     }
     /// 모든 윈도우 순회 — bell drain, blink, pending_resize 같은 background 작업용.
-    /// M-W-2b에서 사용 예정 (현재 active_state만으로 single-window OK).
+    /// 현재 직접 사용 site는 없음 (windows.iter_mut() inline 사용), 추후 helper 활용 예정.
     #[allow(dead_code)]
     fn all_states_mut(&mut self) -> impl Iterator<Item = &mut WindowState> {
         self.windows.values_mut()
+    }
+
+    /// Codex 10차 Critical 1: SessionId 보유 윈도우의 WindowState 찾기.
+    /// SessionId는 각 윈도우의 IdAllocator가 0부터 발급해 글로벌 unique 아님.
+    /// PTY UserEvent(SessionRepaint/Exited/PtyError) routing 시 reverse lookup 필요.
+    fn find_state_by_session(&self, session_id: SessionId) -> Option<&WindowState> {
+        self.windows.values().find(|s| s.sessions.contains_key(&session_id))
+    }
+    fn find_state_mut_by_session(&mut self, session_id: SessionId) -> Option<&mut WindowState> {
+        self.windows.values_mut().find(|s| s.sessions.contains_key(&session_id))
     }
 }
 
@@ -1407,9 +1417,30 @@ impl App {
                 return;
             }
         };
+        // Codex 10차 Critical 4: 첫 윈도우(finish_startup)와 동일 platform setup.
         state.window.focus_window();
+        state.window.set_ime_allowed(true);
+        state.window.set_ime_purpose(ImePurpose::Terminal);
         #[cfg(target_os = "macos")]
-        macos_ime::wake_input_context(&state.window);
+        {
+            // macOS backdrop attach — first-window path와 동일 분기 (env > config > default).
+            let env_off = std::env::var("PJ001_NO_BACKDROP")
+                .ok()
+                .map(|v| {
+                    let s = v.trim().to_ascii_lowercase();
+                    matches!(s.as_str(), "1" | "true" | "yes")
+                })
+                .unwrap_or(false);
+            let config_off = matches!(self.config.backdrop_enabled, Some(false));
+            let overlay_ok = state.overlay_attach.is_some();
+            if !env_off && !config_off && overlay_ok {
+                let palette = state.renderer.palette();
+                let _attach = macos_backdrop::attach_visual_effect(&state.window, &palette);
+                // backdrop attach 결과는 새 윈도우용 — overlay_attach와 별도. WindowState 안에
+                // 저장 필요 시 추가 필드. 1차 cut은 attach 호출만.
+            }
+            macos_ime::wake_input_context(&state.window);
+        }
         let window_id = window.id();
         self.windows.insert(window_id, state);
         self.active_window = Some(window_id);
@@ -1580,19 +1611,30 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
-        // M-W-2: WindowId로 해당 윈도우의 state 찾기. 못 찾으면 무시 (stale event).
-        self.active_window = Some(window_id);
+        // Codex 10차 Critical 3: active_window는 Focused에서만 갱신. 모든 event에서 갱신하면
+        // RedrawRequested/Occluded 같은 비-focus event도 menu dispatch target 바꿈 → 다른 윈도우에 잘못 명령.
         let Some(state) = self.windows.get_mut(&window_id) else {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Codex 10차 개선 5: 마지막 윈도우면 exit, 아니면 individual remove.
+                self.windows.remove(&window_id);
+                if Some(window_id) == self.active_window {
+                    self.active_window = self.windows.keys().next().copied();
+                }
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
+                return;
+            }
             WindowEvent::ModifiersChanged(mods) => {
                 state.modifiers = mods.state();
             }
             WindowEvent::Focused(focused) => {
                 state.focused = focused;
                 if focused {
+                    self.active_window = Some(window_id);
                     // 포커스 회복 시 즉시 cursor 보이기 (다음 blink phase 기다리지 않음).
                     state.cursor_visible = true;
                     // 포커스 회복 시점에 입력 소스가 한국어로 바뀌었을 가능성 → IME wake-up
@@ -2195,17 +2237,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
-        // M-W-2: about_to_wait은 active window 기준으로 진행. multi-window 도입 후엔
-        // 각 window 별 pending_resize/bell도 처리해야 — 다음 M-W-2b 단계.
-        let Some(state) = self.active_state_mut() else {
-            return;
-        };
-        // Visual Bell — 매 about_to_wait에서 모든 session의 bell_pending drain.
-        // 정책에 따라 dock bounce + NSBeep + shader cell bg flash. 모두 off면 silent.
-        let bell_seen = state.drain_bell_pending();
-        if bell_seen {
-            let visible = state.bell_visible;
-            let audible = state.bell_audible;
+        // Codex 10차 Critical 2: bell drain은 모든 윈도우 순회 (background 윈도우의 BEL도 처리).
+        // 그 외 timing (pending_resize/blink/auto-scroll)은 1차 cut에서 active만 — 다음 cut.
+        let mut bells: Vec<winit::window::WindowId> = Vec::new();
+        for (&id, state) in self.windows.iter_mut() {
+            if state.drain_bell_pending() {
+                bells.push(id);
+                if state.bell_visible {
+                    state.last_bell_at = Some(Instant::now());
+                    state.window.request_redraw();
+                }
+            }
+        }
+        if !bells.is_empty() {
+            let visible = self
+                .active_state()
+                .map(|s| s.bell_visible)
+                .unwrap_or(true);
+            let audible = self
+                .active_state()
+                .map(|s| s.bell_audible)
+                .unwrap_or(false);
             #[cfg(target_os = "macos")]
             {
                 if visible {
@@ -2215,14 +2267,13 @@ impl ApplicationHandler<UserEvent> for App {
                     macos_bell::ns_beep();
                 }
             }
-            if visible {
-                // shader-level flash 시작 — about_to_wait이 매 frame intensity 갱신.
-                state.last_bell_at = Some(Instant::now());
-                state.window.request_redraw();
-            }
-            log::info!("BEL → visible={visible} audible={audible}");
+            log::info!("BEL → visible={visible} audible={audible} windows={:?}", bells);
         }
+        let Some(state) = self.active_state_mut() else {
+            return;
+        };
         // Bell flash fade — 250ms 동안 1.0 → 0.0. 활성 중에는 매 frame redraw.
+        // bell drain은 위 모든 윈도우 순회로 옮김 (Codex 10차 Critical 2). active 윈도우만 flash.
         if let Some(start) = state.last_bell_at {
             let elapsed = start.elapsed().as_secs_f32();
             const BELL_FLASH_DURATION: f32 = 0.25;
@@ -2289,7 +2340,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::SessionRepaint(session_id) => {
                 log::debug!("repaint requested by session {}", session_id.0);
-                if let Some(state) = self.active_state() {
+                if let Some(state) = self.find_state_by_session(session_id) {
                     // M12-4 design §3.3: 방어적 lookup. unknown session은 debug log + ignore.
                     if !state.sessions.contains_key(&session_id) {
                         log::debug!(
@@ -2310,7 +2361,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SessionExited { id, code } => {
                 log::info!("session {} child exited (code={code})", id.0);
-                if let Some(state) = self.active_state_mut() {
+                // Codex 10차 Critical 1: SessionId 보유 윈도우로 라우팅. active 아닐 수도.
+                if let Some(state) = self.find_state_mut_by_session(id) {
                     if !state.sessions.contains_key(&id) {
                         log::debug!("SessionExited for unknown session {:?}, ignore", id);
                         return;
@@ -2360,7 +2412,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SessionPtyError { id, message } => {
                 log::error!("session {} pty error: {message}", id.0);
-                if let Some(state) = self.active_state_mut() {
+                // Codex 10차 Critical 1: SessionId 보유 윈도우로 라우팅.
+                if let Some(state) = self.find_state_mut_by_session(id) {
                     if !state.sessions.contains_key(&id) {
                         log::debug!("SessionPtyError for unknown session {:?}, ignore", id);
                         return;
