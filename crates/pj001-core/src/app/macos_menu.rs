@@ -17,6 +17,22 @@ use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::sel;
 use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
 use objc2_foundation::{MainThreadMarker, NSString};
+use winit::event_loop::EventLoopProxy;
+
+use crate::app::event::{AppMenuCommand, UserEvent};
+
+/// menu click → UserEvent::MenuCommand dispatch path. AppState init 시 set.
+/// 외부 module은 `init_menu_proxy`를 통해서만 접근. menu click 발생 시점에 main thread.
+/// EventLoopProxy는 Send + Sync.
+static MENU_PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+
+/// AppState::new_with_size에서 한 번 호출. 이후 menu click이 이 proxy로 send_event.
+/// Codex 6차 개선: set 실패는 stale proxy를 silent 가리지 않고 warn (재초기화/test 가시성).
+pub fn init_menu_proxy(proxy: EventLoopProxy<UserEvent>) {
+    if MENU_PROXY.set(proxy).is_err() {
+        log::warn!("init_menu_proxy: MENU_PROXY already initialized — ignored (stale proxy 위험)");
+    }
+}
 
 // Custom action handler — Help/Preferences 등 우리 명령. objc2 define_class!로 NSObject 서브
 // 클래스 만들고 NSMenuItem.target에 set. selector는 Pj001MenuTarget.{openHelp,openPreferences}.
@@ -43,6 +59,29 @@ define_class!(
             let path = std::path::PathBuf::from(home).join(".config/pj001/config.toml");
             spawn_open(path.to_str().unwrap_or(""));
             log::info!("menu: Preferences → open {}", path.display());
+        }
+
+        /// macOS NSMenu item click → UserEvent::MenuCommand로 dispatch.
+        /// 단일 selector + NSMenuItem.tag로 명령 식별 (옵션 B, design §2).
+        #[unsafe(method(menuAction:))]
+        fn menu_action(&self, sender: *mut NSObject) {
+            if sender.is_null() {
+                return;
+            }
+            let tag: i64 = unsafe { msg_send![sender, tag] };
+            let Some(cmd) = AppMenuCommand::from_tag(tag) else {
+                log::warn!("menu_action: unknown tag {tag}");
+                return;
+            };
+            let Some(proxy) = MENU_PROXY.get() else {
+                log::warn!("menu_action: MENU_PROXY not yet set (early click?)");
+                return;
+            };
+            if proxy.send_event(UserEvent::MenuCommand(cmd)).is_err() {
+                log::warn!("menu_action: send_event failed (event loop closed?)");
+            } else {
+                log::debug!("menu_action: dispatched {:?}", cmd);
+            }
         }
     }
 );
@@ -166,123 +205,70 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
 
         // ── Shell menu ──────────────────────────────────────────────────────────
         let shell_menu = NSMenu::new(mtm); shell_menu.setAutoenablesItems(false);
-        // New Window — placeholder (multi-window milestone 전).
-        shell_menu.addItem(&make_item(
-            mtm,
-            "New Window",
-            None,
-            "n",
-            NSEventModifierFlags::Command,
+        shell_menu.addItem(&make_command_item(
+            mtm, "New Pane", "n", NSEventModifierFlags::Command, AppMenuCommand::NewPane,
         ));
-        shell_menu.addItem(&make_item(
-            mtm,
-            "New Tab",
-            None,
-            "t",
-            NSEventModifierFlags::Command,
+        shell_menu.addItem(&make_command_item(
+            mtm, "New Tab", "t", NSEventModifierFlags::Command, AppMenuCommand::NewTab,
         ));
         shell_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        shell_menu.addItem(&make_item(
-            mtm,
-            "Split Vertically",
-            None,
-            "d",
-            NSEventModifierFlags::Command,
+        shell_menu.addItem(&make_command_item(
+            mtm, "Split Vertically", "d", NSEventModifierFlags::Command,
+            AppMenuCommand::SplitVertical,
         ));
-        shell_menu.addItem(&make_item(
-            mtm,
-            "Split Horizontally",
-            None,
-            "d",
+        shell_menu.addItem(&make_command_item(
+            mtm, "Split Horizontally", "d",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::SplitHorizontal,
         ));
         shell_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        shell_menu.addItem(&make_item(
-            mtm,
-            "Close",
-            None,
-            "w",
-            NSEventModifierFlags::Command,
+        shell_menu.addItem(&make_command_item(
+            mtm, "Close", "w", NSEventModifierFlags::Command, AppMenuCommand::CloseActive,
         ));
-        shell_menu.addItem(&make_item(
-            mtm,
-            "Close Tab",
-            None,
-            "w",
+        shell_menu.addItem(&make_command_item(
+            mtm, "Close Tab", "w",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::CloseTab,
         ));
         attach_submenu(mtm, &main, "Shell", &shell_menu);
 
         // ── Edit menu ───────────────────────────────────────────────────────────
         let edit_menu = NSMenu::new(mtm); edit_menu.setAutoenablesItems(false);
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Copy",
-            None,
-            "c",
-            NSEventModifierFlags::Command,
+        edit_menu.addItem(&make_command_item(
+            mtm, "Copy", "c", NSEventModifierFlags::Command, AppMenuCommand::Copy,
         ));
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Paste",
-            None,
-            "v",
-            NSEventModifierFlags::Command,
+        edit_menu.addItem(&make_command_item(
+            mtm, "Paste", "v", NSEventModifierFlags::Command, AppMenuCommand::Paste,
         ));
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Select All",
-            None,
-            "a",
-            NSEventModifierFlags::Command,
+        edit_menu.addItem(&make_command_item(
+            mtm, "Select All", "a", NSEventModifierFlags::Command, AppMenuCommand::SelectAll,
         ));
         edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Find…",
-            None,
-            "f",
-            NSEventModifierFlags::Command,
+        edit_menu.addItem(&make_command_item(
+            mtm, "Find…", "f", NSEventModifierFlags::Command, AppMenuCommand::Find,
         ));
         edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Clear Buffer",
-            None,
-            "k",
-            NSEventModifierFlags::Command,
+        edit_menu.addItem(&make_command_item(
+            mtm, "Clear Buffer", "k", NSEventModifierFlags::Command,
+            AppMenuCommand::ClearBuffer,
         ));
-        edit_menu.addItem(&make_item(
-            mtm,
-            "Clear Scrollback",
-            None,
-            "k",
+        edit_menu.addItem(&make_command_item(
+            mtm, "Clear Scrollback", "k",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::ClearScrollback,
         ));
         attach_submenu(mtm, &main, "Edit", &edit_menu);
 
         // ── View menu ───────────────────────────────────────────────────────────
         let view_menu = NSMenu::new(mtm); view_menu.setAutoenablesItems(false);
-        view_menu.addItem(&make_item(
-            mtm,
-            "Bigger",
-            None,
-            "=",
-            NSEventModifierFlags::Command,
+        view_menu.addItem(&make_command_item(
+            mtm, "Bigger", "=", NSEventModifierFlags::Command, AppMenuCommand::ZoomIn,
         ));
-        view_menu.addItem(&make_item(
-            mtm,
-            "Smaller",
-            None,
-            "-",
-            NSEventModifierFlags::Command,
+        view_menu.addItem(&make_command_item(
+            mtm, "Smaller", "-", NSEventModifierFlags::Command, AppMenuCommand::ZoomOut,
         ));
-        view_menu.addItem(&make_item(
-            mtm,
-            "Actual Size",
-            None,
-            "0",
-            NSEventModifierFlags::Command,
+        view_menu.addItem(&make_command_item(
+            mtm, "Actual Size", "0", NSEventModifierFlags::Command, AppMenuCommand::ZoomReset,
         ));
         view_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_action_item(
@@ -323,20 +309,15 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
             NSEventModifierFlags::empty(),
         );
         window_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        // Tab navigation — winit chain에 이미 매핑됨 (PrevTab/NextTab). keyEquivalent만 표시.
-        window_menu.addItem(&make_item(
-            mtm,
-            "Previous Tab",
-            None,
-            "[",
+        window_menu.addItem(&make_command_item(
+            mtm, "Previous Tab", "[",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::PrevTab,
         ));
-        window_menu.addItem(&make_item(
-            mtm,
-            "Next Tab",
-            None,
-            "]",
+        window_menu.addItem(&make_command_item(
+            mtm, "Next Tab", "]",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::NextTab,
         ));
         attach_submenu(mtm, &main, "Window", &window_menu);
         // Apple이 자동으로 윈도우 목록을 windowsMenu에 채움.
@@ -362,6 +343,25 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         // 부착.
         app.setMainMenu(Some(&main));
         log::info!("macos_menu: NSMenu attached (6 menus, hybrid selector + keyEquivalent)");
+    }
+}
+
+/// `AppMenuCommand` tag + menuAction: selector wire. click → UserEvent dispatch.
+/// keyEquivalent 표시는 그대로 — winit keyboard chain과 menu click 둘 다 동일 명령.
+unsafe fn make_command_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    key_equivalent: &str,
+    modifiers: NSEventModifierFlags,
+    cmd: AppMenuCommand,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        let item = make_item(mtm, title, Some(sel!(menuAction:)), key_equivalent, modifiers);
+        let _: () = msg_send![&*item, setTag: cmd as i64];
+        let target_ptr = menu_target(mtm);
+        let target_obj: &AnyObject = &*(target_ptr as *mut AnyObject);
+        item.setTarget(Some(target_obj));
+        item
     }
 }
 

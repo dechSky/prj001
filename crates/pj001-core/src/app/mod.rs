@@ -1330,9 +1330,11 @@ impl App {
         .expect("AppState::new");
         state.window.focus_window();
         // macOS NSMenu attach — 상단 menu bar 6개 (App/Shell/Edit/View/Window/Help).
-        // Apple 표준 selector + custom 항목 keyEquivalent 하이브리드.
+        // Apple 표준 selector + custom 항목 keyEquivalent + tag dispatch 하이브리드.
         #[cfg(target_os = "macos")]
         if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            // menu click → UserEvent::MenuCommand routing proxy 등록 (1회).
+            macos_menu::init_menu_proxy(self.proxy.clone());
             macos_menu::attach_menu_bar(mtm);
         }
         // Phase 3 step 2b/3: NSVisualEffectView를 winit_view sibling으로 추가.
@@ -2228,6 +2230,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         state.window.request_redraw();
                     }
+                }
+            }
+            UserEvent::MenuCommand(cmd) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.dispatch_menu_command(event_loop, cmd);
+                    state.window.request_redraw();
+                } else {
+                    log::warn!("MenuCommand received before AppState ready: {cmd:?}");
                 }
             }
         }
@@ -3971,6 +3981,72 @@ impl AppState {
         ) {
             self.apply_layout_viewports();
             self.window.request_redraw();
+        }
+    }
+
+    /// macOS NSMenu click → AppCommand dispatch. 기존 CmdShortcut handler를 재활용한다.
+    /// `event_loop`는 close 동작 (Cmd+W escalation 등)에서 필요.
+    fn dispatch_menu_command(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        cmd: crate::app::event::AppMenuCommand,
+    ) {
+        use crate::app::event::AppMenuCommand as M;
+        match cmd {
+            M::NewTab => {
+                if let Err(e) = self.create_tab() {
+                    log::warn!("menu NewTab failed: {e}");
+                }
+            }
+            M::NewPane => {
+                // Codex 6차 Critical fix: 기존 Cmd+N keyboard chain과 동등 (split_active V).
+                if let Err(e) = self.split_active(SplitAxis::Vertical) {
+                    log::warn!("menu NewPane (split V) failed: {e}");
+                }
+            }
+            M::CloseActive => {
+                self.apply_close_decision(
+                    event_loop,
+                    close_decision(
+                        CmdShortcut::ClosePaneOrTab,
+                        self.active_tab().panes.len(),
+                        self.tabs.len(),
+                    ),
+                    "menu close",
+                );
+            }
+            M::CloseTab => {
+                self.apply_close_decision(
+                    event_loop,
+                    close_decision(
+                        CmdShortcut::CloseTab,
+                        self.active_tab().panes.len(),
+                        self.tabs.len(),
+                    ),
+                    "menu close tab",
+                );
+            }
+            M::SplitVertical => {
+                if let Err(e) = self.split_active(SplitAxis::Vertical) {
+                    log::warn!("menu Split V failed: {e}");
+                }
+            }
+            M::SplitHorizontal => {
+                if let Err(e) = self.split_active(SplitAxis::Horizontal) {
+                    log::warn!("menu Split H failed: {e}");
+                }
+            }
+            M::Copy => self.handle_copy(),
+            M::Paste => self.handle_paste(),
+            M::SelectAll => self.handle_select_all(),
+            M::Find => self.start_find(),
+            M::ClearBuffer => self.clear_active_buffer(false),
+            M::ClearScrollback => self.clear_active_buffer(true),
+            M::ZoomIn => self.set_logical_font_size(self.logical_font_size + FONT_SIZE_STEP),
+            M::ZoomOut => self.set_logical_font_size(self.logical_font_size - FONT_SIZE_STEP),
+            M::ZoomReset => self.set_logical_font_size(DEFAULT_FONT_SIZE),
+            M::PrevTab => self.focus_adjacent_tab(false),
+            M::NextTab => self.focus_adjacent_tab(true),
         }
     }
 
