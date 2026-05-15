@@ -24,7 +24,6 @@ use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject};
-use objc2::ClassType;
 use objc2_app_kit::NSView;
 use objc2_foundation::{MainThreadMarker, NSRect};
 use objc2_quartz_core::CAMetalLayer;

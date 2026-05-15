@@ -33,6 +33,16 @@ pub struct ThemePalette {
     pub block_border: [f32; 4],
     /// Phase 4d: prompt marker 모양 (테마별 시각 차별화).
     pub block_marker_kind: MarkerKind,
+    /// Phase 3 step 3: 윈도우 bg 불투명도 (0.0~1.0). 1.0 = 완전 불투명(vibrancy 없음),
+    /// 낮을수록 NSVisualEffectView 뒤 데스크톱이 더 비침. glyph(텍스트)는 항상 1.0으로
+    /// shader에서 별도 처리. themes-handoff.md §2 시각 의도:
+    /// - aurora: 0.35 (라이트 글래스)
+    /// - obsidian: 0.85 (다크 vibrancy)
+    /// - vellum: 1.0 (paper, no blur)
+    /// - holo: 0.85
+    /// - bento: 1.0 (no blur 권장)
+    /// - crystal: 0.55 (radial deep — original 0.085은 가독성 떨어져 보강)
+    pub bg_opacity: f32,
 }
 
 impl ThemePalette {
@@ -79,6 +89,7 @@ impl ThemePalette {
             block_bg: rgb(0xf6, 0xf2, 0xeb),
             block_border: rgb(0xf6, 0xf2, 0xeb),
             block_marker_kind: MarkerKind::RoundedSquare,
+            bg_opacity: 0.35,
         }
     }
 
@@ -112,6 +123,7 @@ impl ThemePalette {
             block_bg: rgb(0x14, 0x16, 0x26),
             block_border: rgb(0x28, 0x2a, 0x3a),
             block_marker_kind: MarkerKind::RoundedSquare,
+            bg_opacity: 0.85,
         }
     }
 
@@ -143,6 +155,7 @@ impl ThemePalette {
             block_bg: rgb(0xef, 0xe7, 0xd2),
             block_border: rgb(0xef, 0xe7, 0xd2),
             block_marker_kind: MarkerKind::Dollar,
+            bg_opacity: 1.0,
         }
     }
 
@@ -174,6 +187,7 @@ impl ThemePalette {
             block_bg: rgb(0x0a, 0x08, 0x1e),
             block_border: rgb(0x0a, 0x08, 0x1e),
             block_marker_kind: MarkerKind::Hex,
+            bg_opacity: 0.85,
         }
     }
 
@@ -205,6 +219,7 @@ impl ThemePalette {
             block_bg: rgb(0xe9, 0xdf, 0xc1),
             block_border: rgb(0xe9, 0xdf, 0xc1),
             block_marker_kind: MarkerKind::RunChip,
+            bg_opacity: 1.0,
         }
     }
 
@@ -236,6 +251,7 @@ impl ThemePalette {
             block_bg: rgb(0x0a, 0x0f, 0x24),
             block_border: rgb(0x0a, 0x0f, 0x24),
             block_marker_kind: MarkerKind::Bubble,
+            bg_opacity: 0.55,
         }
     }
 

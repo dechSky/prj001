@@ -4,9 +4,9 @@ struct Uniforms {
     fg: vec4<f32>,
     palette_bg: vec4<f32>,
     marker_kind: u32,
+    bg_opacity: f32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -273,7 +273,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // 일반 cell 렌더 (기존).
+    // Phase 3 step 3: cell.bg.a를 u.bg_opacity로 곱해 NSVisualEffectView 뒤에 비치게,
+    // glyph가 그려진 비율만큼 alpha를 1.0으로 끌어올려 텍스트 가독성 유지.
     var color = in.bg;
+    var out_alpha = color.a * u.bg_opacity;
     if (in.glyph_size.x > 0.0 && in.glyph_size.y > 0.0) {
         let rel = in.cell_pixel - in.glyph_offset;
         if (rel.x >= 0.0 && rel.x < in.glyph_size.x
@@ -282,7 +285,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let atlas_uv = mix(in.uv_min, in.uv_max, glyph_uv01);
             let alpha = textureSample(atlas_tex, atlas_smp, atlas_uv).r;
             color = mix(in.bg, in.fg, alpha);
+            out_alpha = mix(out_alpha, color.a, alpha);
         }
     }
-    return color;
+    return vec4<f32>(color.rgb, out_alpha);
 }

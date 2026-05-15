@@ -26,7 +26,10 @@ struct Uniforms {
     palette_bg: [f32; 4],
     /// Phase 4d: MarkerKind enum 값 (0=RoundedSquare/1=Hex/2=Dollar/3=RunChip/4=Bubble).
     marker_kind: u32,
-    _pad: [u32; 3],
+    /// Phase 3 step 3: 윈도우 bg 불투명도. 일반 cell의 bg alpha multiplier.
+    /// glyph 영역은 1.0 강제 (텍스트 가독성).
+    bg_opacity: f32,
+    _pad: [u32; 2],
 }
 
 pub struct Renderer {
@@ -71,7 +74,8 @@ impl Renderer {
             fg: palette.fg,
             palette_bg: palette.bg,
             marker_kind: palette.block_marker_kind as u32,
-            _pad: [0; 3],
+            bg_opacity: palette.bg_opacity,
+            _pad: [0; 2],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -328,7 +332,8 @@ impl Renderer {
             fg: [0.86, 0.86, 0.86, 1.0],
             palette_bg: self.palette.bg,
             marker_kind: self.palette.block_marker_kind as u32,
-            _pad: [0; 3],
+            bg_opacity: self.palette.bg_opacity,
+            _pad: [0; 2],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -586,7 +591,9 @@ impl Renderer {
                         r: self.palette.bg[0] as f64,
                         g: self.palette.bg[1] as f64,
                         b: self.palette.bg[2] as f64,
-                        a: self.palette.bg[3] as f64,
+                        // Phase 3 step 3: clear alpha를 테마 bg_opacity와 일치 — cell 미커버
+                        // 영역(padding, status row 등)도 NSVE 비치게.
+                        a: (self.palette.bg[3] * self.palette.bg_opacity) as f64,
                     }),
                     store: wgpu::StoreOp::Store,
                 },

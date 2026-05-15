@@ -1212,16 +1212,19 @@ impl App {
         ))
         .expect("AppState::new");
         state.window.focus_window();
-        // Phase 3 step 2: NSVisualEffectView vibrancy attach (window-vibrancy crate).
-        // **DEFAULT OFF** — 진단 결과 NSVE가 winit_view의 sub-view(Below)로 추가돼도
-        // layer-backed view에서 sub-view는 backing CAMetalLayer **위에** 그려져
-        // wgpu가 그린 텍스트를 가린다 (2026-05-15 검증). 다음 세션에서
-        // wgpu Metal layer를 NSVE의 sibling/위로 옮기는 attach 패턴 재설계 필요.
-        // 그동안 PJ001_BACKDROP=1 env로 실험적 opt-in 가능 (텍스트 가려짐).
+        // Phase 3 step 2b: NSVisualEffectView를 winit_view sibling으로 추가.
+        // M-P3-2a에서 WgpuOverlay sibling이 이미 attach됐고 wgpu surface는 별도 layer로
+        // 생성됨. 이제 NSVE를 가장 뒤(Below) subview로 추가 → z-order: NSVE 아래, WgpuOverlay 위.
+        // cell.bg.alpha < 1 영역에서 NSVE vibrancy가 비친다.
+        // PJ001_NO_BACKDROP=1 env로 vibrancy 비활성 가능 (회귀 escape hatch).
         #[cfg(target_os = "macos")]
-        if std::env::var("PJ001_BACKDROP").is_ok() {
-            macos_backdrop::attach_visual_effect(&state.window);
-        }
+        let _backdrop_attach = if std::env::var("PJ001_NO_BACKDROP").is_err() {
+            let palette = state.renderer.palette();
+            macos_backdrop::attach_visual_effect(&state.window, &palette)
+        } else {
+            log::info!("macos_backdrop: skipped via PJ001_NO_BACKDROP env");
+            None
+        };
         // IME 이벤트 활성화. winit 0.30.13에서 macOS set_ime_purpose는 no-op
         // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
         state.window.set_ime_allowed(true);
