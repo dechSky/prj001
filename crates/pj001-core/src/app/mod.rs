@@ -6,6 +6,8 @@ mod macos_backdrop;
 #[cfg(target_os = "macos")]
 mod macos_ime;
 #[cfg(target_os = "macos")]
+mod macos_menu;
+#[cfg(target_os = "macos")]
 mod macos_overlay;
 mod session;
 
@@ -1314,6 +1316,12 @@ impl App {
         ))
         .expect("AppState::new");
         state.window.focus_window();
+        // macOS NSMenu attach — 상단 menu bar 6개 (App/Shell/Edit/View/Window/Help).
+        // Apple 표준 selector + custom 항목 keyEquivalent 하이브리드.
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            macos_menu::attach_menu_bar(mtm);
+        }
         // Phase 3 step 2b/3: NSVisualEffectView를 winit_view sibling으로 추가.
         // M-P3-2a에서 WgpuOverlay sibling이 attach 성공한 경우만 NSVE 부착 — Codex 리뷰
         // 1순위 fix: overlay fallback path(기존 winit_view.layer를 wgpu가 점유)에서
