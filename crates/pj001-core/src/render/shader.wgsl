@@ -119,13 +119,15 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
     // Phase 5: SCROLLBAR_THUMB path. cell 우측 가장자리 약 3px만 thumb 색, 나머지는
     // palette_bg (cell content 안 그리고 단순 thin band).
+    // Phase 3 step 3 (Codex 권 2): thumb 외 영역 palette_bg를 bg_opacity로 곱해 vibrancy
+    // 통과. thumb 자체는 in.bg 그대로 (가독성 위해).
     if ((in.flags & 0x400u) != 0u) {
         let cell_w = u.cell.x * in.cell_span;
         let thumb_w = max(2.0, cell_w * 0.30);
         if (in.cell_pixel.x >= cell_w - thumb_w) {
             return in.bg;
         }
-        return u.palette_bg;
+        return vec4<f32>(u.palette_bg.rgb, u.palette_bg.a * u.bg_opacity);
     }
 
     // Phase 4b-2c-4b: BLOCK_CARD SDF path. bit 0x10 set이면 카드 cell —
@@ -190,7 +192,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
 
         if (outside_card) {
-            return u.palette_bg;
+            // Phase 3 step 3 (Codex 권 3): rounded corner 바깥도 vibrancy 통과.
+            return vec4<f32>(u.palette_bg.rgb, u.palette_bg.a * u.bg_opacity);
         }
         if (on_border) {
             card_color = in.block_border_color;

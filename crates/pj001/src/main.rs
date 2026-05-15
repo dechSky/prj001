@@ -187,9 +187,12 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
     if let Some(backdrop) = file_config.and_then(|c| c.backdrop.enabled) {
         config = config.with_backdrop_enabled(Some(backdrop));
     }
-    // font.size 적용은 별도 세션 (Renderer/FontStack 초기화 깊은 변경).
+    // font.size 적용은 별도 세션 (Renderer/FontStack 초기화 깊은 변경). 사용자가 schema
+    // 신뢰 후 미적용 silent 함정 회피 위해 warn 레벨로 명시 (Codex 권).
     if let Some(size) = file_config.and_then(|c| c.font.size) {
-        log::info!("font.size config={size} (적용은 별도 세션 — 현재 14.0 default 유지)");
+        log::warn!(
+            "font.size={size} in config — **not yet applied** (reserved schema, 별도 세션 작업). 14.0 default 적용됨"
+        );
     }
     Ok(config)
 }

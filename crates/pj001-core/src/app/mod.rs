@@ -1225,19 +1225,32 @@ impl App {
         .expect("AppState::new");
         state.window.focus_window();
         // Phase 3 step 2b/3: NSVisualEffectView를 winit_view sibling으로 추가.
-        // M-P3-2a에서 WgpuOverlay sibling이 이미 attach됐고 wgpu surface는 별도 layer로
-        // 생성됨. 이제 NSVE를 가장 뒤(Below) subview로 추가 → z-order: NSVE 아래, WgpuOverlay 위.
-        // cell.bg.alpha < 1 영역에서 NSVE vibrancy가 비친다.
-        // 활성화 정책: PJ001_NO_BACKDROP=1 env > config.backdrop_enabled > default ON.
+        // M-P3-2a에서 WgpuOverlay sibling이 attach 성공한 경우만 NSVE 부착 — Codex 리뷰
+        // 1순위 fix: overlay fallback path(기존 winit_view.layer를 wgpu가 점유)에서
+        // NSVE를 attach하면 이전 실패 모드(텍스트 가림) 회귀.
+        // 활성화 정책: PJ001_NO_BACKDROP=1/true/yes env > config.backdrop_enabled=false >
+        // default ON. env가 set돼 있어도 값이 0/false/no/공백이면 default 적용 (Codex 권).
         #[cfg(target_os = "macos")]
         let _backdrop_attach = {
-            let env_off = std::env::var("PJ001_NO_BACKDROP").is_ok();
+            let env_off = std::env::var("PJ001_NO_BACKDROP")
+                .ok()
+                .map(|v| {
+                    let s = v.trim().to_ascii_lowercase();
+                    matches!(s.as_str(), "1" | "true" | "yes")
+                })
+                .unwrap_or(false);
             let config_off = matches!(self.config.backdrop_enabled, Some(false));
+            let overlay_ok = state.overlay_attach.is_some();
             if env_off {
                 log::info!("macos_backdrop: skipped via PJ001_NO_BACKDROP env");
                 None
             } else if config_off {
                 log::info!("macos_backdrop: skipped via config [backdrop] enabled=false");
+                None
+            } else if !overlay_ok {
+                log::warn!(
+                    "macos_backdrop: skipped — WgpuOverlay attach failed (fallback path). NSVE를 attach하면 텍스트 가림 회귀 위험"
+                );
                 None
             } else {
                 let palette = state.renderer.palette();

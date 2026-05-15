@@ -25,7 +25,7 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject};
 use objc2_app_kit::NSView;
-use objc2_foundation::{MainThreadMarker, NSRect};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
 use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -43,12 +43,17 @@ define_class!(
 
     impl WgpuOverlay {
         /// 키 포커스는 winit_view에 맡김.
-        /// hitTest override는 객체-반환 ABI(retain 시멘틱) 매크로 지원이 까다로워 생략.
-        /// NSResponder chain이 응답 안 하는 view를 superview로 자동 전달하므로 mouseDown
-        /// 류 이벤트는 winit_view에 도달. cursor tracking만 WgpuOverlay 기준이 될 수 있어
-        /// 추후 회귀 발견 시 hitTest override 재시도 (objc2 macro 호환 path 찾으면).
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> Bool {
+            Bool::NO
+        }
+
+        /// Codex 리뷰: hitTest 회귀 방지. `pointInside:withEvent:`로 항상 NO 반환하면
+        /// AppKit이 이 view를 hit detection에서 통과시켜 모든 마우스 이벤트가 winit_view에
+        /// 도달한다. CursorMoved/drag/xterm mouse mode/cursor icon 회귀 차단.
+        /// Bool 반환은 ABI 안전 (retain 시멘틱 없음).
+        #[unsafe(method(pointInside:withEvent:))]
+        fn point_inside(&self, _point: NSPoint, _event: *mut AnyObject) -> Bool {
             Bool::NO
         }
     }
