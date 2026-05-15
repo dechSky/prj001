@@ -5,8 +5,9 @@ struct Uniforms {
     palette_bg: vec4<f32>,
     marker_kind: u32,
     bg_opacity: f32,
+    /// Visual Bell flash intensity (0.0=normal, 1.0=fully inverted).
+    bell_flash: f32,
     _pad0: u32,
-    _pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -290,6 +291,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             color = mix(in.bg, in.fg, alpha);
             out_alpha = mix(out_alpha, color.a, alpha);
         }
+    }
+    // Visual Bell flash — bell_flash > 0이면 cell 색을 inverted color로 점진 mix.
+    // 250ms 동안 1.0 → 0.0 fade out (AppState가 elapsed로 set_bell_flash 호출).
+    if (u.bell_flash > 0.0) {
+        let inverted = vec3<f32>(1.0 - color.r, 1.0 - color.g, 1.0 - color.b);
+        color = vec4<f32>(mix(color.rgb, inverted, u.bell_flash), color.a);
+        // flash 중에는 alpha를 1.0으로 끌어올려 vibrancy 통과 없이 강한 시각.
+        out_alpha = mix(out_alpha, 1.0, u.bell_flash);
     }
     return vec4<f32>(color.rgb, out_alpha);
 }

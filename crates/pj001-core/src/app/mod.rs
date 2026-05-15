@@ -1184,6 +1184,9 @@ struct AppState {
     /// Bell 정책 (Config에서 복사 — App.config access conflict 회피).
     bell_visible: bool,
     bell_audible: bool,
+    /// Visual Bell flash 시작 시각. about_to_wait이 매 frame elapsed로 fade.
+    /// None이면 fade 안 함. 250ms 안에 1.0 → 0.0.
+    last_bell_at: Option<Instant>,
     /// M-P3-2a: macOS WgpuOverlay attach. Retained NSView/CAMetalLayer 보관 — drop 시
     /// AppKit 객체 자동 release. AppState가 main thread 전용이라 Send 불필요.
     #[cfg(target_os = "macos")]
@@ -2105,7 +2108,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         // Visual Bell — 매 about_to_wait에서 모든 session의 bell_pending drain.
-        // 정책에 따라 dock bounce + NSBeep. 둘 다 off면 silent.
+        // 정책에 따라 dock bounce + NSBeep + shader cell bg flash. 모두 off면 silent.
         let bell_seen = state.drain_bell_pending();
         if bell_seen {
             let visible = state.bell_visible;
@@ -2119,7 +2122,26 @@ impl ApplicationHandler<UserEvent> for App {
                     macos_bell::ns_beep();
                 }
             }
+            if visible {
+                // shader-level flash 시작 — about_to_wait이 매 frame intensity 갱신.
+                state.last_bell_at = Some(Instant::now());
+                state.window.request_redraw();
+            }
             log::info!("BEL → visible={visible} audible={audible}");
+        }
+        // Bell flash fade — 250ms 동안 1.0 → 0.0. 활성 중에는 매 frame redraw.
+        if let Some(start) = state.last_bell_at {
+            let elapsed = start.elapsed().as_secs_f32();
+            const BELL_FLASH_DURATION: f32 = 0.25;
+            if elapsed >= BELL_FLASH_DURATION {
+                state.renderer.set_bell_flash(&state.queue, 0.0);
+                state.last_bell_at = None;
+            } else {
+                let intensity = 1.0 - (elapsed / BELL_FLASH_DURATION);
+                state.renderer.set_bell_flash(&state.queue, intensity);
+                state.window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
         }
         // M17-5: 누적된 resize를 한 번만 처리.
         if let Some(size) = state.pending_resize.take() {
@@ -3441,6 +3463,7 @@ impl AppState {
             mouse_buttons_held: 0,
             bell_visible: config.bell_visible,
             bell_audible: config.bell_audible,
+            last_bell_at: None,
             #[cfg(target_os = "macos")]
             overlay_attach,
         };

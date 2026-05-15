@@ -29,7 +29,10 @@ struct Uniforms {
     /// Phase 3 step 3: 윈도우 bg 불투명도. 일반 cell의 bg alpha multiplier.
     /// glyph 영역은 1.0 강제 (텍스트 가독성).
     bg_opacity: f32,
-    _pad: [u32; 2],
+    /// Visual Bell flash intensity (0.0=normal, 1.0=fully inverted). 250ms fade.
+    /// AppState가 BEL 발생 시 1.0 → 0.0 점진 감쇠.
+    bell_flash: f32,
+    _pad: u32,
 }
 
 pub struct Renderer {
@@ -49,6 +52,7 @@ pub struct Renderer {
     viewport: [f32; 2],
     pending_instances: Vec<CellInstance>,
     palette: ThemePalette,
+    bell_flash: f32,
 }
 
 impl Renderer {
@@ -75,7 +79,8 @@ impl Renderer {
             palette_bg: palette.bg,
             marker_kind: palette.block_marker_kind as u32,
             bg_opacity: palette.bg_opacity,
-            _pad: [0; 2],
+            bell_flash: 0.0,
+            _pad: 0,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -265,6 +270,7 @@ impl Renderer {
             viewport,
             pending_instances: Vec::new(),
             palette,
+            bell_flash: 0.0,
         }
     }
 
@@ -326,14 +332,26 @@ impl Renderer {
 
     pub fn resize(&mut self, queue: &wgpu::Queue, viewport: [f32; 2]) {
         self.viewport = viewport;
+        self.write_uniforms(queue);
+    }
+
+    /// Visual bell flash intensity 갱신 (0.0=normal, 1.0=fully inverted).
+    /// AppState가 매 frame elapsed로 fade out 호출.
+    pub fn set_bell_flash(&mut self, queue: &wgpu::Queue, intensity: f32) {
+        self.bell_flash = intensity.clamp(0.0, 1.0);
+        self.write_uniforms(queue);
+    }
+
+    fn write_uniforms(&self, queue: &wgpu::Queue) {
         let uniforms = Uniforms {
-            viewport,
+            viewport: self.viewport,
             cell: [self.cell.width as f32, self.cell.height as f32],
             fg: [0.86, 0.86, 0.86, 1.0],
             palette_bg: self.palette.bg,
             marker_kind: self.palette.block_marker_kind as u32,
             bg_opacity: self.palette.bg_opacity,
-            _pad: [0; 2],
+            bell_flash: self.bell_flash,
+            _pad: 0,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
