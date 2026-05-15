@@ -9,10 +9,58 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const HELP_TEXT: &str = "pj001 — macOS GPU terminal emulator (wgpu + winit, Rust)
+
+USAGE:
+    pj001 [OPTIONS]
+
+OPTIONS:
+    -s, --shell <path>          Shell binary path (default: $SHELL or /bin/zsh)
+        --theme <name>          Color theme: aurora | obsidian | vellum | holo | bento | crystal
+        --block-mode <mode>     Block UI mode: auto (default) | off
+    -h, --help                  Print this help and exit
+    -V, --version               Print version info and exit
+
+ENV:
+    PJ001_NO_BACKDROP=1         Disable macOS NSVisualEffectView vibrancy backdrop
+    PJ001_CONFIG=<path>         Override config file location
+    RUST_LOG=<level>            Logging level (info / debug / warn / error)
+
+CONFIG:
+    ~/.config/pj001/config.toml — TOML schema:
+        [general]   theme = \"...\", shell = \"...\"
+        [block]     mode = \"auto\" | \"off\"
+        [backdrop]  enabled = true | false
+        [font]      size = 14.0
+        [bell]      visible = true, audible = false
+
+DOCS:
+    https://github.com/dechSky/prj001
+";
+
+fn version_string() -> String {
+    format!("pj001 {} (wgpu {} winit {})", env!("CARGO_PKG_VERSION"), "29", "0.30")
+}
+
 fn main() -> error::Result<()> {
     install_panic_hook();
     let _ = env_logger::try_init();
     let args: Vec<String> = std::env::args().collect();
+    // CLI --help / --version short-circuit. parse_config 통과시 macOS NSApp init까지 가서
+    // user-visible 효과 있을 수 있음 → 일찍 출력 후 exit.
+    for a in args.iter().skip(1) {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{HELP_TEXT}");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("{}", version_string());
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     let file_config = load_user_config_file();
     let config = parse_config(&args[1..], file_config.as_ref())?;
     app::run(config)
