@@ -19,27 +19,25 @@ pub fn encode_key(event: &KeyEvent, mode: InputMode) -> Option<Vec<u8>> {
         return None;
     }
     // 1. NamedKey 매핑 시도 (modifier 조합 포함).
-    if let Key::Named(named) = &event.logical_key {
-        if let Some(bytes) = encode_named_key(named, mode) {
-            return Some(bytes);
-        }
+    if let Key::Named(named) = &event.logical_key
+        && let Some(bytes) = encode_named_key(named, mode)
+    {
+        return Some(bytes);
     }
     // 2. Ctrl + 글자 명시 매핑 (winit text 의존을 줄임).
-    if mode.modifiers.control_key() {
-        if let Key::Character(s) = &event.logical_key {
-            if let Some(c) = s.chars().next() {
-                if let Some(b) = encode_ctrl_char(c) {
-                    return Some(vec![b]);
-                }
-            }
-        }
+    if mode.modifiers.control_key()
+        && let Key::Character(s) = &event.logical_key
+        && let Some(c) = s.chars().next()
+        && let Some(b) = encode_ctrl_char(c)
+    {
+        return Some(vec![b]);
     }
     // 3. text fallback. winit 0.30.13 macOS Korean IME 회귀(setMarkedText 미호출, insertText
     // 직접) 케이스에서 자모 단위 자모 텍스트가 KeyboardInput.text로 들어와 PTY에 그대로 흘러감.
     // → non-ASCII는 IME path(WindowEvent::Ime::Commit)만 신뢰하도록 차단.
     // ASCII는 그대로 통과 (영문 입력 등 정상).
     event.text.as_ref().and_then(|s| {
-        if s.chars().all(|c| c.is_ascii()) {
+        if s.is_ascii() {
             Some(s.as_bytes().to_vec())
         } else {
             log::debug!(
@@ -74,12 +72,12 @@ fn encode_named_key(key: &NamedKey, mode: InputMode) -> Option<Vec<u8>> {
     let pm = modifier_param(mode.modifiers);
 
     // modifier가 있으면 modified form 우선.
-    if let Some(pm) = pm {
-        if let Some(bytes) = encode_modified(key, pm) {
-            return Some(bytes);
-        }
-        // modifier 적용 안 되는 키(Enter/Backspace/Tab 등)는 unmodified로 진행.
+    if let Some(pm) = pm
+        && let Some(bytes) = encode_modified(key, pm)
+    {
+        return Some(bytes);
     }
+    // modifier 적용 안 되는 키(Enter/Backspace/Tab 등)는 unmodified로 진행.
 
     let unmodified: &'static [u8] = match key {
         NamedKey::Enter => b"\r",

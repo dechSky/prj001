@@ -365,6 +365,7 @@ impl Renderer {
         self.instance_count = 0;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_term(
         &mut self,
         queue: &wgpu::Queue,
@@ -387,10 +388,10 @@ impl Renderer {
                 if cell.attrs.contains(Attrs::WIDE_CONT) {
                     continue;
                 }
-                if self.atlas.get(cell.ch).is_none() {
-                    if let Some(raster) = self.font_stack.raster_one(cell.ch) {
-                        self.atlas.insert(queue, cell.ch, &raster);
-                    }
+                if self.atlas.get(cell.ch).is_none()
+                    && let Some(raster) = self.font_stack.raster_one(cell.ch)
+                {
+                    self.atlas.insert(queue, cell.ch, &raster);
                 }
             }
         }
@@ -400,10 +401,10 @@ impl Renderer {
                 if ch == ' ' || (ch as u32) < 0x20 {
                     continue;
                 }
-                if self.atlas.get(ch).is_none() {
-                    if let Some(raster) = self.font_stack.raster_one(ch) {
-                        self.atlas.insert(queue, ch, &raster);
-                    }
+                if self.atlas.get(ch).is_none()
+                    && let Some(raster) = self.font_stack.raster_one(ch)
+                {
+                    self.atlas.insert(queue, ch, &raster);
                 }
             }
         }
@@ -436,6 +437,7 @@ impl Renderer {
         self.pending_instances.append(&mut instances);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_text_line(
         &mut self,
         queue: &wgpu::Queue,
@@ -454,10 +456,10 @@ impl Renderer {
             if *ch == ' ' || (*ch as u32) < 0x20 {
                 continue;
             }
-            if self.atlas.get(*ch).is_none() {
-                if let Some(raster) = self.font_stack.raster_one(*ch) {
-                    self.atlas.insert(queue, *ch, &raster);
-                }
+            if self.atlas.get(*ch).is_none()
+                && let Some(raster) = self.font_stack.raster_one(*ch)
+            {
+                self.atlas.insert(queue, *ch, &raster);
             }
         }
 

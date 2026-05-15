@@ -99,7 +99,11 @@ pub fn attach_overlay(window: &Window) -> Option<OverlayAttach> {
         let before_layer: *mut AnyObject = msg_send![winit_view_ptr, layer];
         log::info!(
             "macos_overlay: BEFORE create_surface winit_view.layer={}",
-            if before_layer.is_null() { "nil" } else { "present" }
+            if before_layer.is_null() {
+                "nil"
+            } else {
+                "present"
+            }
         );
 
         // CAMetalLayer 생성 + 필수 속성. typed `new()` 사용 — objc2가 retained 자동 처리.
@@ -143,7 +147,11 @@ pub fn attach_overlay(window: &Window) -> Option<OverlayAttach> {
         let after_attach_layer: *mut AnyObject = msg_send![winit_view_ptr, layer];
         log::info!(
             "macos_overlay: AFTER overlay attach winit_view.layer={}",
-            if after_attach_layer.is_null() { "nil" } else { "present" }
+            if after_attach_layer.is_null() {
+                "nil"
+            } else {
+                "present"
+            }
         );
 
         let metal_layer_ptr = Retained::as_ptr(&metal_layer) as *mut c_void;

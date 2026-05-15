@@ -583,7 +583,6 @@ impl App {
     fn all_states_mut(&mut self) -> impl Iterator<Item = &mut WindowState> {
         self.windows.values_mut()
     }
-
 }
 
 struct Pane {
@@ -1060,9 +1059,7 @@ fn cmd_shortcut(
         };
     }
     if lower == Some("k") || physical_code == Some(KeyCode::KeyK) {
-        return Some(if shift {
-            CmdShortcut::ClearScrollback
-        } else if alt {
+        return Some(if shift || alt {
             CmdShortcut::ClearScrollback
         } else {
             CmdShortcut::ClearBuffer
@@ -1226,11 +1223,7 @@ fn compute_block_gutter_px(
 }
 
 fn app_tab_bar_rows() -> usize {
-    if USE_NATIVE_OS_TABS {
-        0
-    } else {
-        TAB_BAR_ROWS
-    }
+    if USE_NATIVE_OS_TABS { 0 } else { TAB_BAR_ROWS }
 }
 
 fn tab_content_size(
@@ -1320,8 +1313,8 @@ struct MouseSelection {
     pane: PaneId,
     /// caret 좌표 (abs_row, caret_col). Phase 5: viewport-local row → abs_row(= term.top_visible_abs()
     /// + viewport_row) 기반으로 변경. 스크롤해도 selection이 텍스트와 같이 움직이게 함.
-    /// caret_col은 0..=cols (글자 사이 boundary).
-    /// word/line selection의 경우 cell index를 caret 변환 (start=cell_start, end=cell_end+1).
+    ///   caret_col은 0..=cols (글자 사이 boundary).
+    ///   word/line selection의 경우 cell index를 caret 변환 (start=cell_start, end=cell_end+1).
     anchor: (usize, usize),
     head: (usize, usize),
     dragging: bool,
@@ -1334,14 +1327,14 @@ struct MouseSelection {
 /// Codex 5차 권: zombie 방지 — `open` spawn 후 별도 thread에서 wait + reap.
 /// open(1)이 launchd로 빠르게 종료하지만 parent가 reap 안 하면 zombie. thread는 wait 후 자동 종료.
 fn spawn_open_detached(arg: String) {
-    std::thread::spawn(move || {
-        match std::process::Command::new("open").arg(&arg).spawn() {
+    std::thread::spawn(
+        move || match std::process::Command::new("open").arg(&arg).spawn() {
             Ok(mut child) => {
                 let _ = child.wait();
             }
             Err(e) => log::warn!("open spawn failed for {arg}: {e}"),
-        }
-    });
+        },
+    );
 }
 
 fn caret_to_abs(term: &Term, viewport_caret: (usize, usize)) -> (usize, usize) {
@@ -1484,7 +1477,11 @@ impl App {
         };
         log::info!(
             "M-W-3: creating new {} via shortcut/menu cwd={:?}",
-            if tab_base_window.is_some() { "tab" } else { "window" },
+            if tab_base_window.is_some() {
+                "tab"
+            } else {
+                "window"
+            },
             startup_cwd
         );
         let attrs = Window::default_attributes()
@@ -1557,7 +1554,10 @@ impl App {
         #[cfg(target_os = "macos")]
         self.refresh_all_window_titles();
         window.request_redraw();
-        log::info!("M-W-3: new window {window_id:?} created, total windows={}", self.windows.len());
+        log::info!(
+            "M-W-3: new window {window_id:?} created, total windows={}",
+            self.windows.len()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1567,11 +1567,7 @@ impl App {
         }
     }
 
-    fn close_window(
-        &mut self,
-        window_id: winit::window::WindowId,
-        label: &str,
-    ) {
+    fn close_window(&mut self, window_id: winit::window::WindowId, label: &str) {
         if self.windows.remove(&window_id).is_none() {
             log::debug!("{label}: ignored unknown window {window_id:?}");
             return;
@@ -1764,7 +1760,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 // M-W-7: native close button and shortcut/menu window close share policy.
                 self.close_window(window_id, "native close requested");
-                return;
             }
             WindowEvent::ModifiersChanged(mods) => {
                 state.modifiers = mods.state();
@@ -1791,10 +1786,10 @@ impl ApplicationHandler<UserEvent> for App {
                         None
                     }
                 };
-                if let Some(bytes) = send {
-                    if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes) {
-                        log::warn!("focus report write: {e}");
-                    }
+                if let Some(bytes) = send
+                    && let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes)
+                {
+                    log::warn!("focus report write: {e}");
                 }
             }
             WindowEvent::Resized(size) => {
@@ -1866,17 +1861,17 @@ impl ApplicationHandler<UserEvent> for App {
                     state.dragging_divider = None;
                 }
                 // 슬라이스 6.3c: Cmd+click on hyperlink cell → 브라우저로 OSC 8 URI 열기.
-                if pressed && state.modifiers.super_key() && !state.modifiers.shift_key() {
-                    if state.try_open_hyperlink_at_mouse() {
-                        return;
-                    }
+                if pressed
+                    && state.modifiers.super_key()
+                    && !state.modifiers.shift_key()
+                    && state.try_open_hyperlink_at_mouse()
+                {
+                    return;
                 }
                 // 슬라이스 6.6: mouse reporting 활성 + Shift 미보유 → PTY로 전달.
                 // Shift 보유 시 selection 모드로 우회 (xterm/iterm 표준).
-                if !state.modifiers.shift_key() {
-                    if state.try_report_mouse_button(pressed, 0) {
-                        return;
-                    }
+                if !state.modifiers.shift_key() && state.try_report_mouse_button(pressed, 0) {
+                    return;
                 }
                 match button_state {
                     ElementState::Pressed => {
@@ -1893,10 +1888,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         if let Some((pane_id, cell)) = state.pane_cell_at_mouse() {
                             // caret은 mouse pos 기준. caret 못 얻으면 cell의 왼쪽 boundary fallback.
-                            let caret = state
-                                .pane_caret_at_mouse()
-                                .map(|(_, c)| c)
-                                .unwrap_or(cell);
+                            let caret = state.pane_caret_at_mouse().map(|(_, c)| c).unwrap_or(cell);
                             state.set_active(pane_id);
                             state.start_selection_at(pane_id, cell, caret);
                             state.window.request_redraw();
@@ -1919,19 +1911,15 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 let pressed = matches!(button_state, ElementState::Pressed);
                 state.track_mouse_button(pressed, 2);
-                if !state.modifiers.shift_key() {
-                    if state.try_report_mouse_button(pressed, 2) {
-                        return;
-                    }
+                if !state.modifiers.shift_key() && state.try_report_mouse_button(pressed, 2) {
+                    return;
                 }
-                if pressed {
-                    if let Some((pane_id, _)) = state.pane_cell_at_mouse() {
-                        state.set_active(pane_id);
-                        if state.selection.is_some() {
-                            state.handle_copy();
-                        }
-                        state.window.request_redraw();
+                if pressed && let Some((pane_id, _)) = state.pane_cell_at_mouse() {
+                    state.set_active(pane_id);
+                    if state.selection.is_some() {
+                        state.handle_copy();
                     }
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
@@ -2070,65 +2058,61 @@ impl ApplicationHandler<UserEvent> for App {
                         PhysicalKey::Code(code) => Some(code),
                         PhysicalKey::Unidentified(_) => None,
                     };
-                    if state.modifiers.shift_key() {
-                        if let Key::Named(named) = &event.logical_key {
-                            let handled = match named {
-                                NamedKey::ArrowLeft => state.adjust_active_split(
-                                    SplitAxis::Vertical,
-                                    RatioDirection::ShrinkActive,
-                                ),
-                                NamedKey::ArrowRight => state.adjust_active_split(
-                                    SplitAxis::Vertical,
-                                    RatioDirection::GrowActive,
-                                ),
-                                NamedKey::ArrowUp => state.adjust_active_split(
-                                    SplitAxis::Horizontal,
-                                    RatioDirection::ShrinkActive,
-                                ),
-                                NamedKey::ArrowDown => state.adjust_active_split(
-                                    SplitAxis::Horizontal,
-                                    RatioDirection::GrowActive,
-                                ),
-                                _ => false,
-                            };
-                            if handled {
-                                return;
-                            }
+                    if state.modifiers.shift_key()
+                        && let Key::Named(named) = &event.logical_key
+                    {
+                        let handled = match named {
+                            NamedKey::ArrowLeft => state.adjust_active_split(
+                                SplitAxis::Vertical,
+                                RatioDirection::ShrinkActive,
+                            ),
+                            NamedKey::ArrowRight => state.adjust_active_split(
+                                SplitAxis::Vertical,
+                                RatioDirection::GrowActive,
+                            ),
+                            NamedKey::ArrowUp => state.adjust_active_split(
+                                SplitAxis::Horizontal,
+                                RatioDirection::ShrinkActive,
+                            ),
+                            NamedKey::ArrowDown => state.adjust_active_split(
+                                SplitAxis::Horizontal,
+                                RatioDirection::GrowActive,
+                            ),
+                            _ => false,
+                        };
+                        if handled {
+                            return;
                         }
                     }
-                    if !state.modifiers.alt_key() && !state.modifiers.control_key() {
-                        if let Key::Named(named) = &event.logical_key {
-                            if let Some(bytes) = cmd_named_key_bytes(named) {
+                    if !state.modifiers.alt_key()
+                        && !state.modifiers.control_key()
+                        && let Key::Named(named) = &event.logical_key
+                    {
+                        if let Some(bytes) = cmd_named_key_bytes(named) {
+                            let idx = state.active_index();
+                            if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes) {
+                                log::warn!("cmd+arrow write failed: {e}");
+                            }
+                            return;
+                        }
+                        match named {
+                            NamedKey::ArrowUp => {
                                 let idx = state.active_index();
-                                if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(bytes)
-                                {
-                                    log::warn!("cmd+arrow write failed: {e}");
+                                if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
+                                    term.scroll_view_by(isize::MAX);
                                 }
+                                state.window.request_redraw();
                                 return;
                             }
-                            match named {
-                                NamedKey::ArrowUp => {
-                                    let idx = state.active_index();
-                                    if let Ok(mut term) =
-                                        state.session_for_pane_idx(idx).term.lock()
-                                    {
-                                        term.scroll_view_by(isize::MAX);
-                                    }
-                                    state.window.request_redraw();
-                                    return;
+                            NamedKey::ArrowDown => {
+                                let idx = state.active_index();
+                                if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
+                                    term.snap_to_bottom();
                                 }
-                                NamedKey::ArrowDown => {
-                                    let idx = state.active_index();
-                                    if let Ok(mut term) =
-                                        state.session_for_pane_idx(idx).term.lock()
-                                    {
-                                        term.snap_to_bottom();
-                                    }
-                                    state.window.request_redraw();
-                                    return;
-                                }
-                                _ => {}
+                                state.window.request_redraw();
+                                return;
                             }
+                            _ => {}
                         }
                     }
                     let lower = match &event.logical_key {
@@ -2158,19 +2142,17 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         Some(CmdShortcut::PrevTab) => {
-                            if let Err(e) = self
-                                .proxy
-                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::PrevTab))
-                            {
+                            if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(
+                                crate::app::event::AppMenuCommand::PrevTab,
+                            )) {
                                 log::warn!("cmd+shift+[ PrevTab proxy send failed: {e:?}");
                             }
                             return;
                         }
                         Some(CmdShortcut::NextTab) => {
-                            if let Err(e) = self
-                                .proxy
-                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NextTab))
-                            {
+                            if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(
+                                crate::app::event::AppMenuCommand::NextTab,
+                            )) {
                                 log::warn!("cmd+shift+] NextTab proxy send failed: {e:?}");
                             }
                             return;
@@ -2196,10 +2178,9 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         Some(CmdShortcut::NewTab) => {
-                            if let Err(e) = self
-                                .proxy
-                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NewTab))
-                            {
+                            if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(
+                                crate::app::event::AppMenuCommand::NewTab,
+                            )) {
                                 log::warn!("cmd+t NewTab proxy send failed: {e:?}");
                             }
                             return;
@@ -2214,10 +2195,9 @@ impl ApplicationHandler<UserEvent> for App {
                             // M-W-3: keyboard chain의 NewWindow는 EventLoopProxy를 통해
                             // App.user_event arm으로 indirection (state borrow drop 후 App.
                             // create_new_window 호출). Cmd+N → NSWindow 추가.
-                            if let Err(e) = self
-                                .proxy
-                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NewWindow))
-                            {
+                            if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(
+                                crate::app::event::AppMenuCommand::NewWindow,
+                            )) {
                                 log::warn!("cmd+n NewWindow proxy send failed: {e:?}");
                             }
                             return;
@@ -2326,35 +2306,34 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 // M8-5: PageUp/Down 분기 — alt screen이면 PTY 전송, main이면 scrollback.
-                if event.state == ElementState::Pressed {
-                    if let Key::Named(named @ (NamedKey::PageUp | NamedKey::PageDown)) =
+                if event.state == ElementState::Pressed
+                    && let Key::Named(named @ (NamedKey::PageUp | NamedKey::PageDown)) =
                         &event.logical_key
-                    {
-                        let idx = state.active_index();
-                        let alt = state
-                            .session_for_pane_idx(idx)
-                            .term
-                            .lock()
-                            .map(|t| t.is_alt_screen())
-                            .unwrap_or(false);
-                        if alt {
-                            // alt screen: encode_named_key가 byte 반환 → 일반 PTY 송신 흐름.
-                            log_page_dispatch_once("PTY (alt screen)");
-                        } else {
-                            // main screen: scrollback view 스크롤. PTY 안 보냄.
-                            if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
-                                let page = term.rows().saturating_sub(1).max(1) as isize;
-                                let delta = if matches!(named, NamedKey::PageUp) {
-                                    page
-                                } else {
-                                    -page
-                                };
-                                term.scroll_view_by(delta);
-                            }
-                            state.window.request_redraw();
-                            log_page_dispatch_once("scrollback (main screen)");
-                            return;
+                {
+                    let idx = state.active_index();
+                    let alt = state
+                        .session_for_pane_idx(idx)
+                        .term
+                        .lock()
+                        .map(|t| t.is_alt_screen())
+                        .unwrap_or(false);
+                    if alt {
+                        // alt screen: encode_named_key가 byte 반환 → 일반 PTY 송신 흐름.
+                        log_page_dispatch_once("PTY (alt screen)");
+                    } else {
+                        // main screen: scrollback view 스크롤. PTY 안 보냄.
+                        if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
+                            let page = term.rows().saturating_sub(1).max(1) as isize;
+                            let delta = if matches!(named, NamedKey::PageUp) {
+                                page
+                            } else {
+                                -page
+                            };
+                            term.scroll_view_by(delta);
                         }
+                        state.window.request_redraw();
+                        log_page_dispatch_once("scrollback (main screen)");
+                        return;
                     }
                 }
                 // type-to-snap: scrollback view 활성 시 일반 키 누름 → bottom 스냅.
@@ -2364,11 +2343,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state == ElementState::Pressed && !is_modifier_only_key(&event.logical_key)
                 {
                     let idx = state.active_index();
-                    if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock() {
-                        if term.view_offset() > 0 {
-                            term.snap_to_bottom();
-                            state.window.request_redraw();
-                        }
+                    if let Ok(mut term) = state.session_for_pane_idx(idx).term.lock()
+                        && term.view_offset() > 0
+                    {
+                        term.snap_to_bottom();
+                        state.window.request_redraw();
                     }
                     if state.selection.is_some() {
                         state.selection = None;
@@ -2385,10 +2364,10 @@ impl ApplicationHandler<UserEvent> for App {
                         modifiers: state.modifiers,
                     }
                 };
-                if let Some(bytes) = input::encode_key(&event, mode) {
-                    if let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(&bytes) {
-                        log::warn!("pty write: {e}");
-                    }
+                if let Some(bytes) = input::encode_key(&event, mode)
+                    && let Err(e) = state.session_for_pane_idx_mut(idx).pty.write(&bytes)
+                {
+                    log::warn!("pty write: {e}");
                 }
             }
             _ => {}
@@ -2533,10 +2512,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 .iter()
                                 .find(|p| p.id == state.active_tab().active)
                                 .map(|p| p.session);
-                            if active_session == Some(id) {
-                                if let Some(next) = state.next_alive_pane_id() {
-                                    state.set_active(next);
-                                }
+                            if active_session == Some(id)
+                                && let Some(next) = state.next_alive_pane_id()
+                            {
+                                state.set_active(next);
                             }
                             state.window.request_redraw();
                         }
@@ -2590,10 +2569,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 .iter()
                                 .find(|p| p.id == state.active_tab().active)
                                 .map(|p| p.session);
-                            if active_session == Some(id) {
-                                if let Some(next) = state.next_alive_pane_id() {
-                                    state.set_active(next);
-                                }
+                            if active_session == Some(id)
+                                && let Some(next) = state.next_alive_pane_id()
+                            {
+                                state.set_active(next);
                             }
                             state.window.request_redraw();
                         }
@@ -2824,7 +2803,8 @@ impl WindowState {
             && let Some(ordinal) =
                 macos_window::tab_ordinal(&self.window).filter(|ordinal| *ordinal <= 9)
         {
-            self.window.set_title(&format!("⌘{} {} — pj001", ordinal, title));
+            self.window
+                .set_title(&format!("⌘{} {} — pj001", ordinal, title));
             return;
         }
 
@@ -2882,11 +2862,7 @@ impl WindowState {
         }
     }
 
-    fn apply_close_decision(
-        &mut self,
-        decision: CloseDecision,
-        label: &str,
-    ) {
+    fn apply_close_decision(&mut self, decision: CloseDecision, label: &str) {
         match decision {
             CloseDecision::Noop => log::debug!("{label}: close ignored"),
             CloseDecision::ClosePane => self.close_active_pane(),
@@ -2894,7 +2870,11 @@ impl WindowState {
             CloseDecision::CloseWindow => {
                 let window_id = self.window.id();
                 log::info!("{label}: close current window {window_id:?}");
-                if self.proxy.send_event(UserEvent::CloseWindow(window_id)).is_err() {
+                if self
+                    .proxy
+                    .send_event(UserEvent::CloseWindow(window_id))
+                    .is_err()
+                {
                     log::warn!("{label}: close window dispatch failed");
                 }
             }
@@ -3172,8 +3152,7 @@ impl WindowState {
                         .windows(qlen)
                         .enumerate()
                         .take(start_col)
-                        .filter(|(_, w)| *w == query_chars.as_slice())
-                        .last()
+                        .rfind(|(_, w)| *w == query_chars.as_slice())
                         .map(|(i, _)| i)
                 }
             } else if forward {
@@ -3184,8 +3163,7 @@ impl WindowState {
                 row_chars
                     .windows(qlen)
                     .enumerate()
-                    .filter(|(_, w)| *w == query_chars.as_slice())
-                    .last()
+                    .rfind(|(_, w)| *w == query_chars.as_slice())
                     .map(|(i, _)| i)
             };
             if let Some(col_start) = result {
@@ -3619,27 +3597,24 @@ impl WindowState {
         // (현실적으로 request_adapter 직후 compatible_surface caps가 empty일 가능성은 낮지만
         // wgpu API contract상 보장은 아님. 방어적 guard.)
         let caps = surface.get_capabilities(&adapter);
-        let format = choose_surface_format(&caps.formats, None).ok_or(
-            Error::SurfaceIncompatible {
+        let format =
+            choose_surface_format(&caps.formats, None).ok_or(Error::SurfaceIncompatible {
                 formats_empty: caps.formats.is_empty(),
                 alpha_modes_empty: caps.alpha_modes.is_empty(),
                 present_modes_empty: caps.present_modes.is_empty(),
-            },
-        )?;
-        let alpha_mode = choose_alpha_mode(&caps.alpha_modes, None).ok_or(
-            Error::SurfaceIncompatible {
+            })?;
+        let alpha_mode =
+            choose_alpha_mode(&caps.alpha_modes, None).ok_or(Error::SurfaceIncompatible {
                 formats_empty: caps.formats.is_empty(),
                 alpha_modes_empty: caps.alpha_modes.is_empty(),
                 present_modes_empty: caps.present_modes.is_empty(),
-            },
-        )?;
-        let present_mode = choose_present_mode(&caps.present_modes).ok_or(
-            Error::SurfaceIncompatible {
+            })?;
+        let present_mode =
+            choose_present_mode(&caps.present_modes).ok_or(Error::SurfaceIncompatible {
                 formats_empty: caps.formats.is_empty(),
                 alpha_modes_empty: caps.alpha_modes.is_empty(),
                 present_modes_empty: caps.present_modes.is_empty(),
-            },
-        )?;
+            })?;
         log::info!(
             "M-W-6 first window: format={format:?} alpha={alpha_mode:?} present={present_mode:?} (avail alpha={:?})",
             caps.alpha_modes
@@ -4089,11 +4064,7 @@ impl WindowState {
             .as_ref()
             .cloned()
             .or_else(|| self.divider_hit_at_mouse());
-        let dragging_selection = self
-            .selection
-            .as_ref()
-            .map(|s| s.dragging)
-            .unwrap_or(false);
+        let dragging_selection = self.selection.as_ref().map(|s| s.dragging).unwrap_or(false);
         let icon = match hit.map(|hit| hit.axis()) {
             Some(SplitAxis::Vertical) => CursorIcon::ColResize,
             Some(SplitAxis::Horizontal) => CursorIcon::RowResize,
@@ -4282,17 +4253,14 @@ impl WindowState {
             // + about_to_wait sticky scroll에서 같은 throttle 재사용 (continuous scroll).
             // M-W-5 Codex 2차: now 외부 주입 — 같은 cycle의 다른 timing과 일관.
             const SCROLL_THROTTLE_MS: u64 = 50;
-            let throttle_ok = self
-                .last_auto_scroll_at
-                .map_or(true, |last| {
-                    now.saturating_duration_since(last) >= Duration::from_millis(SCROLL_THROTTLE_MS)
-                });
+            let throttle_ok = self.last_auto_scroll_at.is_none_or(|last| {
+                now.saturating_duration_since(last) >= Duration::from_millis(SCROLL_THROTTLE_MS)
+            });
             if throttle_ok {
-                if let Some(sid) = session_id_for_scroll {
-                    if let Some(mut term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok())
-                    {
-                        term.scroll_view_by(scroll_delta);
-                    }
+                if let Some(sid) = session_id_for_scroll
+                    && let Some(mut term) = self.sessions.get(&sid).and_then(|s| s.term.lock().ok())
+                {
+                    term.scroll_view_by(scroll_delta);
                 }
                 self.last_auto_scroll_at = Some(now);
             }
@@ -4357,13 +4325,13 @@ impl WindowState {
         // 1. OSC 8 hyperlink_id
         let cell = term.cell(row, col);
         let id = cell.hyperlink_id;
-        if id != 0 {
-            if let Some(uri) = term.hyperlink_uri_by_id(id).map(|u| u.to_string()) {
-                drop(term);
-                log::info!("hyperlink open (OSC 8): {}", uri);
-                spawn_open_detached(uri);
-                return true;
-            }
+        if id != 0
+            && let Some(uri) = term.hyperlink_uri_by_id(id).map(|u| u.to_string())
+        {
+            drop(term);
+            log::info!("hyperlink open (OSC 8): {}", uri);
+            spawn_open_detached(uri);
+            return true;
         }
         // 2. plain text URL detection — soft-wrap chain head/tail까지 추적 (Codex 3차 권 1).
         // (a) prev WRAPPED chain head로 거슬러 올라가며 prepend
@@ -4638,10 +4606,10 @@ impl WindowState {
     fn drain_bell_pending(&mut self) -> bool {
         let mut bell = false;
         for session in self.sessions.values() {
-            if let Ok(mut term) = session.term.lock() {
-                if term.take_bell_pending() {
-                    bell = true;
-                }
+            if let Ok(mut term) = session.term.lock()
+                && term.take_bell_pending()
+            {
+                bell = true;
             }
         }
         bell
@@ -4729,7 +4697,9 @@ impl WindowState {
             M::NewWindow => {
                 // M-W-3: App level — user_event arm이 별도로 처리. WindowState method로
                 // 도달하면 unreachable (logic bug). debug log + ignore.
-                log::warn!("dispatch_menu_command: NewWindow는 App level dispatch — 호출 안 와야 함");
+                log::warn!(
+                    "dispatch_menu_command: NewWindow는 App level dispatch — 호출 안 와야 함"
+                );
             }
         }
     }
@@ -4843,11 +4813,11 @@ impl WindowState {
     fn write_text_to_active_pty(&mut self, text: &str, label: &str) {
         let idx = self.active_index();
         // scrollback view 활성 시 paste는 bottom으로 snap.
-        if let Ok(mut term) = self.session_for_pane_idx(idx).term.lock() {
-            if term.view_offset() > 0 {
-                term.snap_to_bottom();
-                self.window.request_redraw();
-            }
+        if let Ok(mut term) = self.session_for_pane_idx(idx).term.lock()
+            && term.view_offset() > 0
+        {
+            term.snap_to_bottom();
+            self.window.request_redraw();
         }
         let bracketed = self
             .session_for_pane_idx(idx)
@@ -5157,8 +5127,8 @@ impl WindowState {
                     } else {
                         mix_palette(palette.bg, palette.fg, 0.3)
                     };
-                    let scrollbar_col = pane_col_offset + self.active_tab().panes[idx].viewport.cols
-                        - 1;
+                    let scrollbar_col =
+                        pane_col_offset + self.active_tab().panes[idx].viewport.cols - 1;
                     let scrollbar_row = pane_row_offset + thumb_top;
                     self.renderer.append_scrollbar_thumb(
                         scrollbar_col,
@@ -5168,9 +5138,7 @@ impl WindowState {
                     );
                 }
                 // Phase 4c: status badge — 각 카드의 visible_row_start 우측 끝에 chip text.
-                let viewport_cols = {
-                    self.active_tab().panes[idx].viewport.cols
-                };
+                let viewport_cols = { self.active_tab().panes[idx].viewport.cols };
                 let palette = self.renderer.palette();
                 for vb in &visible_blocks {
                     let Some(badge) = status_badge_text(&vb.state, vb.duration_ms) else {
@@ -5475,7 +5443,10 @@ mod tests {
 
     #[test]
     fn choose_surface_format_falls_back_to_first_when_no_srgb() {
-        let caps = vec![wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm];
+        let caps = vec![
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ];
         let r = choose_surface_format(&caps, None);
         assert_eq!(r, Some(wgpu::TextureFormat::Bgra8Unorm));
     }
@@ -5773,9 +5744,7 @@ mod tests {
 
     #[test]
     fn status_badge_text_completed_success_with_duration() {
-        let state = BlockState::Completed {
-            exit_code: Some(0),
-        };
+        let state = BlockState::Completed { exit_code: Some(0) };
         assert_eq!(
             status_badge_text(&state, Some(123)),
             Some(" 123ms ".to_string())
@@ -5786,9 +5755,7 @@ mod tests {
 
     #[test]
     fn status_badge_text_completed_failure_shows_exit_code() {
-        let state = BlockState::Completed {
-            exit_code: Some(1),
-        };
+        let state = BlockState::Completed { exit_code: Some(1) };
         assert_eq!(
             status_badge_text(&state, Some(50)),
             Some(" x 1 ".to_string())
@@ -5798,10 +5765,7 @@ mod tests {
     #[test]
     fn status_badge_text_completed_unknown_exit_question() {
         let state = BlockState::Completed { exit_code: None };
-        assert_eq!(
-            status_badge_text(&state, Some(50)),
-            Some(" ? ".to_string())
-        );
+        assert_eq!(status_badge_text(&state, Some(50)), Some(" ? ".to_string()));
     }
 
     #[test]
@@ -6356,7 +6320,10 @@ mod tests {
             cmd_shortcut(Some("n"), Some(KeyCode::KeyN), false, true),
             Some(CmdShortcut::QuickSpawnStart)
         );
-        assert_eq!(cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false), None);
+        assert_eq!(
+            cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false),
+            None
+        );
         assert_eq!(
             cmd_shortcut(Some("k"), Some(KeyCode::KeyK), false, false),
             Some(CmdShortcut::ClearBuffer)

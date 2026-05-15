@@ -349,6 +349,7 @@ pub(super) fn divider_hit_at(
     divider_hit_at_rect(root, rect, col, row, &mut path)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn set_split_ratio_at_cell(
     root: &mut Layout,
     hit: &DividerHit,

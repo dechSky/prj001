@@ -43,17 +43,12 @@ pub(crate) struct ScrollbackRow {
     pub block_tags: Vec<RowBlockTag>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Color {
+    #[default]
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,8 +166,8 @@ impl Grid {
         // row_block_tags도 같이 carry — 4a는 truncate-only (4a reflow remap에서 분기).
         let mut new_tags = vec![Vec::new(); rows];
         let copy_t = rows.min(self.row_block_tags.len());
-        for r in 0..copy_t {
-            new_tags[r] = std::mem::take(&mut self.row_block_tags[r]);
+        for (r, tags) in new_tags.iter_mut().enumerate().take(copy_t) {
+            *tags = std::mem::take(&mut self.row_block_tags[r]);
         }
         self.row_block_tags = new_tags;
         self.cols = cols;
@@ -469,14 +464,14 @@ pub(crate) fn rewrap_lines_with_tags(
         }
 
         // cursor 매핑: 이 logical line이 만들어낸 NewRow 슬라이스에서 offset → (rel_row, col)
-        if let Some(offset) = cursor_offset_in_line {
-            if !cursor_set {
-                let line_rows = &result.new_rows[line_start..];
-                let (rel_row, col) = map_cursor_in_line(line_rows, offset);
-                result.cursor_global_row = line_start + rel_row;
-                result.cursor_new_col = col;
-                cursor_set = true;
-            }
+        if let Some(offset) = cursor_offset_in_line
+            && !cursor_set
+        {
+            let line_rows = &result.new_rows[line_start..];
+            let (rel_row, col) = map_cursor_in_line(line_rows, offset);
+            result.cursor_global_row = line_start + rel_row;
+            result.cursor_new_col = col;
+            cursor_set = true;
         }
 
         i = end + 1;
@@ -1302,12 +1297,12 @@ impl Term {
 
         // 새 main row_block_tags carry (Phase 4a).
         let mut new_block_tags: Vec<Vec<RowBlockTag>> = vec![Vec::new(); new_rows];
-        for r in 0..new_rows {
+        for (r, tags_out) in new_block_tags.iter_mut().enumerate().take(new_rows) {
             let src_idx = main_start + r;
             if src_idx < total
                 && let Some(tags) = result.new_row_tags.get(src_idx)
             {
-                new_block_tags[r] = tags.clone();
+                *tags_out = tags.clone();
             }
         }
 

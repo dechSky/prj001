@@ -188,23 +188,23 @@ impl<'a> Perform for TermPerform<'a> {
         // (2) home-relative 표시명을 title에 set (기존 동작 유지).
         // 형식: file://hostname/encoded/path
         if code == b"7" {
-            if let Ok(url) = std::str::from_utf8(params[1]) {
-                if let Some(rest) = url.strip_prefix("file://") {
-                    // hostname/path 분리. hostname은 무시, path만.
-                    let path_encoded = rest.splitn(2, '/').nth(1).unwrap_or("");
-                    let path = url_decode(path_encoded);
-                    // 디코드된 절대 경로 ("/" prefix 보존). 빈 문자열이면 저장 안 함.
-                    if !path.is_empty() {
-                        let absolute = if path.starts_with('/') {
-                            path.clone()
-                        } else {
-                            format!("/{path}")
-                        };
-                        self.term.set_cwd(absolute);
-                    }
-                    let display = home_relative(&path);
-                    self.term.set_title(display);
+            if let Ok(url) = std::str::from_utf8(params[1])
+                && let Some(rest) = url.strip_prefix("file://")
+            {
+                // hostname/path 분리. hostname은 무시, path만.
+                let path_encoded = rest.split_once('/').map(|x| x.1).unwrap_or("");
+                let path = url_decode(path_encoded);
+                // 디코드된 절대 경로 ("/" prefix 보존). 빈 문자열이면 저장 안 함.
+                if !path.is_empty() {
+                    let absolute = if path.starts_with('/') {
+                        path.clone()
+                    } else {
+                        format!("/{path}")
+                    };
+                    self.term.set_cwd(absolute);
                 }
+                let display = home_relative(&path);
+                self.term.set_title(display);
             }
             return;
         }
@@ -223,23 +223,22 @@ impl<'a> Perform for TermPerform<'a> {
         // 슬라이스 6.4: OSC 133 semantic prompt — FinalTerm/iTerm 호환.
         // `OSC 133;A ST` prompt start, `OSC 133;B ST` command start,
         // `OSC 133;C ST` output start, `OSC 133;D[;exit] ST` command end.
-        if code == b"133" {
-            if let Some(kind) = params.get(1) {
-                match kind.first() {
-                    Some(b'A') => self.term.semantic_prompt_start(),
-                    Some(b'B') => self.term.semantic_command_start(),
-                    Some(b'C') => self.term.semantic_output_start(),
-                    Some(b'D') => {
-                        let exit = params
-                            .get(2)
-                            .and_then(|s| std::str::from_utf8(s).ok())
-                            .and_then(|s| s.parse::<i32>().ok());
-                        self.term.semantic_command_end(exit);
-                    }
-                    _ => {}
+        if code == b"133"
+            && let Some(kind) = params.get(1)
+        {
+            match kind.first() {
+                Some(b'A') => self.term.semantic_prompt_start(),
+                Some(b'B') => self.term.semantic_command_start(),
+                Some(b'C') => self.term.semantic_output_start(),
+                Some(b'D') => {
+                    let exit = params
+                        .get(2)
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .and_then(|s| s.parse::<i32>().ok());
+                    self.term.semantic_command_end(exit);
                 }
+                _ => {}
             }
-            return;
         }
     }
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
@@ -347,15 +346,15 @@ fn url_decode(s: &str) -> String {
 /// $HOME 접두사면 "~"로 치환, 아니면 절대 path 그대로.
 fn home_relative(abs_path: &str) -> String {
     let abs = format!("/{}", abs_path.trim_start_matches('/'));
-    if let Ok(home) = std::env::var("HOME") {
-        if abs.starts_with(&home) {
-            let suffix = &abs[home.len()..];
-            return if suffix.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~{suffix}")
-            };
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && abs.starts_with(&home)
+    {
+        let suffix = &abs[home.len()..];
+        return if suffix.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{suffix}")
+        };
     }
     abs
 }
@@ -546,12 +545,16 @@ mod tests {
         let mut term = Term::new(10, 1);
         run(&mut term, b"abcdefghij");
         // cursor 끝까지 갔으니 0,col=10 (오른쪽 끝).
-        run(&mut term, b"\x1b[5G");  // CHA col 5 (1-based → col index 4)
+        run(&mut term, b"\x1b[5G"); // CHA col 5 (1-based → col index 4)
         run(&mut term, b"\x1b[0K");
         assert_eq!(term.cell(0, 0).ch, 'a');
         assert_eq!(term.cell(0, 3).ch, 'd');
         for c in 4..10 {
-            assert_eq!(term.cell(0, c).ch, ' ', "EL 0 should clear from col 4, col {c}");
+            assert_eq!(
+                term.cell(0, c).ch,
+                ' ',
+                "EL 0 should clear from col 4, col {c}"
+            );
         }
     }
 
@@ -559,7 +562,7 @@ mod tests {
     fn semantic_el_1_clears_from_start_to_cursor() {
         let mut term = Term::new(10, 1);
         run(&mut term, b"abcdefghij");
-        run(&mut term, b"\x1b[5G");  // col 5 (index 4)
+        run(&mut term, b"\x1b[5G"); // col 5 (index 4)
         run(&mut term, b"\x1b[1K");
         for c in 0..=4 {
             assert_eq!(term.cell(0, c).ch, ' ', "EL 1 should clear col {c}");
@@ -570,10 +573,10 @@ mod tests {
     #[test]
     fn semantic_decsc_decrc_save_restore_cursor() {
         let mut term = Term::new(20, 5);
-        run(&mut term, b"\x1b[3;7H");  // row 3 col 7 (1-based)
-        run(&mut term, b"\x1b7");       // DECSC
-        run(&mut term, b"\x1b[1;1H");  // 다른 곳
-        run(&mut term, b"\x1b8");       // DECRC
+        run(&mut term, b"\x1b[3;7H"); // row 3 col 7 (1-based)
+        run(&mut term, b"\x1b7"); // DECSC
+        run(&mut term, b"\x1b[1;1H"); // 다른 곳
+        run(&mut term, b"\x1b8"); // DECRC
         let (r, c) = (term.cursor().row, term.cursor().col);
         assert_eq!((r, c), (2, 6), "DECRC should restore row=2 col=6");
     }
@@ -582,7 +585,7 @@ mod tests {
     fn semantic_bs_moves_cursor_left() {
         let mut term = Term::new(10, 1);
         run(&mut term, b"abc");
-        run(&mut term, b"\x08\x08");  // BS BS
+        run(&mut term, b"\x08\x08"); // BS BS
         assert_eq!(term.cursor().col, 1);
     }
 
@@ -628,7 +631,7 @@ mod tests {
     fn semantic_nel_moves_to_first_col_next_row() {
         let mut term = Term::new(10, 3);
         run(&mut term, b"hello");
-        run(&mut term, b"\x1bE");  // NEL = CR + LF
+        run(&mut term, b"\x1bE"); // NEL = CR + LF
         assert_eq!(term.cursor().row, 1);
         assert_eq!(term.cursor().col, 0);
     }
@@ -649,8 +652,8 @@ mod tests {
     fn semantic_ri_at_top_scrolls_down() {
         let mut term = Term::new(10, 3);
         run(&mut term, b"r0\r\nr1\r\nr2");
-        run(&mut term, b"\x1b[1;1H");  // top
-        run(&mut term, b"\x1bM");  // RI — reverse index
+        run(&mut term, b"\x1b[1;1H"); // top
+        run(&mut term, b"\x1bM"); // RI — reverse index
         // 새 line이 위에 삽입되고 r2는 사라짐.
         assert_eq!(term.cell(0, 0).ch, ' ');
         assert_eq!(term.cell(1, 0).ch, 'r');

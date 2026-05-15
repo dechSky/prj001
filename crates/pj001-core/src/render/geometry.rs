@@ -119,6 +119,7 @@ impl BlockOverlay {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_instances_at(
     term: &Term,
     atlas: &GlyphAtlas,
@@ -249,10 +250,7 @@ pub fn build_instances_at(
                 // non-marker cell은 fg 사용 안 함 (gutter cell엔 글자 없음).
                 let fg = if is_marker { palette.fg } else { [0.0; 4] };
                 out.push(CellInstance {
-                    cell_xy: [
-                        (gutter_start_col + gc) as f32,
-                        (r + row_offset) as f32,
-                    ],
+                    cell_xy: [(gutter_start_col + gc) as f32, (r + row_offset) as f32],
                     uv_min: [0.0; 2],
                     uv_max: [0.0; 2],
                     glyph_offset: [0.0; 2],
@@ -451,10 +449,7 @@ mod tests {
         let o = overlay(3, 3);
         // 가운데 col은 top+bottom edge.
         let mid = o.cell_info(3, 5, 10).unwrap();
-        assert_eq!(
-            mid.edge_mask,
-            FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_BOTTOM
-        );
+        assert_eq!(mid.edge_mask, FLAG_BLOCK_EDGE_TOP | FLAG_BLOCK_EDGE_BOTTOM);
         // 좌측 끝은 top+bottom+left (3 비트 corner).
         let l = o.cell_info(3, 0, 10).unwrap();
         assert_eq!(
@@ -528,6 +523,7 @@ mod tests {
 
 /// IME preedit overlay. Term grid는 건드리지 않고 cursor (start_col, start_row) 위치부터
 /// preedit string을 dim된 fg로 그려넣는다. cell 경계 넘어가면 truncate.
+#[allow(clippy::too_many_arguments)]
 pub fn build_preedit_instances_at(
     preedit: &str,
     start_col: usize,
