@@ -1,7 +1,7 @@
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-/// 키 입력 인코딩 시점에 참조되는 Term/AppState 상태 스냅샷.
+/// 키 입력 인코딩 시점에 참조되는 Term/WindowState 상태 스냅샷.
 /// (advisor lock-race 가이드: 키 입력당 한 번만 lock 잡고 채워서 사용)
 #[derive(Default, Clone, Copy)]
 pub struct InputMode {

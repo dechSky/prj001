@@ -30,7 +30,7 @@ struct Uniforms {
     /// glyph 영역은 1.0 강제 (텍스트 가독성).
     bg_opacity: f32,
     /// Visual Bell flash intensity (0.0=normal, 1.0=fully inverted). 250ms fade.
-    /// AppState가 BEL 발생 시 1.0 → 0.0 점진 감쇠.
+    /// WindowState가 BEL 발생 시 1.0 → 0.0 점진 감쇠.
     bell_flash: f32,
     _pad: u32,
 }
@@ -340,7 +340,7 @@ impl Renderer {
     }
 
     /// Visual bell flash intensity 갱신 (0.0=normal, 1.0=fully inverted).
-    /// AppState가 매 frame elapsed로 fade out 호출.
+    /// WindowState가 매 frame elapsed로 fade out 호출.
     pub fn set_bell_flash(&mut self, queue: &wgpu::Queue, intensity: f32) {
         self.bell_flash = intensity.clamp(0.0, 1.0);
         self.write_uniforms(queue);

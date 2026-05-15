@@ -293,7 +293,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
     // Visual Bell flash — bell_flash > 0이면 cell 색을 inverted color로 점진 mix.
-    // 250ms 동안 1.0 → 0.0 fade out (AppState가 elapsed로 set_bell_flash 호출).
+    // 250ms 동안 1.0 → 0.0 fade out (WindowState가 elapsed로 set_bell_flash 호출).
     if (u.bell_flash > 0.0) {
         let inverted = vec3<f32>(1.0 - color.r, 1.0 - color.g, 1.0 - color.b);
         color = vec4<f32>(mix(color.rgb, inverted, u.bell_flash), color.a);

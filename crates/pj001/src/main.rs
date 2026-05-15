@@ -544,7 +544,7 @@ mode = "off"
 
     #[test]
     fn file_config_font_size_extreme_values_passthrough_to_clamp() {
-        // Codex 권 검증 부족 2: parse는 clamp 안 함 (AppState init 시 clamp).
+        // Codex 권 검증 부족 2: parse는 clamp 안 함 (WindowState init 시 clamp).
         // parse_config는 그대로 전달, clamp는 init 단계.
         for v in [0.0_f32, -5.0, 999.0] {
             let fc = FileConfig {

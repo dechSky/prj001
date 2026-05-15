@@ -1539,7 +1539,7 @@ impl Term {
     }
 
     /// BEL(0x07) 발생 표시. 정책 I 변경(2026-05-15) — 무음 → visual bell.
-    /// AppState main thread가 매 frame `take_bell_pending`으로 drain → NSApp request.
+    /// WindowState main thread가 매 frame `take_bell_pending`으로 drain → NSApp request.
     pub fn ring_bell(&mut self) {
         self.bell_pending = true;
     }

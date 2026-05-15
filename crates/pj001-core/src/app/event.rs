@@ -87,7 +87,7 @@ pub struct SessionId(pub u64);
 pub struct TabId(pub u64);
 
 /// M12-6: design §2.1 정합. ID 재사용 금지 monotonic counter.
-/// AppState가 보유하던 raw next_*_id 필드 + allocate_* 메서드를 한 struct로 묶음.
+/// WindowState가 보유하던 raw next_*_id 필드 + allocate_* 메서드를 한 struct로 묶음.
 #[derive(Debug, Default)]
 pub struct IdAllocator {
     next_pane: u64,

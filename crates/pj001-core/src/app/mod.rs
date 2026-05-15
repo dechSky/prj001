@@ -517,7 +517,7 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 struct App {
-    state: Option<AppState>,
+    state: Option<WindowState>,
     /// M12-5 회귀 fix v3 (Codex thread 019e1659): spawn을 첫 winit `Resized` 후로 미룸.
     /// resumed에서 window만 생성하고 여기 보관 → 첫 Resized에서 그 size로 PTY spawn.
     /// startup SIGWINCH 0회 → wrap된 작은 창에서도 zsh duplicate prompt 회피.
@@ -564,7 +564,7 @@ struct PaneViewport {
     height_px: u32,
     /// Block UI Phase 4a — prompt marker gutter 폭. 4a는 강제 0.
     /// 4b에서 block_capable && block_mode==auto일 때 발동.
-    /// 4b-2c-3: AppState::render에서 gutter_cells 계산에 사용.
+    /// 4b-2c-3: WindowState::render에서 gutter_cells 계산에 사용.
     gutter_px: u16,
     /// `x_px + gutter_px`. mouse/selection 좌표 변환 시 사용. 4a는 x_px와 동일.
     #[allow(dead_code)]
@@ -1132,7 +1132,7 @@ fn tab_content_size(
     )
 }
 
-struct AppState {
+struct WindowState {
     window: Arc<Window>,
     proxy: EventLoopProxy<UserEvent>,
     surface: wgpu::Surface<'static>,
@@ -1188,7 +1188,7 @@ struct AppState {
     /// None이면 fade 안 함. 250ms 안에 1.0 → 0.0.
     last_bell_at: Option<Instant>,
     /// M-P3-2a: macOS WgpuOverlay attach. Retained NSView/CAMetalLayer 보관 — drop 시
-    /// AppKit 객체 자동 release. AppState가 main thread 전용이라 Send 불필요.
+    /// AppKit 객체 자동 release. WindowState가 main thread 전용이라 Send 불필요.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     overlay_attach: Option<macos_overlay::OverlayAttach>,
@@ -1355,13 +1355,13 @@ impl App {
             window.inner_size().width,
             window.inner_size().height,
         );
-        let state = pollster::block_on(AppState::new_with_size(
+        let state = pollster::block_on(WindowState::new_with_size(
             window,
             self.proxy.clone(),
             self.config.clone(),
             size,
         ))
-        .expect("AppState::new");
+        .expect("WindowState::new");
         state.window.focus_window();
         // macOS NSMenu attach — 상단 menu bar 6개 (App/Shell/Edit/View/Window/Help).
         // Apple 표준 selector + custom 항목 keyEquivalent + tag dispatch 하이브리드.
@@ -2315,14 +2315,14 @@ impl ApplicationHandler<UserEvent> for App {
                     state.dispatch_menu_command(event_loop, cmd);
                     state.window.request_redraw();
                 } else {
-                    log::warn!("MenuCommand received before AppState ready: {cmd:?}");
+                    log::warn!("MenuCommand received before WindowState ready: {cmd:?}");
                 }
             }
         }
     }
 }
 
-impl AppState {
+impl WindowState {
     fn active_tab_index(&self) -> usize {
         self.tabs
             .iter()
@@ -3354,7 +3354,7 @@ impl AppState {
             .map(|_| ids.new_pane())
             .collect::<Vec<_>>();
         let layout_root = Layout::from_initial_panes(&pane_ids);
-        // AppState init 시점은 block_capable=false라 gutter 0.
+        // WindowState init 시점은 block_capable=false라 gutter 0.
         let layouts = compute_tab_viewports(&layout_root, size, renderer.cell_metrics(), 0);
         log::info!(
             "startup spawn size={}x{} cell={}x{} panes={} layouts={:?}",
@@ -4066,7 +4066,7 @@ impl AppState {
     }
 
     /// 모든 session의 Term.bell_pending을 drain. 하나라도 true였으면 true 반환.
-    /// AppState about_to_wait이 매 frame 호출, true면 NSApp.requestUserAttention.
+    /// WindowState about_to_wait이 매 frame 호출, true면 NSApp.requestUserAttention.
     fn drain_bell_pending(&mut self) -> bool {
         let mut bell = false;
         for session in self.sessions.values() {

@@ -64,12 +64,12 @@ fn tr(en: &'static str, ko: &'static str) -> &'static str {
     if is_korean_locale() { ko } else { en }
 }
 
-/// menu click → UserEvent::MenuCommand dispatch path. AppState init 시 set.
+/// menu click → UserEvent::MenuCommand dispatch path. WindowState init 시 set.
 /// 외부 module은 `init_menu_proxy`를 통해서만 접근. menu click 발생 시점에 main thread.
 /// EventLoopProxy는 Send + Sync.
 static MENU_PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
-/// AppState::new_with_size에서 한 번 호출. 이후 menu click이 이 proxy로 send_event.
+/// WindowState::new_with_size에서 한 번 호출. 이후 menu click이 이 proxy로 send_event.
 /// Codex 6차 개선: set 실패는 stale proxy를 silent 가리지 않고 warn (재초기화/test 가시성).
 pub fn init_menu_proxy(proxy: EventLoopProxy<UserEvent>) {
     if MENU_PROXY.set(proxy).is_err() {

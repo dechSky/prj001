@@ -180,7 +180,7 @@ pub fn log_layer_class_after_surface(window: &Window) {
 }
 
 // `Send` 불가능: AppKit object는 main thread 전용. App이 main thread에서만 보관/drop하는
-// 가정으로 unsafe impl Send를 피한다. OverlayAttach는 AppState 안에서 직접 보관.
+// 가정으로 unsafe impl Send를 피한다. OverlayAttach는 WindowState 안에서 직접 보관.
 // Retained<NSObject>는 thread-safety가 NSObject impl에 따라 다르므로 추후 필요 시 검토.
 #[allow(dead_code)]
 fn _force_module_compiled() -> *const NSObject {
