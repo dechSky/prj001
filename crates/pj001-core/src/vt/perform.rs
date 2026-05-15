@@ -158,6 +158,13 @@ impl<'a> Perform for TermPerform<'a> {
             b'>' => self.term.set_keypad_application(false),
             // M11-3: RIS Reset to Initial State (`ESC c`).
             b'c' => self.term.full_reset(),
+            // VT100 표준 cursor movement (Codex semantic 회귀 검증 추가):
+            // IND (`ESC D`) — LF 동작. scroll region 끝이면 scroll up.
+            b'D' => self.term.newline(),
+            // NEL (`ESC E`) — CR + LF.
+            b'E' => self.term.next_line(),
+            // RI (`ESC M`) — reverse LF. scroll region top이면 scroll down.
+            b'M' => self.term.reverse_index(),
             _ => {}
         }
     }
@@ -513,6 +520,138 @@ mod tests {
             assert_eq!(term.rows(), 24, "corpus[{i}] altered rows: {seq:?}");
             assert_eq!(term.cols(), 80, "corpus[{i}] altered cols: {seq:?}");
         }
+    }
+
+    /// Codex 2차 권 검증 부족 4: fuzz semantic 회귀 unit test — panic만 보는 fuzz가
+    /// 못 잡는 의미 회귀 (ED가 line 안 지움 같은 케이스). 각 시퀀스의 기대 결과 assert.
+
+    #[test]
+    fn semantic_ed_2_clears_screen() {
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"hello");
+        assert_eq!(term.cell(0, 0).ch, 'h');
+        run(&mut term, b"\x1b[2J");
+        for r in 0..5 {
+            for c in 0..10 {
+                assert_eq!(term.cell(r, c).ch, ' ', "ED 2 should clear row {r} col {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_el_0_clears_from_cursor_to_end() {
+        let mut term = Term::new(10, 1);
+        run(&mut term, b"abcdefghij");
+        // cursor 끝까지 갔으니 0,col=10 (오른쪽 끝).
+        run(&mut term, b"\x1b[5G");  // CHA col 5 (1-based → col index 4)
+        run(&mut term, b"\x1b[0K");
+        assert_eq!(term.cell(0, 0).ch, 'a');
+        assert_eq!(term.cell(0, 3).ch, 'd');
+        for c in 4..10 {
+            assert_eq!(term.cell(0, c).ch, ' ', "EL 0 should clear from col 4, col {c}");
+        }
+    }
+
+    #[test]
+    fn semantic_el_1_clears_from_start_to_cursor() {
+        let mut term = Term::new(10, 1);
+        run(&mut term, b"abcdefghij");
+        run(&mut term, b"\x1b[5G");  // col 5 (index 4)
+        run(&mut term, b"\x1b[1K");
+        for c in 0..=4 {
+            assert_eq!(term.cell(0, c).ch, ' ', "EL 1 should clear col {c}");
+        }
+        assert_eq!(term.cell(0, 5).ch, 'f');
+    }
+
+    #[test]
+    fn semantic_decsc_decrc_save_restore_cursor() {
+        let mut term = Term::new(20, 5);
+        run(&mut term, b"\x1b[3;7H");  // row 3 col 7 (1-based)
+        run(&mut term, b"\x1b7");       // DECSC
+        run(&mut term, b"\x1b[1;1H");  // 다른 곳
+        run(&mut term, b"\x1b8");       // DECRC
+        let (r, c) = (term.cursor().row, term.cursor().col);
+        assert_eq!((r, c), (2, 6), "DECRC should restore row=2 col=6");
+    }
+
+    #[test]
+    fn semantic_bs_moves_cursor_left() {
+        let mut term = Term::new(10, 1);
+        run(&mut term, b"abc");
+        run(&mut term, b"\x08\x08");  // BS BS
+        assert_eq!(term.cursor().col, 1);
+    }
+
+    #[test]
+    fn semantic_cr_lf_newline_logic() {
+        let mut term = Term::new(10, 3);
+        run(&mut term, b"abc\r\ndef");
+        assert_eq!(term.cell(0, 0).ch, 'a');
+        assert_eq!(term.cell(1, 0).ch, 'd');
+        assert_eq!(term.cursor().row, 1);
+        assert_eq!(term.cursor().col, 3);
+    }
+
+    #[test]
+    fn semantic_ht_advances_to_next_tab_stop() {
+        let mut term = Term::new(20, 1);
+        run(&mut term, b"x\thello");
+        // tab은 8 단위 stop. x(col 0) -> col 1 -> tab -> col 8
+        assert_eq!(term.cell(0, 0).ch, 'x');
+        assert_eq!(term.cell(0, 8).ch, 'h');
+        assert_eq!(term.cell(0, 9).ch, 'e');
+    }
+
+    #[test]
+    fn semantic_decstbm_scroll_region_then_lf() {
+        let mut term = Term::new(10, 5);
+        // 처음 5줄에 텍스트
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        // scroll region 2..4 (1-based 2..4 → idx 1..3)
+        run(&mut term, b"\x1b[2;4r");
+        // cursor를 region 안 마지막 줄로
+        run(&mut term, b"\x1b[4;1H"); // row 4 col 1 = idx (3, 0)
+        // LF — region 안에서 scroll
+        run(&mut term, b"\n");
+        // r1(이전 idx 1)이 영역 밖으로 scroll out. r0/r4는 그대로.
+        assert_eq!(term.cell(0, 0).ch, 'r');
+        assert_eq!(term.cell(0, 1).ch, '0');
+        assert_eq!(term.cell(4, 0).ch, 'r');
+        assert_eq!(term.cell(4, 1).ch, '4');
+    }
+
+    #[test]
+    fn semantic_nel_moves_to_first_col_next_row() {
+        let mut term = Term::new(10, 3);
+        run(&mut term, b"hello");
+        run(&mut term, b"\x1bE");  // NEL = CR + LF
+        assert_eq!(term.cursor().row, 1);
+        assert_eq!(term.cursor().col, 0);
+    }
+
+    #[test]
+    fn semantic_ind_lf_at_bottom_scrolls() {
+        let mut term = Term::new(10, 3);
+        run(&mut term, b"r0\r\nr1\r\nr2");
+        // cursor at row 2 col 2 (bottom). IND — scroll up since at bottom.
+        run(&mut term, b"\x1bD");
+        // row 0=r1, row 1=r2, row 2=공백
+        assert_eq!(term.cell(0, 0).ch, 'r');
+        assert_eq!(term.cell(0, 1).ch, '1');
+        assert_eq!(term.cell(1, 1).ch, '2');
+    }
+
+    #[test]
+    fn semantic_ri_at_top_scrolls_down() {
+        let mut term = Term::new(10, 3);
+        run(&mut term, b"r0\r\nr1\r\nr2");
+        run(&mut term, b"\x1b[1;1H");  // top
+        run(&mut term, b"\x1bM");  // RI — reverse index
+        // 새 line이 위에 삽입되고 r2는 사라짐.
+        assert_eq!(term.cell(0, 0).ch, ' ');
+        assert_eq!(term.cell(1, 0).ch, 'r');
+        assert_eq!(term.cell(1, 1).ch, '0');
     }
 
     /// edge: 1-byte-at-a-time feed — incremental parser state machine 검증.

@@ -1503,6 +1503,25 @@ impl Term {
         self.cursor.col = 0;
     }
 
+    /// Reverse Index (`ESC M`) — LF의 반대. cursor를 위 row로, scroll_top이면 scroll_down.
+    /// VT100 표준. ED 1 cleanup 시 등 less/man 같은 pager가 사용.
+    pub fn reverse_index(&mut self) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if self.cursor.row > top {
+            self.cursor.row -= 1;
+        } else {
+            // top — scroll down (cursor 행 위에 빈 row 삽입, scroll region 마지막 row 사라짐)
+            self.grid_mut().scroll_down(top, bottom, 1);
+        }
+    }
+
+    /// Next Line (`ESC E`) — CR + LF. cursor를 다음 row의 col 0으로.
+    pub fn next_line(&mut self) {
+        self.carriage_return();
+        self.newline();
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor.col > 0 {
             self.cursor.col -= 1;
@@ -1838,9 +1857,8 @@ impl Term {
         s
     }
 
-    // M17-2: 테스트/디버깅용 row_flags 접근자. 외부 노출 안 함.
-    #[cfg(test)]
-    fn row_flags(&self, row: usize) -> RowFlags {
+    // M17-2: 테스트/디버깅용 row_flags 접근자. soft-wrap URL detection이 사용.
+    pub fn row_flags(&self, row: usize) -> RowFlags {
         self.grid().row_flags[row]
     }
 

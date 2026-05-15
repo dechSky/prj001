@@ -3687,11 +3687,28 @@ impl AppState {
                 return true;
             }
         }
-        // 2. plain text URL detection — row의 chars 모아서 click cell이 http(s):// 범위 안인지
+        // 2. plain text URL detection — row의 chars 모음. soft-wrap 지원:
+        // 현재 row가 WRAPPED flag면 다음 row까지 이어 붙임. URL이 두 줄에 걸쳐 있어도
+        // 매칭. 단 wrap 정보는 grid.row_flags[row]로 확인.
         let cols = term.cols();
-        let row_chars: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
+        let rows = term.rows();
+        let mut row_chars: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
+        let mut wrap_target_col = col;
+        // 현재 행의 끝이 WRAPPED 상태면 (다음 line으로 이어짐) 다음 row 연결.
+        if row + 1 < rows && term.row_flags(row).contains(crate::grid::RowFlags::WRAPPED) {
+            for c in 0..cols {
+                row_chars.push(term.cell(row + 1, c).ch);
+            }
+        }
+        // 클릭이 다음 line에 있다면(현재 row가 prev로 WRAPPED) prev에서 시작해야.
+        if row > 0 && term.row_flags(row - 1).contains(crate::grid::RowFlags::WRAPPED) {
+            let mut prev: String = (0..cols).map(|c| term.cell(row - 1, c).ch).collect();
+            wrap_target_col += prev.len();
+            prev.push_str(&row_chars);
+            row_chars = prev;
+        }
         drop(term);
-        if let Some(url) = detect_url_at(&row_chars, col) {
+        if let Some(url) = detect_url_at(&row_chars, wrap_target_col) {
             log::info!("hyperlink open (plain text): {}", url);
             if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
                 log::warn!("plain url open failed: {e}");
@@ -5599,6 +5616,19 @@ mod tests {
         assert!(super::detect_url_at(s, 0).is_none());
         let s2 = "http://";
         assert!(super::detect_url_at(s2, 0).is_none());
+    }
+
+    #[test]
+    fn url_detect_at_concatenated_softwrap_string() {
+        // soft-wrap 시뮬레이션: row 끝 + 다음 row 첫 col이 한 문자열로 이어붙여졌을 때
+        // 클릭 col이 첫 row 안이든 두 번째 row 안이든 매칭.
+        let combined = "head https://very-long-domain.example.com/path/to/resource tail";
+        // col 5 (h of https) — URL 시작에서 매칭
+        let url = super::detect_url_at(combined, 5).unwrap();
+        assert!(url.starts_with("https://very-long-domain"));
+        // col 35 (path 영역, 가운데) — 같은 URL 매칭
+        let url2 = super::detect_url_at(combined, 35).unwrap();
+        assert_eq!(url, url2);
     }
 
     #[test]
