@@ -35,6 +35,10 @@ struct Uniforms {
     _pad: u32,
 }
 
+// Codex 9차 권: Uniforms layout 검증 — vec2(8) + vec2(8) + vec4(16) + vec4(16) +
+// u32(4) + f32(4) + f32(4) + u32(4) = 64 bytes. WGSL std140 / Rust repr(C) 정합.
+const _: () = assert!(std::mem::size_of::<Uniforms>() == 64);
+
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,

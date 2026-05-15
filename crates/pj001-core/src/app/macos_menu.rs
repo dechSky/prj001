@@ -123,8 +123,11 @@ define_class!(
                     \n\
                     [block]\n\
                     mode = \"auto\"\n";
-                let _ = std::fs::write(&path, default_config);
-                log::info!("menu: Preferences — config.toml not found, created default");
+                if let Err(e) = std::fs::write(&path, default_config) {
+                    log::warn!("menu: Preferences default config write failed at {}: {e}", path.display());
+                } else {
+                    log::info!("menu: Preferences — config.toml not found, created default at {}", path.display());
+                }
             }
             spawn_open(path.to_str().unwrap_or(""));
             log::info!("menu: Preferences → open {}", path.display());
