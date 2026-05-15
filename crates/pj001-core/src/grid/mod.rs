@@ -534,6 +534,9 @@ pub struct Term {
     bracketed_paste: bool,
     /// M10-3: focus reporting mode (CSI ?1004 h/l). app이 focus change 시 송신 판정.
     focus_reporting: bool,
+    /// Visual Bell — PTY reader가 BEL(0x07) 수신 시 set, main thread가 매 frame
+    /// `take_bell_pending`으로 drain. true → NSApp.requestUserAttention(dock bounce).
+    bell_pending: bool,
     /// M10-1: vt가 PTY로 보낼 응답 누적. main이 render에서 drain → pty.write.
     /// DSR/DA 응답, M11+에서 OSC query 응답 등.
     pending_responses: Vec<Vec<u8>>,
@@ -624,6 +627,7 @@ impl Term {
             title_dirty: false,
             bracketed_paste: false,
             focus_reporting: false,
+            bell_pending: false,
             pending_responses: Vec::new(),
             g0_charset: Charset::Ascii,
             cwd: None,
@@ -1532,6 +1536,19 @@ impl Term {
     pub fn next_line(&mut self) {
         self.carriage_return();
         self.newline();
+    }
+
+    /// BEL(0x07) 발생 표시. 정책 I 변경(2026-05-15) — 무음 → visual bell.
+    /// AppState main thread가 매 frame `take_bell_pending`으로 drain → NSApp request.
+    pub fn ring_bell(&mut self) {
+        self.bell_pending = true;
+    }
+
+    /// PTY reader thread가 set한 bell flag를 main thread가 drain (true 반환 + clear).
+    pub fn take_bell_pending(&mut self) -> bool {
+        let was = self.bell_pending;
+        self.bell_pending = false;
+        was
     }
 
     pub fn backspace(&mut self) {

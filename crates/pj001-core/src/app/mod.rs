@@ -4,6 +4,8 @@ mod layout;
 #[cfg(target_os = "macos")]
 mod macos_backdrop;
 #[cfg(target_os = "macos")]
+mod macos_bell;
+#[cfg(target_os = "macos")]
 mod macos_ime;
 #[cfg(target_os = "macos")]
 mod macos_menu;
@@ -2084,6 +2086,14 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // Visual Bell — 매 about_to_wait에서 모든 session의 bell_pending drain.
+        // 하나라도 있으면 NSApp.requestUserAttention (dock bounce) 호출 + log.
+        let bell_seen = state.drain_bell_pending();
+        if bell_seen {
+            #[cfg(target_os = "macos")]
+            macos_bell::request_user_attention();
+            log::info!("BEL → visual bell (dock bounce)");
+        }
         // M17-5: 누적된 resize를 한 번만 처리.
         if let Some(size) = state.pending_resize.take() {
             state.resize(size);
@@ -4001,6 +4011,20 @@ impl AppState {
             self.apply_layout_viewports();
             self.window.request_redraw();
         }
+    }
+
+    /// 모든 session의 Term.bell_pending을 drain. 하나라도 true였으면 true 반환.
+    /// AppState about_to_wait이 매 frame 호출, true면 NSApp.requestUserAttention.
+    fn drain_bell_pending(&mut self) -> bool {
+        let mut bell = false;
+        for session in self.sessions.values() {
+            if let Ok(mut term) = session.term.lock() {
+                if term.take_bell_pending() {
+                    bell = true;
+                }
+            }
+        }
+        bell
     }
 
     /// macOS NSMenu click → AppCommand dispatch. 기존 CmdShortcut handler를 재활용한다.

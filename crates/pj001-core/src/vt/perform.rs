@@ -19,6 +19,9 @@ impl<'a> Perform for TermPerform<'a> {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            // BEL — 정책 I 변경: 무음 → visual bell (dock bounce). Term.bell_pending=true
+            // 만 set, 실제 NSApp 호출은 AppState about_to_wait main thread에서 drain.
+            0x07 => self.term.ring_bell(),
             0x0A => self.term.newline(),
             0x0D => self.term.carriage_return(),
             0x08 => self.term.backspace(),
