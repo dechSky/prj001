@@ -24,12 +24,19 @@ struct FileConfig {
     general: FileGeneral,
     #[serde(default)]
     block: FileBlock,
+    #[serde(default)]
+    backdrop: FileBackdrop,
+    #[serde(default)]
+    font: FileFont,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 struct FileGeneral {
     #[serde(default)]
     theme: Option<String>,
+    /// shell 경로 override. CLI --shell이 더 우선.
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -38,6 +45,22 @@ struct FileBlock {
     /// "off" — 절대 visual ON 안 함. Phase 4a는 파싱만, visual은 4b부터.
     #[serde(default)]
     mode: Option<String>,
+}
+
+/// Phase 3 step 3: macOS NSVisualEffectView 토글.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileBackdrop {
+    /// macOS vibrancy backdrop 활성화. None/true = 활성 (default), false = 비활성.
+    /// 환경변수 PJ001_NO_BACKDROP=1이 더 우선.
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct FileFont {
+    /// 폰트 크기(pt). 기본 14.0. CLI override 없음 (config 전용).
+    #[serde(default)]
+    size: Option<f32>,
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -153,9 +176,20 @@ fn parse_config(args: &[String], file_config: Option<&FileConfig>) -> error::Res
         }
     };
     log::info!("block-mode: {resolved_block_mode}");
-    let mut config = Config::single_shell(shell_override).with_block_mode(block_mode_enum);
+    // shell file_config override (CLI > config). CLI 미지정 + config 있으면 config 사용.
+    let resolved_shell = shell_override
+        .or_else(|| file_config.and_then(|c| c.general.shell.clone()));
+    let mut config = Config::single_shell(resolved_shell).with_block_mode(block_mode_enum);
     if let Some(theme) = theme {
         config = config.with_theme(theme);
+    }
+    // Phase 3 step 3: [backdrop] enabled. None = default ON. 환경변수가 더 우선.
+    if let Some(backdrop) = file_config.and_then(|c| c.backdrop.enabled) {
+        config = config.with_backdrop_enabled(Some(backdrop));
+    }
+    // font.size 적용은 별도 세션 (Renderer/FontStack 초기화 깊은 변경).
+    if let Some(size) = file_config.and_then(|c| c.font.size) {
+        log::info!("font.size config={size} (적용은 별도 세션 — 현재 14.0 default 유지)");
     }
     Ok(config)
 }
@@ -272,8 +306,11 @@ mod tests {
         let fc = FileConfig {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
+                shell: None,
             },
             block: FileBlock::default(),
+            backdrop: FileBackdrop::default(),
+            font: FileFont::default(),
         };
         let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("vellum"));
@@ -284,8 +321,11 @@ mod tests {
         let fc = FileConfig {
             general: FileGeneral {
                 theme: Some("vellum".to_string()),
+                shell: None,
             },
             block: FileBlock::default(),
+            backdrop: FileBackdrop::default(),
+            font: FileFont::default(),
         };
         let cfg = parse_config(&args(&["--theme", "obsidian"]), Some(&fc)).unwrap();
         assert_eq!(cfg.theme.map(|t| t.name), Some("obsidian"));
@@ -296,8 +336,11 @@ mod tests {
         let fc = FileConfig {
             general: FileGeneral {
                 theme: Some("nope".to_string()),
+                shell: None,
             },
             block: FileBlock::default(),
+            backdrop: FileBackdrop::default(),
+            font: FileFont::default(),
         };
         assert!(parse_config(&args(&[]), Some(&fc)).is_err());
     }
@@ -364,11 +407,72 @@ mode = "off"
     #[test]
     fn block_mode_toml_invalid_rejected_at_parse_config() {
         let fc = FileConfig {
-            general: FileGeneral { theme: None },
+            general: FileGeneral {
+                theme: None,
+                shell: None,
+            },
             block: FileBlock {
                 mode: Some("nonsense".to_string()),
             },
+            backdrop: FileBackdrop::default(),
+            font: FileFont::default(),
         };
         assert!(parse_config(&args(&[]), Some(&fc)).is_err());
+    }
+
+    #[test]
+    fn file_config_backdrop_disabled_applied() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: None,
+                shell: None,
+            },
+            block: FileBlock::default(),
+            backdrop: FileBackdrop {
+                enabled: Some(false),
+            },
+            font: FileFont::default(),
+        };
+        let cfg = parse_config(&args(&[]), Some(&fc)).unwrap();
+        assert_eq!(cfg.backdrop_enabled, Some(false));
+    }
+
+    #[test]
+    fn file_config_shell_applied_when_cli_omits() {
+        let fc = FileConfig {
+            general: FileGeneral {
+                theme: None,
+                shell: Some("/bin/bash".to_string()),
+            },
+            block: FileBlock::default(),
+            backdrop: FileBackdrop::default(),
+            font: FileFont::default(),
+        };
+        // 단순 parse 성공만 확인 (Config 내부 shell은 SessionSpec 안)
+        let _ = parse_config(&args(&[]), Some(&fc)).unwrap();
+    }
+
+    #[test]
+    fn full_toml_schema_roundtrip() {
+        let raw = r#"
+[general]
+theme = "obsidian"
+shell = "/bin/zsh"
+
+[block]
+mode = "auto"
+
+[backdrop]
+enabled = true
+
+[font]
+size = 14.0
+"#;
+        let parsed: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.general.theme.as_deref(), Some("obsidian"));
+        assert_eq!(parsed.general.shell.as_deref(), Some("/bin/zsh"));
+        assert_eq!(parsed.block.mode.as_deref(), Some("auto"));
+        assert_eq!(parsed.backdrop.enabled, Some(true));
+        assert_eq!(parsed.font.size, Some(14.0));
     }
 }

@@ -206,6 +206,10 @@ pub struct Config {
     /// Block UI 렌더 모드. default Auto — OSC 133 수신 시 gutter/card visual ON.
     /// Off — 절대 visual ON 안 함. Phase 4b부터 실제 시각 분기.
     pub block_mode: BlockMode,
+    /// Phase 3 step 3: macOS NSVisualEffectView vibrancy backdrop 활성화.
+    /// None = default ON. env var `PJ001_NO_BACKDROP=1`이 더 우선 (escape hatch).
+    /// macOS 외 OS에서는 무의미.
+    pub backdrop_enabled: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -363,6 +367,7 @@ impl Config {
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),
+            backdrop_enabled: None,
         }
     }
 
@@ -378,6 +383,7 @@ impl Config {
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),
+            backdrop_enabled: None,
         }
     }
 
@@ -398,6 +404,12 @@ impl Config {
 
     pub fn with_theme(mut self, theme: ThemePalette) -> Self {
         self.theme = Some(theme);
+        self
+    }
+
+    /// Phase 3 step 3: macOS backdrop vibrancy 활성/비활성. None = default(ON).
+    pub fn with_backdrop_enabled(mut self, enabled: Option<bool>) -> Self {
+        self.backdrop_enabled = enabled;
         self
     }
 
@@ -1212,18 +1224,25 @@ impl App {
         ))
         .expect("AppState::new");
         state.window.focus_window();
-        // Phase 3 step 2b: NSVisualEffectView를 winit_view sibling으로 추가.
+        // Phase 3 step 2b/3: NSVisualEffectView를 winit_view sibling으로 추가.
         // M-P3-2a에서 WgpuOverlay sibling이 이미 attach됐고 wgpu surface는 별도 layer로
         // 생성됨. 이제 NSVE를 가장 뒤(Below) subview로 추가 → z-order: NSVE 아래, WgpuOverlay 위.
         // cell.bg.alpha < 1 영역에서 NSVE vibrancy가 비친다.
-        // PJ001_NO_BACKDROP=1 env로 vibrancy 비활성 가능 (회귀 escape hatch).
+        // 활성화 정책: PJ001_NO_BACKDROP=1 env > config.backdrop_enabled > default ON.
         #[cfg(target_os = "macos")]
-        let _backdrop_attach = if std::env::var("PJ001_NO_BACKDROP").is_err() {
-            let palette = state.renderer.palette();
-            macos_backdrop::attach_visual_effect(&state.window, &palette)
-        } else {
-            log::info!("macos_backdrop: skipped via PJ001_NO_BACKDROP env");
-            None
+        let _backdrop_attach = {
+            let env_off = std::env::var("PJ001_NO_BACKDROP").is_ok();
+            let config_off = matches!(self.config.backdrop_enabled, Some(false));
+            if env_off {
+                log::info!("macos_backdrop: skipped via PJ001_NO_BACKDROP env");
+                None
+            } else if config_off {
+                log::info!("macos_backdrop: skipped via config [backdrop] enabled=false");
+                None
+            } else {
+                let palette = state.renderer.palette();
+                macos_backdrop::attach_visual_effect(&state.window, &palette)
+            }
         };
         // IME 이벤트 활성화. winit 0.30.13에서 macOS set_ime_purpose는 no-op
         // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
@@ -5383,6 +5402,7 @@ mod tests {
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),
+            backdrop_enabled: None,
         };
 
         assert!(config.pane_specs().is_err());
@@ -5404,6 +5424,7 @@ mod tests {
             hooks: Hooks::default(),
             theme: None,
             block_mode: BlockMode::default(),
+            backdrop_enabled: None,
         };
 
         assert!(config.pane_specs().is_err());
