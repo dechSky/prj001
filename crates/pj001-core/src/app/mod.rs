@@ -1185,6 +1185,19 @@ struct MouseSelection {
 }
 
 /// Phase 5: viewport-local caret → abs caret. abs_row = top_visible_abs + viewport_row.
+/// Codex 5차 권: zombie 방지 — `open` spawn 후 별도 thread에서 wait + reap.
+/// open(1)이 launchd로 빠르게 종료하지만 parent가 reap 안 하면 zombie. thread는 wait 후 자동 종료.
+fn spawn_open_detached(arg: String) {
+    std::thread::spawn(move || {
+        match std::process::Command::new("open").arg(&arg).spawn() {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(e) => log::warn!("open spawn failed for {arg}: {e}"),
+        }
+    });
+}
+
 fn caret_to_abs(term: &Term, viewport_caret: (usize, usize)) -> (usize, usize) {
     let top_abs = term.top_visible_abs() as usize;
     (top_abs.saturating_add(viewport_caret.0), viewport_caret.1)
@@ -3689,9 +3702,7 @@ impl AppState {
             if let Some(uri) = term.hyperlink_uri_by_id(id).map(|u| u.to_string()) {
                 drop(term);
                 log::info!("hyperlink open (OSC 8): {}", uri);
-                if let Err(e) = std::process::Command::new("open").arg(&uri).spawn() {
-                    log::warn!("hyperlink open failed: {e}");
-                }
+                spawn_open_detached(uri);
                 return true;
             }
         }
@@ -3726,9 +3737,7 @@ impl AppState {
         drop(term);
         if let Some(url) = detect_url_at(&row_chars, wrap_target_col) {
             log::info!("hyperlink open (plain text): {}", url);
-            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
-                log::warn!("plain url open failed: {e}");
-            }
+            spawn_open_detached(url);
             return true;
         }
         false

@@ -8,12 +8,72 @@
 //! 6 menu: App / Shell / Edit / View / Window / Help.
 //! winit `App::resumed` 이후 한 번 호출. NSApp.mainMenu 교체.
 
+use std::sync::OnceLock;
+
+use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::runtime::Sel;
+use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::sel;
 use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
 use objc2_foundation::{MainThreadMarker, NSString};
+
+// Custom action handler — Help/Preferences 등 우리 명령. objc2 define_class!로 NSObject 서브
+// 클래스 만들고 NSMenuItem.target에 set. selector는 Pj001MenuTarget.{openHelp,openPreferences}.
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "Pj001MenuTarget"]
+    #[ivars = ()]
+    struct MenuTarget;
+
+    impl MenuTarget {
+        #[unsafe(method(openHelp:))]
+        fn open_help(&self, _sender: *mut NSObject) {
+            // README URL — 다른 OS의 menu에선 Help는 docs 페이지. pj001은 repo README.
+            spawn_open("https://github.com/dechSky/prj001");
+            log::info!("menu: Help → open repo README");
+        }
+
+        #[unsafe(method(openPreferences:))]
+        fn open_preferences(&self, _sender: *mut NSObject) {
+            let Some(home) = std::env::var_os("HOME") else {
+                log::warn!("menu: Preferences — HOME unset");
+                return;
+            };
+            let path = std::path::PathBuf::from(home).join(".config/pj001/config.toml");
+            spawn_open(path.to_str().unwrap_or(""));
+            log::info!("menu: Preferences → open {}", path.display());
+        }
+    }
+);
+
+/// `open` 명령 + Codex 5차 권: zombie 방지 위해 별도 thread에서 wait. open(1)은 launchd로
+/// 즉시 종료하지만 parent가 reap 안 하면 zombie 가능성. thread::spawn은 wait 후 종료.
+fn spawn_open(arg: &str) {
+    let arg = arg.to_string();
+    std::thread::spawn(move || {
+        if let Ok(mut child) = std::process::Command::new("open").arg(&arg).spawn() {
+            let _ = child.wait();
+        }
+    });
+}
+
+// 단일 NSObject instance를 OnceLock에 보관. main thread 전용이라 raw pointer로.
+// NSObject는 NSApplication과 동일 lifetime이라 leak OK.
+// SAFETY invariant (Codex 5차 권): 이 static은 module-private이고 오직
+// `menu_target(MainThreadMarker)` 경유로만 deref. usize Send/Sync 우회는 ObjC object
+// thread-affinity를 컴파일러 보호 해제하므로 외부에서 raw로 꺼내지 말 것.
+static MENU_TARGET: OnceLock<usize> = OnceLock::new();
+
+fn menu_target(mtm: MainThreadMarker) -> *mut NSObject {
+    let ptr = *MENU_TARGET.get_or_init(|| {
+        let alloc = mtm.alloc::<MenuTarget>().set_ivars(());
+        let target: Retained<MenuTarget> = unsafe { msg_send![super(alloc), init] };
+        // Retained → into_raw로 leak (NSApp과 동일 lifetime, drop 안 함).
+        Retained::into_raw(target) as usize
+    });
+    ptr as *mut NSObject
+}
 
 /// macOS 상단 menu bar 부착. 호출 시점: winit Window 생성 후 (NSApp 활성 상태).
 /// 중복 호출 안전 — setMainMenu가 idempotent하게 교체.
@@ -39,14 +99,17 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         );
         app_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Preferences placeholder — selector 없음(disabled visual). Cmd+, hint만.
+        // Preferences — custom target action. ~/.config/pj001/config.toml을 system editor로 open.
         let prefs = make_item(
             mtm,
             "Preferences…",
-            None,
+            Some(sel!(openPreferences:)),
             ",",
             NSEventModifierFlags::Command,
         );
+        let target_ptr = menu_target(mtm);
+        let target_obj: &AnyObject = &*(target_ptr as *mut AnyObject);
+        prefs.setTarget(Some(target_obj));
         app_menu.addItem(&prefs);
 
         app_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -265,13 +328,17 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
 
         // ── Help menu ───────────────────────────────────────────────────────────
         let help_menu = NSMenu::new(mtm); help_menu.setAutoenablesItems(false);
-        help_menu.addItem(&make_item(
+        let help_item = make_item(
             mtm,
             "pj001 Help",
-            None,
+            Some(sel!(openHelp:)),
             "?",
             NSEventModifierFlags::Command,
-        ));
+        );
+        let target_ptr = menu_target(mtm);
+        let target_obj: &AnyObject = &*(target_ptr as *mut AnyObject);
+        help_item.setTarget(Some(target_obj));
+        help_menu.addItem(&help_item);
         attach_submenu(mtm, &main, "Help", &help_menu);
         // Apple Help search 활성화.
         app.setHelpMenu(Some(&help_menu));
