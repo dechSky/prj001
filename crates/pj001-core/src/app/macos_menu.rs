@@ -100,6 +100,32 @@ define_class!(
                 return;
             };
             let path = std::path::PathBuf::from(home).join(".config/pj001/config.toml");
+            // config.toml이 없으면 default를 생성해서 열기 — 사용자가 빈 파일 보지 않게.
+            if !path.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let default_config = "# pj001 config — schema: https://github.com/dechSky/prj001/blob/main/docs/config-schema.md\n\
+                    \n\
+                    [general]\n\
+                    # theme = \"obsidian\"  # aurora | obsidian | vellum | holo | bento | crystal\n\
+                    # shell = \"/bin/zsh\"\n\
+                    \n\
+                    [backdrop]\n\
+                    enabled = true\n\
+                    \n\
+                    [bell]\n\
+                    visible = true\n\
+                    audible = false\n\
+                    \n\
+                    [font]\n\
+                    # size = 14.0\n\
+                    \n\
+                    [block]\n\
+                    mode = \"auto\"\n";
+                let _ = std::fs::write(&path, default_config);
+                log::info!("menu: Preferences — config.toml not found, created default");
+            }
             spawn_open(path.to_str().unwrap_or(""));
             log::info!("menu: Preferences → open {}", path.display());
         }
