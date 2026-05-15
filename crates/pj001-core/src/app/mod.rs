@@ -538,6 +538,9 @@ impl App {
         self.active_window.and_then(|id| self.windows.get_mut(&id))
     }
     /// 현재 활성 윈도우의 WindowState immutable ref.
+    /// M-W-5 1차 fix: 직접 사용 site는 현재 없음 (BEL OR 집계로 active 의존 제거),
+    /// 추후 status bar / focus inspection 등에 활용 예정.
+    #[allow(dead_code)]
     fn active_state(&self) -> Option<&WindowState> {
         self.active_window.and_then(|id| self.windows.get(&id))
     }
@@ -918,6 +921,36 @@ enum CloseDecision {
     ClosePane,
     CloseTab,
     Exit,
+}
+
+/// M-W-5: `WindowState::tick`이 반환하는 다음 wake-up 요청.
+/// `App::about_to_wait`이 모든 윈도우의 결과를 fold해 단일 `ControlFlow`로 변환.
+///
+/// Fold 정책:
+/// - 어느 하나라도 `Poll` → `ControlFlow::Poll`
+/// - 그 외엔 `At(t)` 중 가장 이른 시각 → `ControlFlow::WaitUntil(t)`
+/// - 전부 `Idle` → `ControlFlow::Wait`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowNextWake {
+    /// 즉시 다음 cycle도 깨움. bell flash fade 같이 매 frame redraw가 필요한 경우.
+    Poll,
+    /// 해당 시각에 깨움. cursor blink, quick_spawn deadline, auto-scroll 50ms 등.
+    At(Instant),
+    /// 깨울 필요 없음. focus 없고 timing 항목 모두 비활성.
+    Idle,
+}
+
+impl WindowNextWake {
+    /// 두 wake 요청 중 더 빠른(우선) 쪽을 선택. Poll > At(t) > Idle.
+    fn merge(self, other: WindowNextWake) -> WindowNextWake {
+        match (self, other) {
+            (WindowNextWake::Poll, _) | (_, WindowNextWake::Poll) => WindowNextWake::Poll,
+            (WindowNextWake::At(a), WindowNextWake::At(b)) => WindowNextWake::At(a.min(b)),
+            (WindowNextWake::At(t), WindowNextWake::Idle)
+            | (WindowNextWake::Idle, WindowNextWake::At(t)) => WindowNextWake::At(t),
+            (WindowNextWake::Idle, WindowNextWake::Idle) => WindowNextWake::Idle,
+        }
+    }
 }
 
 fn close_decision(shortcut: CmdShortcut, pane_count: usize, tab_count: usize) -> CloseDecision {
@@ -2238,11 +2271,16 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // Codex 10차 Critical 2: bell drain은 모든 윈도우 순회 (background 윈도우의 BEL도 처리).
-        // 그 외 timing (pending_resize/blink/auto-scroll)은 1차 cut에서 active만 — 다음 cut.
+        // M-W-5 Codex 1차 개선: visible/audible은 BEL을 울린 윈도우들의 설정을 OR 집계.
+        // (현재 Config 일괄이라 실 회귀 아님 — per-window override 도입 시 정확성.)
         let mut bells: Vec<winit::window::WindowId> = Vec::new();
+        let mut bell_visible_any = false;
+        let mut bell_audible_any = false;
         for (&id, state) in self.windows.iter_mut() {
             if state.drain_bell_pending() {
                 bells.push(id);
+                bell_visible_any |= state.bell_visible;
+                bell_audible_any |= state.bell_audible;
                 if state.bell_visible {
                     state.last_bell_at = Some(Instant::now());
                     state.window.request_redraw();
@@ -2250,90 +2288,33 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         if !bells.is_empty() {
-            let visible = self
-                .active_state()
-                .map(|s| s.bell_visible)
-                .unwrap_or(true);
-            let audible = self
-                .active_state()
-                .map(|s| s.bell_audible)
-                .unwrap_or(false);
             #[cfg(target_os = "macos")]
             {
-                if visible {
+                if bell_visible_any {
                     macos_bell::request_user_attention();
                 }
-                if audible {
+                if bell_audible_any {
                     macos_bell::ns_beep();
                 }
             }
-            log::info!("BEL → visible={visible} audible={audible} windows={:?}", bells);
+            log::info!(
+                "BEL → visible={bell_visible_any} audible={bell_audible_any} windows={:?}",
+                bells
+            );
         }
-        let Some(state) = self.active_state_mut() else {
-            return;
-        };
-        // Bell flash fade — 250ms 동안 1.0 → 0.0. 활성 중에는 매 frame redraw.
-        // bell drain은 위 모든 윈도우 순회로 옮김 (Codex 10차 Critical 2). active 윈도우만 flash.
-        if let Some(start) = state.last_bell_at {
-            let elapsed = start.elapsed().as_secs_f32();
-            const BELL_FLASH_DURATION: f32 = 0.25;
-            if elapsed >= BELL_FLASH_DURATION {
-                state.renderer.set_bell_flash(&state.queue, 0.0);
-                state.last_bell_at = None;
-            } else {
-                let intensity = 1.0 - (elapsed / BELL_FLASH_DURATION);
-                state.renderer.set_bell_flash(&state.queue, intensity);
-                state.window.request_redraw();
-                event_loop.set_control_flow(ControlFlow::Poll);
-            }
-        }
-        // M17-5: 누적된 resize를 한 번만 처리.
-        if let Some(size) = state.pending_resize.take() {
-            state.resize(size);
-        }
-        if state.quick_spawn_timed_out() {
-            state.cancel_quick_spawn("timeout");
-        }
-        let quick_spawn_deadline = state.quick_spawn_deadline();
-        // 깜빡임 정지 조건:
-        // - 창 비활성 (focused=false)
-        // - cursor.blinking=false (DECSCUSR steady)
-        // 정지 시 cursor_visible=true 유지 (계속 보임), Wait로 idle.
-        if !state.focused || !state.cursor_blinking_cache {
-            if !state.cursor_visible {
-                state.cursor_visible = true;
-                state.window.request_redraw();
-            }
-            if let Some(deadline) = quick_spawn_deadline {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            } else {
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            return;
-        }
-        let blink = Duration::from_millis(CURSOR_BLINK_MS);
+        // M-W-5: timing (bell flash fade / pending_resize / quick_spawn / cursor blink / auto-scroll)을
+        // 모든 윈도우 자체적으로 처리. ControlFlow는 모든 윈도우 wake 요청을 fold.
+        // Codex 1차 개선: 단일 now를 모든 tick이 공유 — 결정성/테스트성.
         let now = Instant::now();
-        let mut next = if now.duration_since(state.last_blink) >= blink {
-            state.cursor_visible = !state.cursor_visible;
-            state.last_blink = now;
-            state.window.request_redraw();
-            now + blink
-        } else {
-            state.last_blink + blink
-        };
-        if let Some(deadline) = quick_spawn_deadline {
-            next = next.min(deadline);
+        let mut next = WindowNextWake::Idle;
+        for state in self.windows.values_mut() {
+            next = next.merge(state.tick_at(now));
         }
-        // Phase 5: continuous auto-scroll — drag 중 마우스 viewport 밖이면 마우스 멈춰 있어도
-        // 50ms마다 sticky scroll. update_selection_to_mouse가 자체 throttle 처리.
-        if state.is_auto_scrolling() {
-            if state.update_selection_to_mouse() {
-                state.window.request_redraw();
-            }
-            let scroll_next = Instant::now() + Duration::from_millis(50);
-            next = next.min(scroll_next);
+        match next {
+            WindowNextWake::Poll => event_loop.set_control_flow(ControlFlow::Poll),
+            WindowNextWake::At(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            WindowNextWake::Idle => event_loop.set_control_flow(ControlFlow::Wait),
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -3033,9 +3014,10 @@ impl WindowState {
         true
     }
 
-    fn quick_spawn_timed_out(&self) -> bool {
+    /// M-W-5 Codex 2차: 시간 주입 — `about_to_wait`의 단일 `now`를 공유 (결정성/테스트성).
+    fn quick_spawn_timed_out_at(&self, now: Instant) -> bool {
         self.pending_quick_spawn
-            .is_some_and(|started_at| quick_spawn_elapsed_timed_out(started_at, Instant::now()))
+            .is_some_and(|started_at| quick_spawn_elapsed_timed_out(started_at, now))
     }
 
     fn quick_spawn_deadline(&self) -> Option<Instant> {
@@ -3796,6 +3778,87 @@ impl WindowState {
         }
     }
 
+    /// M-W-5: 한 윈도우의 timing 처리 + 다음 wake-up 요청 반환.
+    ///
+    /// 처리 대상 (자기 윈도우 한정):
+    /// - bell flash fade (250ms 동안 1.0 → 0.0)
+    /// - pending_resize 누적 처리 (winit Resized burst coalesce)
+    /// - quick_spawn timeout
+    /// - cursor blink (focused 윈도우만)
+    /// - continuous auto-scroll (drag 중 50ms throttle)
+    ///
+    /// bell drain은 호출자(`App::about_to_wait`)에서 모든 윈도우 일괄 처리하므로 여기 포함 X.
+    ///
+    /// Codex M-W-5 1차 개선: `now` 외부 주입 — 한 cycle 내 모든 윈도우가 동일 시각 기준.
+    /// 결정성/테스트성 향상.
+    fn tick_at(&mut self, now: Instant) -> WindowNextWake {
+        let mut next = WindowNextWake::Idle;
+
+        // Bell flash fade — active/background 무관, 자기 윈도우의 flash가 진행 중이면 fade.
+        if let Some(start) = self.last_bell_at {
+            let elapsed = now.saturating_duration_since(start).as_secs_f32();
+            const BELL_FLASH_DURATION: f32 = 0.25;
+            if elapsed >= BELL_FLASH_DURATION {
+                self.renderer.set_bell_flash(&self.queue, 0.0);
+                self.last_bell_at = None;
+            } else {
+                let intensity = 1.0 - (elapsed / BELL_FLASH_DURATION);
+                self.renderer.set_bell_flash(&self.queue, intensity);
+                self.window.request_redraw();
+                next = next.merge(WindowNextWake::Poll);
+            }
+        }
+
+        // M17-5: 누적된 resize를 한 번만 처리.
+        if let Some(size) = self.pending_resize.take() {
+            self.resize(size);
+        }
+
+        // Quick spawn deadline timeout. now 외부 주입 — Codex M-W-5 2차.
+        if self.quick_spawn_timed_out_at(now) {
+            self.cancel_quick_spawn("timeout");
+        }
+        let quick_spawn_deadline = self.quick_spawn_deadline();
+
+        // Cursor blink — focused + cursor_blinking_cache=true 인 윈도우만.
+        // 비활성/steady 윈도우는 cursor_visible=true 유지 + blink 정지.
+        if !self.focused || !self.cursor_blinking_cache {
+            if !self.cursor_visible {
+                self.cursor_visible = true;
+                self.window.request_redraw();
+            }
+            if let Some(deadline) = quick_spawn_deadline {
+                next = next.merge(WindowNextWake::At(deadline));
+            }
+        } else {
+            let blink = Duration::from_millis(CURSOR_BLINK_MS);
+            let next_blink = if now.saturating_duration_since(self.last_blink) >= blink {
+                self.cursor_visible = !self.cursor_visible;
+                self.last_blink = now;
+                self.window.request_redraw();
+                now + blink
+            } else {
+                self.last_blink + blink
+            };
+            next = next.merge(WindowNextWake::At(next_blink));
+            if let Some(deadline) = quick_spawn_deadline {
+                next = next.merge(WindowNextWake::At(deadline));
+            }
+        }
+
+        // Phase 5: continuous auto-scroll — drag 중 마우스 viewport 밖이면 50ms마다 sticky scroll.
+        // Codex M-W-5 2차: throttle 결정이 같은 cycle의 now 기준 — scroll_next와 정합.
+        if self.is_auto_scrolling() {
+            if self.update_selection_to_mouse_at(now) {
+                self.window.request_redraw();
+            }
+            let scroll_next = now + Duration::from_millis(50);
+            next = next.merge(WindowNextWake::At(scroll_next));
+        }
+
+        next
+    }
+
     /// Phase 5: continuous auto-scroll 활성 조건 — selection.dragging + 마우스 viewport 밖.
     /// about_to_wait가 매 50ms 호출해 sticky scroll 유지.
     fn is_auto_scrolling(&self) -> bool {
@@ -3823,6 +3886,11 @@ impl WindowState {
     }
 
     fn update_selection_to_mouse(&mut self) -> bool {
+        self.update_selection_to_mouse_at(Instant::now())
+    }
+
+    /// M-W-5 Codex 2차: 시간 주입 버전. throttle 결정이 `about_to_wait` cycle의 단일 `now` 기준.
+    fn update_selection_to_mouse_at(&mut self, now: Instant) -> bool {
         // Phase 2 caret 모델: dragging 중에만 mouse caret 위치로 head 갱신.
         // caret 모델은 cell A↔A+1 사이 boundary로 head가 잡혀 한 글자 선택은 cell의
         // 왼쪽 절반→오른쪽 절반 drag로 자연스럽게 시작. dragged_off_anchor latch 불필요.
@@ -3866,12 +3934,12 @@ impl WindowState {
         if scroll_delta != 0 {
             // Phase 5: throttle — 50ms 간격으로만 scroll. 마우스 빨리 움직여도 over-scroll 방지
             // + about_to_wait sticky scroll에서 같은 throttle 재사용 (continuous scroll).
+            // M-W-5 Codex 2차: now 외부 주입 — 같은 cycle의 다른 timing과 일관.
             const SCROLL_THROTTLE_MS: u64 = 50;
-            let now = Instant::now();
             let throttle_ok = self
                 .last_auto_scroll_at
                 .map_or(true, |last| {
-                    now.duration_since(last) >= Duration::from_millis(SCROLL_THROTTLE_MS)
+                    now.saturating_duration_since(last) >= Duration::from_millis(SCROLL_THROTTLE_MS)
                 });
             if throttle_ok {
                 if let Some(sid) = session_id_for_scroll {
@@ -4960,6 +5028,91 @@ mod tests {
     fn physical_font_size_scales_logical_default() {
         assert_eq!(physical_font_size(14.0, 1.0), 14.0);
         assert_eq!(physical_font_size(14.0, 2.0), 28.0);
+    }
+
+    /// M-W-5: WindowNextWake fold 정책.
+    ///
+    /// - 어느 한쪽이 Poll이면 결과도 Poll (즉시 다음 cycle).
+    /// - At(a)와 At(b) merge는 더 이른 쪽.
+    /// - Idle과 At(t) merge는 At(t).
+    /// - 둘 다 Idle이면 Idle.
+    #[test]
+    fn window_next_wake_merge_poll_dominates() {
+        let t = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            WindowNextWake::Poll.merge(WindowNextWake::At(t)),
+            WindowNextWake::Poll
+        );
+        assert_eq!(
+            WindowNextWake::At(t).merge(WindowNextWake::Poll),
+            WindowNextWake::Poll
+        );
+        assert_eq!(
+            WindowNextWake::Idle.merge(WindowNextWake::Poll),
+            WindowNextWake::Poll
+        );
+        assert_eq!(
+            WindowNextWake::Poll.merge(WindowNextWake::Idle),
+            WindowNextWake::Poll
+        );
+    }
+
+    #[test]
+    fn window_next_wake_merge_takes_earliest_at() {
+        let now = Instant::now();
+        let earlier = now + Duration::from_millis(100);
+        let later = now + Duration::from_millis(500);
+        assert_eq!(
+            WindowNextWake::At(earlier).merge(WindowNextWake::At(later)),
+            WindowNextWake::At(earlier)
+        );
+        assert_eq!(
+            WindowNextWake::At(later).merge(WindowNextWake::At(earlier)),
+            WindowNextWake::At(earlier)
+        );
+    }
+
+    #[test]
+    fn window_next_wake_idle_yields_to_at_and_self() {
+        let t = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            WindowNextWake::Idle.merge(WindowNextWake::At(t)),
+            WindowNextWake::At(t)
+        );
+        assert_eq!(
+            WindowNextWake::At(t).merge(WindowNextWake::Idle),
+            WindowNextWake::At(t)
+        );
+        assert_eq!(
+            WindowNextWake::Idle.merge(WindowNextWake::Idle),
+            WindowNextWake::Idle
+        );
+    }
+
+    /// 다중 윈도우 fold 시뮬레이션. 한 윈도우 Poll + 다른 At(t) + 또 다른 Idle → Poll.
+    #[test]
+    fn window_next_wake_fold_across_multiple_windows() {
+        let now = Instant::now();
+        let t1 = now + Duration::from_millis(200);
+        let t2 = now + Duration::from_millis(50);
+
+        // 시나리오 1: At + At + Idle → 더 이른 At.
+        let r = WindowNextWake::Idle
+            .merge(WindowNextWake::At(t1))
+            .merge(WindowNextWake::At(t2));
+        assert_eq!(r, WindowNextWake::At(t2));
+
+        // 시나리오 2: Poll 끼면 항상 Poll.
+        let r = WindowNextWake::Idle
+            .merge(WindowNextWake::At(t1))
+            .merge(WindowNextWake::Poll);
+        assert_eq!(r, WindowNextWake::Poll);
+
+        // 시나리오 3: 전부 Idle → Idle.
+        let r = WindowNextWake::Idle
+            .merge(WindowNextWake::Idle)
+            .merge(WindowNextWake::Idle);
+        assert_eq!(r, WindowNextWake::Idle);
     }
 
     #[test]
