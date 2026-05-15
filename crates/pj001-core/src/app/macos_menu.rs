@@ -247,6 +247,14 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         edit_menu.addItem(&make_command_item(
             mtm, "Find…", "f", NSEventModifierFlags::Command, AppMenuCommand::Find,
         ));
+        edit_menu.addItem(&make_command_item(
+            mtm, "Find Next", "g", NSEventModifierFlags::Command, AppMenuCommand::FindNext,
+        ));
+        edit_menu.addItem(&make_command_item(
+            mtm, "Find Previous", "g",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::FindPrev,
+        ));
         edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
         edit_menu.addItem(&make_command_item(
             mtm, "Clear Buffer", "k", NSEventModifierFlags::Command,

@@ -31,6 +31,9 @@ pub enum AppMenuCommand {
     Find = 13,
     ClearBuffer = 14,
     ClearScrollback = 15,
+    /// macOS 표준 Cmd+G / Cmd+Shift+G.
+    FindNext = 16,
+    FindPrev = 17,
     // View
     ZoomIn = 20,
     ZoomOut = 21,
@@ -56,6 +59,8 @@ impl AppMenuCommand {
             13 => Self::Find,
             14 => Self::ClearBuffer,
             15 => Self::ClearScrollback,
+            16 => Self::FindNext,
+            17 => Self::FindPrev,
             20 => Self::ZoomIn,
             21 => Self::ZoomOut,
             22 => Self::ZoomReset,
@@ -140,6 +145,8 @@ mod tests {
             AppMenuCommand::Find,
             AppMenuCommand::ClearBuffer,
             AppMenuCommand::ClearScrollback,
+            AppMenuCommand::FindNext,
+            AppMenuCommand::FindPrev,
             AppMenuCommand::ZoomIn,
             AppMenuCommand::ZoomOut,
             AppMenuCommand::ZoomReset,

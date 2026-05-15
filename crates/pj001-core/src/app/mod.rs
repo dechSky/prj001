@@ -856,6 +856,9 @@ enum CmdShortcut {
     ClearScrollback,
     /// 슬라이스 6.5: Cmd+F find.
     Find,
+    /// macOS 표준 Cmd+G — find 모드 안이 아니어도 단독으로 다음/이전 매치로.
+    FindNext,
+    FindPrev,
     /// Phase 5: Cmd+A — 활성 pane의 scrollback+viewport 전체 selection.
     SelectAll,
 }
@@ -974,6 +977,14 @@ fn cmd_shortcut(
     }
     if lower == Some("f") || physical_code == Some(KeyCode::KeyF) {
         return Some(CmdShortcut::Find);
+    }
+    // macOS 표준 Cmd+G/Cmd+Shift+G — find next/prev (find 모드 밖에서도).
+    if lower == Some("g") || physical_code == Some(KeyCode::KeyG) {
+        return Some(if shift {
+            CmdShortcut::FindPrev
+        } else {
+            CmdShortcut::FindNext
+        });
     }
     if lower == Some("a") || physical_code == Some(KeyCode::KeyA) {
         return Some(CmdShortcut::SelectAll);
@@ -1957,6 +1968,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::Find) => {
                             state.start_find();
+                            return;
+                        }
+                        Some(CmdShortcut::FindNext) => {
+                            state.find_next();
+                            return;
+                        }
+                        Some(CmdShortcut::FindPrev) => {
+                            state.find_prev();
                             return;
                         }
                         Some(CmdShortcut::SelectAll) => {
@@ -4040,6 +4059,8 @@ impl AppState {
             M::Paste => self.handle_paste(),
             M::SelectAll => self.handle_select_all(),
             M::Find => self.start_find(),
+            M::FindNext => self.find_next(),
+            M::FindPrev => self.find_prev(),
             M::ClearBuffer => self.clear_active_buffer(false),
             M::ClearScrollback => self.clear_active_buffer(true),
             M::ZoomIn => self.set_logical_font_size(self.logical_font_size + FONT_SIZE_STEP),
@@ -5521,6 +5542,15 @@ mod tests {
         assert_eq!(
             cmd_shortcut(Some("f"), Some(KeyCode::KeyF), false, false),
             Some(CmdShortcut::Find)
+        );
+        // Codex 7차 권: Cmd+G / Cmd+Shift+G — macOS 표준 find next/prev.
+        assert_eq!(
+            cmd_shortcut(Some("g"), Some(KeyCode::KeyG), false, false),
+            Some(CmdShortcut::FindNext)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("g"), Some(KeyCode::KeyG), true, false),
+            Some(CmdShortcut::FindPrev)
         );
     }
 
