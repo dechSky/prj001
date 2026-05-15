@@ -11,6 +11,8 @@ mod macos_ime;
 mod macos_menu;
 #[cfg(target_os = "macos")]
 mod macos_overlay;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod session;
 
 use std::collections::HashMap;
@@ -48,6 +50,7 @@ const MIN_WINDOW_HEIGHT: u32 = 420;
 const MIN_PANE_COLS: usize = 30;
 const MIN_PANE_ROWS: usize = 5;
 const TAB_BAR_ROWS: usize = 1;
+const USE_NATIVE_OS_TABS: bool = cfg!(target_os = "macos");
 const CURSOR_BLINK_MS: u64 = 500;
 const QUICK_SPAWN_TIMEOUT_MS: u64 = 3_000;
 const MULTI_CLICK_MS: u64 = 500;
@@ -581,15 +584,6 @@ impl App {
         self.windows.values_mut()
     }
 
-    /// Codex 10차 Critical 1: SessionId 보유 윈도우의 WindowState 찾기.
-    /// SessionId는 각 윈도우의 IdAllocator가 0부터 발급해 글로벌 unique 아님.
-    /// PTY UserEvent(SessionRepaint/Exited/PtyError) routing 시 reverse lookup 필요.
-    fn find_state_by_session(&self, session_id: SessionId) -> Option<&WindowState> {
-        self.windows.values().find(|s| s.sessions.contains_key(&session_id))
-    }
-    fn find_state_mut_by_session(&mut self, session_id: SessionId) -> Option<&mut WindowState> {
-        self.windows.values_mut().find(|s| s.sessions.contains_key(&session_id))
-    }
 }
 
 struct Pane {
@@ -926,12 +920,13 @@ enum CmdShortcut {
     NewWindow,
     NewTab,
     QuickSpawnStart,
-    RespawnSession,
     FontZoomIn,
     FontZoomOut,
     FontZoomReset,
-    ClosePaneOrTab,
+    CloseActive,
+    ClosePane,
     CloseTab,
+    CloseWindow,
     Quit,
     Copy,
     Paste,
@@ -948,9 +943,10 @@ enum CmdShortcut {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseDecision {
+    Noop,
     ClosePane,
     CloseTab,
-    Exit,
+    CloseWindow,
 }
 
 /// M-W-5: `WindowState::tick`이 반환하는 다음 wake-up 요청.
@@ -987,20 +983,28 @@ fn close_decision(shortcut: CmdShortcut, pane_count: usize, tab_count: usize) ->
     match shortcut {
         CmdShortcut::CloseTab => {
             if tab_count <= 1 {
-                CloseDecision::Exit
+                CloseDecision::CloseWindow
             } else {
                 CloseDecision::CloseTab
             }
         }
-        CmdShortcut::ClosePaneOrTab => {
+        CmdShortcut::CloseActive => {
             if pane_count > 1 {
                 CloseDecision::ClosePane
             } else if tab_count > 1 {
                 CloseDecision::CloseTab
             } else {
-                CloseDecision::Exit
+                CloseDecision::CloseWindow
             }
         }
+        CmdShortcut::ClosePane => {
+            if pane_count > 1 {
+                CloseDecision::ClosePane
+            } else {
+                CloseDecision::Noop
+            }
+        }
+        CmdShortcut::CloseWindow => CloseDecision::CloseWindow,
         _ => unreachable!("close_decision only accepts close shortcuts"),
     }
 }
@@ -1055,9 +1059,6 @@ fn cmd_shortcut(
             Some(CmdShortcut::NewWindow)
         };
     }
-    if lower == Some("r") || physical_code == Some(KeyCode::KeyR) {
-        return Some(CmdShortcut::RespawnSession);
-    }
     if lower == Some("k") || physical_code == Some(KeyCode::KeyK) {
         return Some(if shift {
             CmdShortcut::ClearScrollback
@@ -1077,10 +1078,12 @@ fn cmd_shortcut(
         return Some(CmdShortcut::FontZoomReset);
     }
     if lower == Some("w") || physical_code == Some(KeyCode::KeyW) {
-        return Some(if shift {
-            CmdShortcut::CloseTab
+        return Some(if alt {
+            CmdShortcut::ClosePane
+        } else if shift {
+            CmdShortcut::CloseWindow
         } else {
-            CmdShortcut::ClosePaneOrTab
+            CmdShortcut::CloseActive
         });
     }
     if lower == Some("q") || physical_code == Some(KeyCode::KeyQ) {
@@ -1115,17 +1118,18 @@ fn compute_tab_viewports(
     cell: crate::render::CellMetrics,
     gutter_px: u32,
 ) -> HashMap<PaneId, PaneViewport> {
+    let tab_bar_rows = app_tab_bar_rows();
     let content_size = tab_content_size(size, cell);
     let mut layouts = layout::compute_viewports(root, content_size, cell);
     let cell_w = cell.width.max(1);
     let gutter_cells = gutter_px / cell_w;
     let gutter_px_aligned = gutter_cells * cell_w;
     for viewport in layouts.values_mut() {
-        viewport.row_offset += TAB_BAR_ROWS;
-        viewport.status_row = viewport.status_row.map(|row| row + TAB_BAR_ROWS);
+        viewport.row_offset += tab_bar_rows;
+        viewport.status_row = viewport.status_row.map(|row| row + tab_bar_rows);
         viewport.y_px = viewport
             .y_px
-            .saturating_add(cell.height * TAB_BAR_ROWS as u32);
+            .saturating_add(cell.height * tab_bar_rows as u32);
         // Phase 4b-1c: pane gutter 발동. cell.width 단위로 align.
         // 좌측 gutter — content cell이 우측으로 shift되어야 design §8 정합.
         // 4b-1c-fix: col_offset도 같이 +=gutter_cells. 없으면 cell 위치 그대로 두고
@@ -1221,6 +1225,14 @@ fn compute_block_gutter_px(
     raw.div_ceil(cell_w) * cell_w
 }
 
+fn app_tab_bar_rows() -> usize {
+    if USE_NATIVE_OS_TABS {
+        0
+    } else {
+        TAB_BAR_ROWS
+    }
+}
+
 fn tab_content_size(
     size: PhysicalSize<u32>,
     cell: crate::render::CellMetrics,
@@ -1228,7 +1240,7 @@ fn tab_content_size(
     PhysicalSize::new(
         size.width,
         size.height
-            .saturating_sub(cell.height * TAB_BAR_ROWS as u32),
+            .saturating_sub(cell.height * app_tab_bar_rows() as u32),
     )
 }
 
@@ -1450,7 +1462,7 @@ impl App {
     ///
     /// M-W-6 Codex 1차 개선: wgpu_shared guard를 window 생성 전에 — invariant를 코드로 고정.
     /// startup 전 NewWindow event가 들어와도 untracked NSWindow 생성 차단.
-    fn create_new_window(&mut self, event_loop: &ActiveEventLoop) {
+    fn create_new_window(&mut self, event_loop: &ActiveEventLoop, tab_with_active: bool) {
         // M-W-6: wgpu_shared invariant — finish_startup 이전엔 None. Cmd+N 무시.
         let Some(shared) = self.wgpu_shared.as_ref() else {
             log::warn!(
@@ -1458,7 +1470,23 @@ impl App {
             );
             return;
         };
-        log::info!("M-W-3: creating new window via Cmd+N");
+        let tab_base_window = if tab_with_active {
+            self.active_window
+                .and_then(|id| self.windows.get(&id))
+                .map(|state| state.window.clone())
+        } else {
+            None
+        };
+        let startup_cwd = if tab_with_active {
+            self.active_state().and_then(WindowState::active_cwd)
+        } else {
+            None
+        };
+        log::info!(
+            "M-W-3: creating new {} via shortcut/menu cwd={:?}",
+            if tab_base_window.is_some() { "tab" } else { "window" },
+            startup_cwd
+        );
         let attrs = Window::default_attributes()
             .with_title("pj001")
             .with_transparent(true)
@@ -1486,6 +1514,7 @@ impl App {
             self.proxy.clone(),
             self.config.clone(),
             size,
+            startup_cwd,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1499,6 +1528,7 @@ impl App {
         state.window.set_ime_purpose(ImePurpose::Terminal);
         #[cfg(target_os = "macos")]
         {
+            macos_window::enable_native_tabbing(&state.window);
             // macOS backdrop attach — first-window path와 동일 분기 (env > config > default).
             let env_off = std::env::var("PJ001_NO_BACKDROP")
                 .ok()
@@ -1520,8 +1550,41 @@ impl App {
         let window_id = window.id();
         self.windows.insert(window_id, state);
         self.active_window = Some(window_id);
+        #[cfg(target_os = "macos")]
+        if let Some(base) = tab_base_window {
+            macos_window::add_window_as_tab(&base, &window);
+        }
+        #[cfg(target_os = "macos")]
+        self.refresh_all_window_titles();
         window.request_redraw();
         log::info!("M-W-3: new window {window_id:?} created, total windows={}", self.windows.len());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_all_window_titles(&self) {
+        for state in self.windows.values() {
+            state.refresh_window_title();
+        }
+    }
+
+    fn close_window(
+        &mut self,
+        window_id: winit::window::WindowId,
+        label: &str,
+    ) {
+        if self.windows.remove(&window_id).is_none() {
+            log::debug!("{label}: ignored unknown window {window_id:?}");
+            return;
+        }
+        if Some(window_id) == self.active_window {
+            self.active_window = self.windows.keys().next().copied();
+        }
+        #[cfg(target_os = "macos")]
+        self.refresh_all_window_titles();
+        log::info!(
+            "{label}: closed window {window_id:?}, remaining={}",
+            self.windows.len()
+        );
     }
 
     /// M12-5 회귀 fix v3: 첫 winit `Resized` 받은 후 그 size로 PTY spawn.
@@ -1593,6 +1656,8 @@ impl App {
         // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
         state.window.set_ime_allowed(true);
         state.window.set_ime_purpose(ImePurpose::Terminal);
+        #[cfg(target_os = "macos")]
+        macos_window::enable_native_tabbing(&state.window);
         // macOS first-key escape 워크어라운드 — NSTextInputContext.activate() 직접 호출로
         // IME를 즉시 wake-up. 입력 소스 전환 직후 첫 자모가 KeyboardInput으로 escape되는
         // winit 동작 회피 (Codex thread 019e2491).
@@ -1697,14 +1762,8 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match event {
             WindowEvent::CloseRequested => {
-                // Codex 10차 개선 5: 마지막 윈도우면 exit, 아니면 individual remove.
-                self.windows.remove(&window_id);
-                if Some(window_id) == self.active_window {
-                    self.active_window = self.windows.keys().next().copied();
-                }
-                if self.windows.is_empty() {
-                    event_loop.exit();
-                }
+                // M-W-7: native close button and shortcut/menu window close share policy.
+                self.close_window(window_id, "native close requested");
                 return;
             }
             WindowEvent::ModifiersChanged(mods) => {
@@ -2083,7 +2142,15 @@ impl ApplicationHandler<UserEvent> for App {
                         state.modifiers.alt_key(),
                     ) {
                         Some(CmdShortcut::TabOrdinal(ordinal)) => {
-                            state.focus_tab_by_ordinal(ordinal);
+                            if USE_NATIVE_OS_TABS {
+                                #[cfg(target_os = "macos")]
+                                macos_window::select_tab_at_index(
+                                    &state.window,
+                                    ordinal.saturating_sub(1),
+                                );
+                            } else {
+                                state.focus_tab_by_ordinal(ordinal);
+                            }
                             return;
                         }
                         Some(CmdShortcut::PaneOrdinal(ordinal)) => {
@@ -2091,11 +2158,21 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         Some(CmdShortcut::PrevTab) => {
-                            state.focus_adjacent_tab(false);
+                            if let Err(e) = self
+                                .proxy
+                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::PrevTab))
+                            {
+                                log::warn!("cmd+shift+[ PrevTab proxy send failed: {e:?}");
+                            }
                             return;
                         }
                         Some(CmdShortcut::NextTab) => {
-                            state.focus_adjacent_tab(true);
+                            if let Err(e) = self
+                                .proxy
+                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NextTab))
+                            {
+                                log::warn!("cmd+shift+] NextTab proxy send failed: {e:?}");
+                            }
                             return;
                         }
                         Some(CmdShortcut::PrevPane) => {
@@ -2119,8 +2196,11 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         Some(CmdShortcut::NewTab) => {
-                            if let Err(e) = state.create_tab() {
-                                log::warn!("cmd+t new tab failed: {e}");
+                            if let Err(e) = self
+                                .proxy
+                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NewTab))
+                            {
+                                log::warn!("cmd+t NewTab proxy send failed: {e:?}");
                             }
                             return;
                         }
@@ -2146,12 +2226,6 @@ impl ApplicationHandler<UserEvent> for App {
                             state.start_quick_spawn();
                             return;
                         }
-                        Some(CmdShortcut::RespawnSession) => {
-                            if let Err(e) = state.respawn_active() {
-                                log::warn!("cmd+r respawn failed: {e}");
-                            }
-                            return;
-                        }
                         Some(CmdShortcut::FontZoomIn) => {
                             state.set_logical_font_size(state.logical_font_size + FONT_SIZE_STEP);
                             return;
@@ -2166,25 +2240,45 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::CloseTab) => {
                             state.apply_close_decision(
-                                event_loop,
                                 close_decision(
                                     CmdShortcut::CloseTab,
                                     state.active_tab().panes.len(),
                                     state.tabs.len(),
                                 ),
-                                "cmd+shift+w",
+                                "cmd+w",
                             );
                             return;
                         }
-                        Some(CmdShortcut::ClosePaneOrTab) => {
+                        Some(CmdShortcut::CloseActive) => {
                             state.apply_close_decision(
-                                event_loop,
                                 close_decision(
-                                    CmdShortcut::ClosePaneOrTab,
+                                    CmdShortcut::CloseActive,
                                     state.active_tab().panes.len(),
                                     state.tabs.len(),
                                 ),
                                 "cmd+w",
+                            );
+                            return;
+                        }
+                        Some(CmdShortcut::ClosePane) => {
+                            state.apply_close_decision(
+                                close_decision(
+                                    CmdShortcut::ClosePane,
+                                    state.active_tab().panes.len(),
+                                    state.tabs.len(),
+                                ),
+                                "cmd+option+w",
+                            );
+                            return;
+                        }
+                        Some(CmdShortcut::CloseWindow) => {
+                            state.apply_close_decision(
+                                close_decision(
+                                    CmdShortcut::CloseWindow,
+                                    state.active_tab().panes.len(),
+                                    state.tabs.len(),
+                                ),
+                                "cmd+shift+w",
                             );
                             return;
                         }
@@ -2365,14 +2459,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::SessionRepaint(session_id) => {
+            UserEvent::SessionRepaint {
+                window_id,
+                session_id,
+            } => {
                 log::debug!("repaint requested by session {}", session_id.0);
-                if let Some(state) = self.find_state_by_session(session_id) {
+                if let Some(state) = self.windows.get(&window_id) {
                     // M12-4 design §3.3: 방어적 lookup. unknown session은 debug log + ignore.
                     if !state.sessions.contains_key(&session_id) {
                         log::debug!(
-                            "SessionRepaint for unknown session {:?}, ignore",
-                            session_id
+                            "SessionRepaint for unknown session {:?} in window {:?}, ignore",
+                            session_id,
+                            window_id
                         );
                         return;
                     }
@@ -2386,12 +2484,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::SessionExited { id, code } => {
+            UserEvent::SessionExited {
+                window_id,
+                id,
+                code,
+            } => {
                 log::info!("session {} child exited (code={code})", id.0);
-                // Codex 10차 Critical 1: SessionId 보유 윈도우로 라우팅. active 아닐 수도.
-                if let Some(state) = self.find_state_mut_by_session(id) {
+                let mut close_window = false;
+                if let Some(state) = self.windows.get_mut(&window_id) {
                     if !state.sessions.contains_key(&id) {
-                        log::debug!("SessionExited for unknown session {:?}, ignore", id);
+                        log::debug!(
+                            "SessionExited for unknown session {:?} in window {:?}, ignore",
+                            id,
+                            window_id
+                        );
                         return;
                     }
                     // Codex v2 권고: 단일 pane exit 분기 전에 session 상태 일관성 먼저.
@@ -2404,45 +2510,56 @@ impl ApplicationHandler<UserEvent> for App {
                         code,
                     });
                     if state.all_sessions_dead() {
-                        event_loop.exit();
-                        return;
-                    }
-                    let Some(tab_idx) = state.tab_index_for_session(id) else {
-                        state.window.request_redraw();
-                        return;
-                    };
-                    let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
-                    if state.tabs[tab_idx].panes.len() <= 1 {
-                        if state.tabs.len() <= 1 {
-                            event_loop.exit();
+                        close_window = true;
+                    } else {
+                        let Some(tab_idx) = state.tab_index_for_session(id) else {
+                            state.window.request_redraw();
+                            return;
+                        };
+                        let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
+                        if state.tabs[tab_idx].panes.len() <= 1 {
+                            if state.tabs.len() <= 1 {
+                                close_window = true;
+                            } else if tab_is_active {
+                                state.close_active_tab();
+                            } else {
+                                state.remove_tab_at(tab_idx);
+                                state.window.request_redraw();
+                            }
                         } else if tab_is_active {
-                            state.close_active_tab();
-                        } else {
-                            state.remove_tab_at(tab_idx);
+                            let active_session = state
+                                .active_tab()
+                                .panes
+                                .iter()
+                                .find(|p| p.id == state.active_tab().active)
+                                .map(|p| p.session);
+                            if active_session == Some(id) {
+                                if let Some(next) = state.next_alive_pane_id() {
+                                    state.set_active(next);
+                                }
+                            }
                             state.window.request_redraw();
                         }
-                    } else if tab_is_active {
-                        let active_session = state
-                            .active_tab()
-                            .panes
-                            .iter()
-                            .find(|p| p.id == state.active_tab().active)
-                            .map(|p| p.session);
-                        if active_session == Some(id) {
-                            if let Some(next) = state.next_alive_pane_id() {
-                                state.set_active(next);
-                            }
-                        }
-                        state.window.request_redraw();
                     }
                 }
+                if close_window {
+                    self.close_window(window_id, "session exited");
+                }
             }
-            UserEvent::SessionPtyError { id, message } => {
+            UserEvent::SessionPtyError {
+                window_id,
+                id,
+                message,
+            } => {
                 log::error!("session {} pty error: {message}", id.0);
-                // Codex 10차 Critical 1: SessionId 보유 윈도우로 라우팅.
-                if let Some(state) = self.find_state_mut_by_session(id) {
+                let mut close_window = false;
+                if let Some(state) = self.windows.get_mut(&window_id) {
                     if !state.sessions.contains_key(&id) {
-                        log::debug!("SessionPtyError for unknown session {:?}, ignore", id);
+                        log::debug!(
+                            "SessionPtyError for unknown session {:?} in window {:?}, ignore",
+                            id,
+                            window_id
+                        );
                         return;
                     }
                     // Codex v2 권고: session 상태 일관성 먼저.
@@ -2450,45 +2567,78 @@ impl ApplicationHandler<UserEvent> for App {
                         s.alive = false;
                     }
                     if state.all_sessions_dead() {
-                        event_loop.exit();
-                        return;
-                    }
-                    let Some(tab_idx) = state.tab_index_for_session(id) else {
-                        state.window.request_redraw();
-                        return;
-                    };
-                    let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
-                    if state.tabs[tab_idx].panes.len() <= 1 {
-                        if state.tabs.len() <= 1 {
-                            event_loop.exit();
+                        close_window = true;
+                    } else {
+                        let Some(tab_idx) = state.tab_index_for_session(id) else {
+                            state.window.request_redraw();
+                            return;
+                        };
+                        let tab_is_active = state.tabs[tab_idx].id == state.active_tab;
+                        if state.tabs[tab_idx].panes.len() <= 1 {
+                            if state.tabs.len() <= 1 {
+                                close_window = true;
+                            } else if tab_is_active {
+                                state.close_active_tab();
+                            } else {
+                                state.remove_tab_at(tab_idx);
+                                state.window.request_redraw();
+                            }
                         } else if tab_is_active {
-                            state.close_active_tab();
-                        } else {
-                            state.remove_tab_at(tab_idx);
+                            let active_session = state
+                                .active_tab()
+                                .panes
+                                .iter()
+                                .find(|p| p.id == state.active_tab().active)
+                                .map(|p| p.session);
+                            if active_session == Some(id) {
+                                if let Some(next) = state.next_alive_pane_id() {
+                                    state.set_active(next);
+                                }
+                            }
                             state.window.request_redraw();
                         }
-                    } else if tab_is_active {
-                        let active_session = state
-                            .active_tab()
-                            .panes
-                            .iter()
-                            .find(|p| p.id == state.active_tab().active)
-                            .map(|p| p.session);
-                        if active_session == Some(id) {
-                            if let Some(next) = state.next_alive_pane_id() {
-                                state.set_active(next);
-                            }
-                        }
-                        state.window.request_redraw();
                     }
+                }
+                if close_window {
+                    self.close_window(window_id, "session pty error");
                 }
             }
             UserEvent::MenuCommand(cmd) => {
                 use crate::app::event::AppMenuCommand as M;
                 match cmd {
-                    // M-W-3: NewWindow는 App level dispatch — event_loop 필요 +
-                    // self.windows mutate. WindowState method로 위임 불가.
-                    M::NewWindow => self.create_new_window(event_loop),
+                    M::NewTab => {
+                        if USE_NATIVE_OS_TABS {
+                            // macOS: user-visible tabs are NSWindow tabs.
+                            self.create_new_window(event_loop, true);
+                        } else if let Some(state) = self.active_state_mut() {
+                            if let Err(e) = state.create_tab() {
+                                log::warn!("menu NewTab failed: {e}");
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+                    M::NewWindow => self.create_new_window(event_loop, false),
+                    M::PrevTab => {
+                        if let Some(state) = self.active_state_mut() {
+                            #[cfg(target_os = "macos")]
+                            macos_window::select_previous_tab(&state.window);
+                            #[cfg(not(target_os = "macos"))]
+                            state.focus_adjacent_tab(false);
+                        }
+                    }
+                    M::NextTab => {
+                        if let Some(state) = self.active_state_mut() {
+                            #[cfg(target_os = "macos")]
+                            macos_window::select_next_tab(&state.window);
+                            #[cfg(not(target_os = "macos"))]
+                            state.focus_adjacent_tab(true);
+                        }
+                    }
+                    M::CloseWindow => {
+                        if let Some(window_id) = self.active_window {
+                            self.close_window(window_id, "menu close window");
+                        }
+                    }
                     other => {
                         if let Some(state) = self.active_state_mut() {
                             state.dispatch_menu_command(event_loop, other);
@@ -2499,8 +2649,66 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::CloseWindow(window_id) => {
+                self.close_window(window_id, "shortcut close window");
+            }
         }
     }
+}
+
+/// M-W-6.1: alpha mode 정책 fallback 순서. Codex 1차 개선: 정책을 const로 — 위치 추적/주석 연결.
+/// shader가 srgb space에서 RGBA 출력 → PostMultiplied 자연. Phase 3 step 1 정합.
+const ALPHA_MODE_FALLBACK_ORDER: &[wgpu::CompositeAlphaMode] = &[
+    wgpu::CompositeAlphaMode::PostMultiplied,
+    wgpu::CompositeAlphaMode::PreMultiplied,
+    wgpu::CompositeAlphaMode::Opaque,
+];
+
+/// M-W-6.1: surface format 선택 — preferred가 caps에 있으면 사용, 없으면 is_srgb 우선,
+/// 그것도 없으면 caps[0]. caps empty면 None (caller가 `Error::SurfaceIncompatible` 변환).
+///
+/// 첫 윈도우(preferred=None)와 두 번째 이후 윈도우(preferred=Some)가 같은 정책 공유.
+fn choose_surface_format(
+    formats: &[wgpu::TextureFormat],
+    preferred: Option<wgpu::TextureFormat>,
+) -> Option<wgpu::TextureFormat> {
+    if formats.is_empty() {
+        return None;
+    }
+    // Codex 1차 개선: 중첩 if let → filter 패턴 (clippy collapsible_if).
+    if let Some(p) = preferred.filter(|p| formats.contains(p)) {
+        return Some(p);
+    }
+    formats
+        .iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .or_else(|| formats.first().copied())
+}
+
+/// M-W-6.1: alpha mode 선택 — preferred가 caps에 있으면 사용, 없으면 `ALPHA_MODE_FALLBACK_ORDER` 순.
+/// caps empty면 None (wgpu docs상 통상 ≥1 보장이지만 방어).
+fn choose_alpha_mode(
+    modes: &[wgpu::CompositeAlphaMode],
+    preferred: Option<wgpu::CompositeAlphaMode>,
+) -> Option<wgpu::CompositeAlphaMode> {
+    if modes.is_empty() {
+        return None;
+    }
+    if let Some(p) = preferred.filter(|p| modes.contains(p)) {
+        return Some(p);
+    }
+    ALPHA_MODE_FALLBACK_ORDER
+        .iter()
+        .copied()
+        .find(|m| modes.contains(m))
+        .or_else(|| modes.first().copied())
+}
+
+/// M-W-6.1: present mode 선택 — 첫 element. caps empty면 None.
+/// caller가 caps empty면 `Error::SurfaceIncompatible` 변환.
+fn choose_present_mode(modes: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
+    modes.first().copied()
 }
 
 impl WindowState {
@@ -2610,6 +2818,23 @@ impl WindowState {
         self.active_tab_mut().title = title;
     }
 
+    fn set_window_title(&self, title: &str) {
+        #[cfg(target_os = "macos")]
+        if USE_NATIVE_OS_TABS
+            && let Some(ordinal) =
+                macos_window::tab_ordinal(&self.window).filter(|ordinal| *ordinal <= 9)
+        {
+            self.window.set_title(&format!("⌘{} {} — pj001", ordinal, title));
+            return;
+        }
+
+        self.window.set_title(&format!("{} — pj001", title));
+    }
+
+    fn refresh_window_title(&self) {
+        self.set_window_title(&self.active_tab().title);
+    }
+
     fn set_active(&mut self, id: PaneId) {
         let sessions = &self.sessions;
         let Some(new_idx) =
@@ -2632,7 +2857,7 @@ impl WindowState {
         let title = self.session_for_pane_idx(new_idx).title.clone();
         self.active_tab_mut().active = id;
         self.sync_active_tab_title(title.clone());
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.cursor_visible = true;
         self.last_ime_cursor = None;
         self.preedit = None;
@@ -2659,16 +2884,19 @@ impl WindowState {
 
     fn apply_close_decision(
         &mut self,
-        event_loop: &ActiveEventLoop,
         decision: CloseDecision,
         label: &str,
     ) {
         match decision {
+            CloseDecision::Noop => log::debug!("{label}: close ignored"),
             CloseDecision::ClosePane => self.close_active_pane(),
             CloseDecision::CloseTab => self.close_active_tab(),
-            CloseDecision::Exit => {
-                log::info!("{label}: exit last tab");
-                event_loop.exit();
+            CloseDecision::CloseWindow => {
+                let window_id = self.window.id();
+                log::info!("{label}: close current window {window_id:?}");
+                if self.proxy.send_event(UserEvent::CloseWindow(window_id)).is_err() {
+                    log::warn!("{label}: close window dispatch failed");
+                }
             }
         }
     }
@@ -2699,7 +2927,9 @@ impl WindowState {
             },
             term.clone(),
             self.proxy.clone(),
+            self.window.id(),
             session_id,
+            None,
         )?;
         let title = spec.title;
         self.sessions.insert(
@@ -2816,7 +3046,7 @@ impl WindowState {
     fn start_find(&mut self) {
         self.pending_find = Some(FindState::default());
         self.selection = None;
-        self.window.set_title("find: — pj001");
+        self.set_window_title("find:");
         self.window.request_redraw();
         log::info!("find mode: open");
     }
@@ -2825,7 +3055,7 @@ impl WindowState {
         self.pending_find = None;
         self.selection = None;
         let title = self.session_for_pane_idx(self.active_index()).title.clone();
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.window.request_redraw();
         log::info!("find mode: cancel");
     }
@@ -2834,8 +3064,8 @@ impl WindowState {
         if let Some(find) = self.pending_find.as_mut() {
             find.query.pop();
             find.last_match_abs = None;
-            self.window
-                .set_title(&format!("find: {} — pj001", find.query));
+            let title = format!("find: {}", find.query);
+            self.set_window_title(&title);
             self.find_apply_current_query(0, 0, true);
             self.window.request_redraw();
         }
@@ -2848,8 +3078,8 @@ impl WindowState {
         if let Some(find) = self.pending_find.as_mut() {
             find.query.push(ch);
             find.last_match_abs = None;
-            self.window
-                .set_title(&format!("find: {} — pj001", find.query));
+            let title = format!("find: {}", find.query);
+            self.set_window_title(&title);
             self.find_apply_current_query(0, 0, true);
             self.window.request_redraw();
         }
@@ -3012,7 +3242,7 @@ impl WindowState {
     fn start_quick_spawn(&mut self) {
         self.pending_quick_spawn = Some(Instant::now());
         let hint = quick_spawn_hint(&self.quick_spawn_presets);
-        self.window.set_title(&format!("{hint} — pj001"));
+        self.set_window_title(&hint);
         self.window.request_redraw();
         log::info!("quick spawn started: {hint}");
     }
@@ -3020,7 +3250,7 @@ impl WindowState {
     fn cancel_quick_spawn(&mut self, reason: &str) {
         self.pending_quick_spawn = None;
         let title = self.session_for_pane_idx(self.active_index()).title.clone();
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.window.request_redraw();
         log::info!("quick spawn canceled: {reason}");
     }
@@ -3055,7 +3285,7 @@ impl WindowState {
         if let Err(e) = self.split_active_with_spec(SplitAxis::Vertical, spec) {
             log::warn!("quick spawn failed: {e}");
             let title = self.session_for_pane_idx(self.active_index()).title.clone();
-            self.window.set_title(&format!("{} — pj001", title));
+            self.set_window_title(&title);
         }
         true
     }
@@ -3069,74 +3299,6 @@ impl WindowState {
     fn quick_spawn_deadline(&self) -> Option<Instant> {
         self.pending_quick_spawn
             .map(|started_at| started_at + Duration::from_millis(QUICK_SPAWN_TIMEOUT_MS))
-    }
-
-    fn respawn_active(&mut self) -> Result<()> {
-        let active_idx = self.active_index();
-        let pane_id = self.active_tab().panes[active_idx].id;
-        let old_session_id = self.active_tab().panes[active_idx].session;
-        let viewport = self.active_tab().panes[active_idx].viewport;
-        let Some(old_session) = self.sessions.get(&old_session_id) else {
-            log::warn!("respawn requested for missing session {}", old_session_id.0);
-            return Ok(());
-        };
-        let command = old_session.command.clone();
-        let title = old_session.title.clone();
-        let new_session_id = self.ids.new_session();
-        let term = Arc::new(Mutex::new(Term::new(viewport.cols, viewport.rows)));
-        log::info!(
-            "respawn pane {} session {} -> {} command={}",
-            pane_id.0,
-            old_session_id.0,
-            new_session_id.0,
-            command,
-        );
-        let pty = PtyHandle::spawn(
-            &command,
-            PtySize {
-                rows: viewport.rows as u16,
-                cols: viewport.cols as u16,
-                pixel_width: viewport.width_px as u16,
-                pixel_height: viewport.height_px as u16,
-            },
-            term.clone(),
-            self.proxy.clone(),
-            new_session_id,
-        )?;
-        self.sessions.insert(
-            new_session_id,
-            Session {
-                id: new_session_id,
-                title: title.clone(),
-                command,
-                pty,
-                term,
-                alive: true,
-                exit_code: None,
-                created_at: Instant::now(),
-            },
-        );
-        self.active_tab_mut().panes[active_idx].session = new_session_id;
-        if let Some(mut old_session) = self.sessions.remove(&old_session_id) {
-            old_session.alive = false;
-            old_session.exit_code = Some(-1);
-            drop(old_session);
-            self.emit_lifecycle(LifecycleEvent::SessionExited {
-                session_id: old_session_id,
-                code: -1,
-            });
-        }
-        self.emit_lifecycle(LifecycleEvent::SessionStarted {
-            session_id: new_session_id,
-            title: title.clone(),
-        });
-        self.sync_active_tab_title(title.clone());
-        self.window.set_title(&format!("{} — pj001", title));
-        self.cursor_visible = true;
-        self.last_ime_cursor = None;
-        self.preedit = None;
-        self.window.request_redraw();
-        Ok(())
     }
 
     fn create_tab(&mut self) -> Result<()> {
@@ -3183,7 +3345,7 @@ impl WindowState {
         self.update_min_inner_size();
         let title = self.session_for_pane_idx(0).title.clone();
         self.sync_active_tab_title(title.clone());
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.cursor_visible = true;
         self.last_ime_cursor = None;
         self.preedit = None;
@@ -3210,7 +3372,7 @@ impl WindowState {
         }
         let title = self.session_for_pane_idx(new_idx).title.clone();
         self.sync_active_tab_title(title.clone());
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.cursor_visible = true;
         self.last_ime_cursor = None;
         self.preedit = None;
@@ -3255,7 +3417,7 @@ impl WindowState {
         let active_idx = self.active_index();
         let title = self.session_for_pane_idx(active_idx).title.clone();
         self.sync_active_tab_title(title.clone());
-        self.window.set_title(&format!("{} — pj001", title));
+        self.set_window_title(&title);
         self.cursor_visible = true;
         self.last_ime_cursor = None;
         self.preedit = None;
@@ -3312,7 +3474,7 @@ impl WindowState {
                     self.send_focus_report(next_idx, true);
                 }
                 let title = self.session_for_pane_idx(next_idx).title.clone();
-                self.window.set_title(&format!("{} — pj001", title));
+                self.set_window_title(&title);
             }
         }
         self.window.request_redraw();
@@ -3380,7 +3542,7 @@ impl WindowState {
             .minimum_size(MIN_PANE_COLS, MIN_PANE_ROWS);
         PhysicalSize::new(
             (cols as u32 * cell.width).max(MIN_WINDOW_WIDTH),
-            ((rows + TAB_BAR_ROWS) as u32 * cell.height).max(MIN_WINDOW_HEIGHT),
+            ((rows + app_tab_bar_rows()) as u32 * cell.height).max(MIN_WINDOW_HEIGHT),
         )
     }
 
@@ -3453,28 +3615,34 @@ impl WindowState {
             })
             .await?;
 
+        // M-W-6.1: 첫 윈도우도 helper로 통일 — caps empty 시 SurfaceIncompatible Err.
+        // (현실적으로 request_adapter 직후 compatible_surface caps가 empty일 가능성은 낮지만
+        // wgpu API contract상 보장은 아님. 방어적 guard.)
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        // Phase 3 step 1: alpha_mode 명시 선택. macOS Metal은 PostMultiplied 흔히 지원.
-        let preferred_alpha = [
-            wgpu::CompositeAlphaMode::PostMultiplied,
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::Opaque,
-        ];
-        let alpha_mode = preferred_alpha
-            .iter()
-            .copied()
-            .find(|m| caps.alpha_modes.contains(m))
-            .unwrap_or(caps.alpha_modes[0]);
+        let format = choose_surface_format(&caps.formats, None).ok_or(
+            Error::SurfaceIncompatible {
+                formats_empty: caps.formats.is_empty(),
+                alpha_modes_empty: caps.alpha_modes.is_empty(),
+                present_modes_empty: caps.present_modes.is_empty(),
+            },
+        )?;
+        let alpha_mode = choose_alpha_mode(&caps.alpha_modes, None).ok_or(
+            Error::SurfaceIncompatible {
+                formats_empty: caps.formats.is_empty(),
+                alpha_modes_empty: caps.alpha_modes.is_empty(),
+                present_modes_empty: caps.present_modes.is_empty(),
+            },
+        )?;
+        let present_mode = choose_present_mode(&caps.present_modes).ok_or(
+            Error::SurfaceIncompatible {
+                formats_empty: caps.formats.is_empty(),
+                alpha_modes_empty: caps.alpha_modes.is_empty(),
+                present_modes_empty: caps.present_modes.is_empty(),
+            },
+        )?;
         log::info!(
-            "M-W-6 first window: surface alpha modes available={:?} selected={:?}",
-            caps.alpha_modes,
-            alpha_mode
+            "M-W-6 first window: format={format:?} alpha={alpha_mode:?} present={present_mode:?} (avail alpha={:?})",
+            caps.alpha_modes
         );
 
         let surface_config = wgpu::SurfaceConfiguration {
@@ -3482,7 +3650,7 @@ impl WindowState {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: caps.present_modes[0],
+            present_mode,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -3500,6 +3668,7 @@ impl WindowState {
             queue.clone(),
             format,
             overlay_attach,
+            None,
         )?;
 
         let shared = WgpuShared {
@@ -3525,73 +3694,53 @@ impl WindowState {
         proxy: EventLoopProxy<UserEvent>,
         config: Config,
         size: PhysicalSize<u32>,
+        startup_cwd: Option<String>,
     ) -> Result<Self> {
         let (surface, overlay_attach) = Self::create_surface(&shared.instance, &window)?;
 
+        // M-W-6.1: 공통 helper 사용 — 첫 path와 정확히 같은 선택 정책. preferred는
+        // shared의 선호값. None이면 caps에서 새로 선택. caps empty면 SurfaceIncompatible Err
+        // (Surface::configure unsupported format panic 차단).
         let caps = surface.get_capabilities(&shared.adapter);
-        if caps.formats.is_empty() || caps.present_modes.is_empty() {
-            log::error!(
-                "M-W-6 second window: surface caps empty — adapter/surface incompatible. formats={:?} present_modes={:?}",
-                caps.formats,
-                caps.present_modes
-            );
-            return Err(Error::NoAdapter);
-        }
-        // 선호값(첫 surface 선택)이 caps에 있으면 사용. 없으면 caps에서 재선택 (첫 윈도우와 같은 정책).
-        let format = if caps.formats.contains(&shared.preferred_surface_format) {
-            shared.preferred_surface_format
-        } else {
-            let fallback = caps
-                .formats
-                .iter()
-                .copied()
-                .find(|f| f.is_srgb())
-                .unwrap_or(caps.formats[0]);
+        let incompatible = |caps: &wgpu::SurfaceCapabilities| Error::SurfaceIncompatible {
+            formats_empty: caps.formats.is_empty(),
+            alpha_modes_empty: caps.alpha_modes.is_empty(),
+            present_modes_empty: caps.present_modes.is_empty(),
+        };
+        let format = choose_surface_format(&caps.formats, Some(shared.preferred_surface_format))
+            .ok_or_else(|| incompatible(&caps))?;
+        let alpha_mode = choose_alpha_mode(&caps.alpha_modes, Some(shared.preferred_alpha_mode))
+            .ok_or_else(|| incompatible(&caps))?;
+        let present_mode =
+            choose_present_mode(&caps.present_modes).ok_or_else(|| incompatible(&caps))?;
+        if format != shared.preferred_surface_format {
             log::warn!(
-                "M-W-6 second window: preferred format {:?} not in caps {:?} — falling back to {:?}",
+                "M-W-6 second window: preferred format {:?} not in caps — fell back to {:?}",
                 shared.preferred_surface_format,
-                caps.formats,
-                fallback
+                format
             );
-            fallback
-        };
-        let alpha_mode = if caps.alpha_modes.contains(&shared.preferred_alpha_mode) {
-            shared.preferred_alpha_mode
-        } else {
-            let preferred_alpha = [
-                wgpu::CompositeAlphaMode::PostMultiplied,
-                wgpu::CompositeAlphaMode::PreMultiplied,
-                wgpu::CompositeAlphaMode::Opaque,
-            ];
-            let fallback = preferred_alpha
-                .iter()
-                .copied()
-                .find(|m| caps.alpha_modes.contains(m))
-                .unwrap_or(caps.alpha_modes[0]);
+        }
+        if alpha_mode != shared.preferred_alpha_mode {
             log::warn!(
-                "M-W-6 second window: preferred alpha_mode {:?} not in caps {:?} — falling back to {:?}",
+                "M-W-6 second window: preferred alpha {:?} not in caps — fell back to {:?}",
                 shared.preferred_alpha_mode,
-                caps.alpha_modes,
-                fallback
+                alpha_mode
             );
-            fallback
-        };
+        }
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: caps.present_modes[0],
+            present_mode,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&shared.device, &surface_config);
         log::info!(
-            "M-W-6 second window: reusing shared wgpu Device — Cmd+N freeze 회피 (format={:?} alpha={:?})",
-            format,
-            alpha_mode
+            "M-W-6 second window: reusing shared wgpu Device — Cmd+N freeze 회피 (format={format:?} alpha={alpha_mode:?} present={present_mode:?})"
         );
 
         Self::assemble(
@@ -3605,6 +3754,7 @@ impl WindowState {
             shared.queue.clone(),
             format,
             overlay_attach,
+            startup_cwd,
         )
     }
 
@@ -3651,6 +3801,7 @@ impl WindowState {
         queue: wgpu::Queue,
         format: wgpu::TextureFormat,
         overlay_attach: OverlayAttachment,
+        startup_cwd: Option<String>,
     ) -> Result<Self> {
         // Phase 3 step 3: config.font_size가 있으면 사용, 없으면 default. clamp 적용.
         let logical_font_size_init = clamp_font_size(config.font_size.unwrap_or(DEFAULT_FONT_SIZE));
@@ -3703,7 +3854,9 @@ impl WindowState {
                 },
                 term.clone(),
                 proxy.clone(),
+                window.id(),
                 session_id,
+                startup_cwd.as_deref(),
             )?;
             let title = spec.title;
             sessions.insert(
@@ -3784,6 +3937,7 @@ impl WindowState {
             overlay_attach,
         };
         state.update_min_inner_size();
+        state.refresh_window_title();
         Ok(state)
     }
 
@@ -3804,6 +3958,15 @@ impl WindowState {
         self.sessions
             .get_mut(&session_id)
             .expect("session for pane not found")
+    }
+
+    fn active_cwd(&self) -> Option<String> {
+        let idx = self.active_index();
+        self.session_for_pane_idx(idx)
+            .term
+            .lock()
+            .ok()
+            .and_then(|term| term.cwd().map(str::to_string))
     }
 
     /// M12-6 design §5: 마우스 hit-test로 PaneId 반환. click site에서 idx 거치지 않고 사용.
@@ -3890,6 +4053,9 @@ impl WindowState {
     }
 
     fn tab_at_mouse(&self) -> Option<TabId> {
+        if USE_NATIVE_OS_TABS {
+            return None;
+        }
         let (col, row) = self.mouse_cell()?;
         if row != 0 || self.tabs.is_empty() {
             return None;
@@ -3902,7 +4068,7 @@ impl WindowState {
 
     fn divider_hit_at_mouse(&self) -> Option<layout::DividerHit> {
         let (col, row) = self.mouse_cell()?;
-        let row = row.checked_sub(TAB_BAR_ROWS)?;
+        let row = row.checked_sub(app_tab_bar_rows())?;
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
         let cell = self.renderer.cell_metrics();
         layout::divider_hit_at(
@@ -4447,7 +4613,7 @@ impl WindowState {
         let Some((col, row)) = self.mouse_cell() else {
             return;
         };
-        let Some(row) = row.checked_sub(TAB_BAR_ROWS) else {
+        let Some(row) = row.checked_sub(app_tab_bar_rows()) else {
             return;
         };
         let size = PhysicalSize::new(self.surface_config.width, self.surface_config.height);
@@ -4482,45 +4648,59 @@ impl WindowState {
     }
 
     /// macOS NSMenu click → AppCommand dispatch. 기존 CmdShortcut handler를 재활용한다.
-    /// `event_loop`는 close 동작 (Cmd+W escalation 등)에서 필요.
     fn dispatch_menu_command(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         cmd: crate::app::event::AppMenuCommand,
     ) {
         use crate::app::event::AppMenuCommand as M;
         match cmd {
             M::NewTab => {
-                if let Err(e) = self.create_tab() {
-                    log::warn!("menu NewTab failed: {e}");
-                }
+                log::warn!("dispatch_menu_command: NewTab should be handled at App level");
             }
             M::NewPane => {
-                // Codex 6차 Critical fix: 기존 Cmd+N keyboard chain과 동등 (split_active V).
                 if let Err(e) = self.split_active(SplitAxis::Vertical) {
                     log::warn!("menu NewPane (split V) failed: {e}");
                 }
             }
             M::CloseActive => {
                 self.apply_close_decision(
-                    event_loop,
                     close_decision(
-                        CmdShortcut::ClosePaneOrTab,
+                        CmdShortcut::CloseActive,
                         self.active_tab().panes.len(),
                         self.tabs.len(),
                     ),
                     "menu close",
                 );
             }
+            M::ClosePane => {
+                self.apply_close_decision(
+                    close_decision(
+                        CmdShortcut::ClosePane,
+                        self.active_tab().panes.len(),
+                        self.tabs.len(),
+                    ),
+                    "menu close pane",
+                );
+            }
             M::CloseTab => {
                 self.apply_close_decision(
-                    event_loop,
                     close_decision(
                         CmdShortcut::CloseTab,
                         self.active_tab().panes.len(),
                         self.tabs.len(),
                     ),
                     "menu close tab",
+                );
+            }
+            M::CloseWindow => {
+                self.apply_close_decision(
+                    close_decision(
+                        CmdShortcut::CloseWindow,
+                        self.active_tab().panes.len(),
+                        self.tabs.len(),
+                    ),
+                    "menu close window",
                 );
             }
             M::SplitVertical => {
@@ -4877,7 +5057,7 @@ impl WindowState {
                             session.title = t.clone();
                         }
                         self.sync_active_tab_title(t.clone());
-                        self.window.set_title(&format!("{} — pj001", t));
+                        self.set_window_title(&t);
                     }
                 }
                 let in_scrollback = term.view_offset() > 0;
@@ -5025,7 +5205,9 @@ impl WindowState {
                 }
             }
         }
-        self.append_tab_bar();
+        if !USE_NATIVE_OS_TABS {
+            self.append_tab_bar();
+        }
         self.append_split_chrome();
         self.append_find_overlay();
         self.renderer.finish_terms(&self.device, &self.queue);
@@ -5108,12 +5290,12 @@ impl WindowState {
         let content_size = tab_content_size(size, cell);
         let root = self.active_tab().root.clone();
         for mut divider in layout::vertical_dividers(&root, content_size, cell) {
-            divider.row += TAB_BAR_ROWS;
+            divider.row += app_tab_bar_rows();
             self.renderer
                 .append_fill_column(divider.col, divider.row, divider.height, DIVIDER_BG);
         }
         for mut divider in layout::horizontal_dividers(&root, content_size, cell) {
-            divider.row += TAB_BAR_ROWS;
+            divider.row += app_tab_bar_rows();
             self.renderer
                 .append_fill_row(divider.col, divider.row, divider.width, DIVIDER_BG);
         }
@@ -5269,6 +5451,90 @@ mod tests {
         );
     }
 
+    /// M-W-6.1: choose_surface_format — preferred가 caps에 있으면 우선, 없으면 is_srgb, 없으면 [0].
+    #[test]
+    fn choose_surface_format_prefers_preferred_if_present() {
+        let caps = vec![
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+        let r = choose_surface_format(&caps, Some(wgpu::TextureFormat::Bgra8UnormSrgb));
+        assert_eq!(r, Some(wgpu::TextureFormat::Bgra8UnormSrgb));
+    }
+
+    #[test]
+    fn choose_surface_format_falls_back_to_srgb_when_preferred_absent() {
+        let caps = vec![
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+        // preferred가 caps에 없는 format이면 is_srgb 우선.
+        let r = choose_surface_format(&caps, Some(wgpu::TextureFormat::Rgba8Unorm));
+        assert_eq!(r, Some(wgpu::TextureFormat::Bgra8UnormSrgb));
+    }
+
+    #[test]
+    fn choose_surface_format_falls_back_to_first_when_no_srgb() {
+        let caps = vec![wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm];
+        let r = choose_surface_format(&caps, None);
+        assert_eq!(r, Some(wgpu::TextureFormat::Bgra8Unorm));
+    }
+
+    #[test]
+    fn choose_surface_format_returns_none_when_empty() {
+        let caps: Vec<wgpu::TextureFormat> = vec![];
+        assert_eq!(choose_surface_format(&caps, None), None);
+        assert_eq!(
+            choose_surface_format(&caps, Some(wgpu::TextureFormat::Bgra8UnormSrgb)),
+            None
+        );
+    }
+
+    /// M-W-6.1: choose_alpha_mode — preferred 우선, fallback은 PostMultiplied > PreMultiplied > Opaque > [0].
+    #[test]
+    fn choose_alpha_mode_prefers_preferred_if_present() {
+        let modes = vec![
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ];
+        let r = choose_alpha_mode(&modes, Some(wgpu::CompositeAlphaMode::PostMultiplied));
+        assert_eq!(r, Some(wgpu::CompositeAlphaMode::PostMultiplied));
+    }
+
+    #[test]
+    fn choose_alpha_mode_falls_back_to_post_multiplied() {
+        let modes = vec![
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+        ];
+        // preferred 없으면 PostMultiplied 우선.
+        let r = choose_alpha_mode(&modes, None);
+        assert_eq!(r, Some(wgpu::CompositeAlphaMode::PostMultiplied));
+    }
+
+    #[test]
+    fn choose_alpha_mode_falls_back_to_opaque_when_post_pre_absent() {
+        let modes = vec![wgpu::CompositeAlphaMode::Opaque];
+        let r = choose_alpha_mode(&modes, Some(wgpu::CompositeAlphaMode::PostMultiplied));
+        assert_eq!(r, Some(wgpu::CompositeAlphaMode::Opaque));
+    }
+
+    #[test]
+    fn choose_alpha_mode_returns_none_when_empty() {
+        let modes: Vec<wgpu::CompositeAlphaMode> = vec![];
+        assert_eq!(choose_alpha_mode(&modes, None), None);
+    }
+
+    /// M-W-6.1: choose_present_mode — 첫 element. empty면 None.
+    #[test]
+    fn choose_present_mode_returns_first_or_none() {
+        assert_eq!(
+            choose_present_mode(&[wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox]),
+            Some(wgpu::PresentMode::Fifo)
+        );
+        assert_eq!(choose_present_mode(&[]), None);
+    }
+
     /// 다중 윈도우 fold 시뮬레이션. 한 윈도우 Poll + 다른 At(t) + 또 다른 Idle → Poll.
     #[test]
     fn window_next_wake_fold_across_multiple_windows() {
@@ -5382,16 +5648,17 @@ mod tests {
         let root = Layout::Pane(PaneId(0));
         let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell(), 0);
         let viewport = layouts[&PaneId(0)];
+        let tab_rows = app_tab_bar_rows();
 
         assert_eq!(viewport.cols, 10);
-        assert_eq!(viewport.rows, 3);
+        assert_eq!(viewport.rows, 4 - tab_rows);
         assert_eq!(viewport.col_offset, 0);
-        assert_eq!(viewport.row_offset, 1);
+        assert_eq!(viewport.row_offset, tab_rows);
         assert_eq!(viewport.status_row, None);
         assert_eq!(viewport.x_px, 0);
-        assert_eq!(viewport.y_px, 20);
+        assert_eq!(viewport.y_px, (tab_rows as u32) * 20);
         assert_eq!(viewport.width_px, 100);
-        assert_eq!(viewport.height_px, 60);
+        assert_eq!(viewport.height_px, 80 - (tab_rows as u32) * 20);
     }
 
     #[test]
@@ -5400,15 +5667,16 @@ mod tests {
         let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 80), cell(), 0);
         let left = layouts[&PaneId(0)];
         let right = layouts[&PaneId(1)];
+        let tab_rows = app_tab_bar_rows();
 
-        assert_eq!(left.rows, 2);
-        assert_eq!(right.rows, 2);
-        assert_eq!(left.row_offset, 1);
-        assert_eq!(right.row_offset, 1);
+        assert_eq!(left.rows, 3 - tab_rows);
+        assert_eq!(right.rows, 3 - tab_rows);
+        assert_eq!(left.row_offset, tab_rows);
+        assert_eq!(right.row_offset, tab_rows);
         assert_eq!(left.status_row, Some(3));
         assert_eq!(right.status_row, Some(3));
-        assert_eq!(left.y_px, 20);
-        assert_eq!(right.y_px, 20);
+        assert_eq!(left.y_px, (tab_rows as u32) * 20);
+        assert_eq!(right.y_px, (tab_rows as u32) * 20);
     }
 
     #[test]
@@ -5416,12 +5684,13 @@ mod tests {
         let root = Layout::Pane(PaneId(0));
         let layouts = compute_tab_viewports(&root, PhysicalSize::new(100, 10), cell(), 0);
         let viewport = layouts[&PaneId(0)];
+        let tab_rows = app_tab_bar_rows();
 
         assert_eq!(viewport.cols, 10);
         assert_eq!(viewport.rows, 1);
-        assert_eq!(viewport.row_offset, 1);
+        assert_eq!(viewport.row_offset, tab_rows);
         assert_eq!(viewport.status_row, None);
-        assert_eq!(viewport.y_px, 20);
+        assert_eq!(viewport.y_px, (tab_rows as u32) * 20);
     }
 
     #[test]
@@ -6045,11 +6314,15 @@ mod tests {
         );
         assert_eq!(
             cmd_shortcut(Some("w"), Some(KeyCode::KeyW), false, false),
-            Some(CmdShortcut::ClosePaneOrTab)
+            Some(CmdShortcut::CloseActive)
         );
         assert_eq!(
             cmd_shortcut(Some("w"), Some(KeyCode::KeyW), true, false),
-            Some(CmdShortcut::CloseTab)
+            Some(CmdShortcut::CloseWindow)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("w"), Some(KeyCode::KeyW), false, true),
+            Some(CmdShortcut::ClosePane)
         );
         assert_eq!(
             cmd_shortcut(Some("c"), Some(KeyCode::KeyC), false, false),
@@ -6083,10 +6356,7 @@ mod tests {
             cmd_shortcut(Some("n"), Some(KeyCode::KeyN), false, true),
             Some(CmdShortcut::QuickSpawnStart)
         );
-        assert_eq!(
-            cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false),
-            Some(CmdShortcut::RespawnSession)
-        );
+        assert_eq!(cmd_shortcut(Some("r"), Some(KeyCode::KeyR), false, false), None);
         assert_eq!(
             cmd_shortcut(Some("k"), Some(KeyCode::KeyK), false, false),
             Some(CmdShortcut::ClearBuffer)
@@ -6155,30 +6425,38 @@ mod tests {
     }
 
     #[test]
-    fn close_decision_escalates_cmd_w_from_pane_to_tab_to_exit() {
+    fn close_decision_cmd_w_cascades_pane_tab_window() {
         assert_eq!(
-            close_decision(CmdShortcut::ClosePaneOrTab, 2, 1),
+            close_decision(CmdShortcut::CloseActive, 2, 2),
             CloseDecision::ClosePane
         );
         assert_eq!(
-            close_decision(CmdShortcut::ClosePaneOrTab, 1, 2),
+            close_decision(CmdShortcut::CloseActive, 1, 2),
             CloseDecision::CloseTab
         );
         assert_eq!(
-            close_decision(CmdShortcut::ClosePaneOrTab, 1, 1),
-            CloseDecision::Exit
+            close_decision(CmdShortcut::CloseActive, 1, 1),
+            CloseDecision::CloseWindow
         );
     }
 
     #[test]
-    fn close_decision_cmd_shift_w_targets_tab_or_exit() {
+    fn close_decision_cmd_option_w_targets_pane_only() {
         assert_eq!(
-            close_decision(CmdShortcut::CloseTab, 3, 2),
-            CloseDecision::CloseTab
+            close_decision(CmdShortcut::ClosePane, 2, 1),
+            CloseDecision::ClosePane
         );
         assert_eq!(
-            close_decision(CmdShortcut::CloseTab, 3, 1),
-            CloseDecision::Exit
+            close_decision(CmdShortcut::ClosePane, 1, 2),
+            CloseDecision::Noop
+        );
+    }
+
+    #[test]
+    fn close_decision_cmd_shift_w_targets_window() {
+        assert_eq!(
+            close_decision(CmdShortcut::CloseWindow, 3, 2),
+            CloseDecision::CloseWindow
         );
     }
 

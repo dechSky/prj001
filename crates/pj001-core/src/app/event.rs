@@ -1,13 +1,28 @@
 #[derive(Debug)]
 pub enum UserEvent {
     /// M12-4: PTY 출력으로 Term이 갱신되었음을 알림. visible session인 경우만 redraw.
-    SessionRepaint(SessionId),
+    SessionRepaint {
+        window_id: winit::window::WindowId,
+        session_id: SessionId,
+    },
     /// M12-4: PTY child process 종료. emit 측은 alive=false + exit_code 기록.
-    SessionExited { id: SessionId, code: i32 },
+    SessionExited {
+        window_id: winit::window::WindowId,
+        id: SessionId,
+        code: i32,
+    },
     /// M12-4: PTY read 에러. fatal 처리(active 이동 + 다른 session도 다 죽으면 종료).
-    SessionPtyError { id: SessionId, message: String },
+    SessionPtyError {
+        window_id: winit::window::WindowId,
+        id: SessionId,
+        message: String,
+    },
     /// macOS NSMenu click → AppCommand. design: docs/menu-dispatch-design.md.
     MenuCommand(AppMenuCommand),
+    /// M-W-7: current window close request from app-level shortcuts/menu paths.
+    /// Winit has no synthetic CloseRequested; route through App so multi-window close
+    /// removes only the target window. App quit is a separate command.
+    CloseWindow(winit::window::WindowId),
 }
 
 /// macOS NSMenu에서 click 가능한 명령. NSMenuItem.tag = repr i64 값.
@@ -21,11 +36,14 @@ pub enum AppMenuCommand {
     SplitVertical = 3,
     SplitHorizontal = 4,
     CloseTab = 5,
-    /// Cmd+N — 기존 keyboard chain이 split_active(Vertical)로 매핑돼 있음(NewPane).
-    /// NSMenu 표시는 "New Pane"로. multi-window milestone 전엔 NewWindow 별도 미구현.
+    /// Cmd+Shift+N — open a new split pane in the current terminal window/tab.
     NewPane = 6,
     /// M-W-3: macOS 표준 Cmd+N. App level dispatch (event_loop.create_window).
     NewWindow = 7,
+    /// M-W-7: Cmd+Option+W — explicit active split pane close.
+    ClosePane = 8,
+    /// M-W-7: Cmd+Shift+W — current NSWindow close.
+    CloseWindow = 9,
     // Edit
     Copy = 10,
     Paste = 11,
@@ -56,6 +74,8 @@ impl AppMenuCommand {
             5 => Self::CloseTab,
             6 => Self::NewPane,
             7 => Self::NewWindow,
+            8 => Self::ClosePane,
+            9 => Self::CloseWindow,
             10 => Self::Copy,
             11 => Self::Paste,
             12 => Self::SelectAll,
@@ -143,6 +163,8 @@ mod tests {
             AppMenuCommand::CloseTab,
             AppMenuCommand::NewPane,
             AppMenuCommand::NewWindow,
+            AppMenuCommand::ClosePane,
+            AppMenuCommand::CloseWindow,
             AppMenuCommand::Copy,
             AppMenuCommand::Paste,
             AppMenuCommand::SelectAll,

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use winit::event_loop::EventLoopProxy;
+use winit::{event_loop::EventLoopProxy, window::WindowId};
 
 use crate::app::event::{SessionId, UserEvent};
 use crate::error::Result;
@@ -24,6 +24,14 @@ fn shell_command(shell: &str) -> CommandBuilder {
     cmd
 }
 
+fn shell_command_with_cwd(shell: &str, cwd: Option<&str>) -> CommandBuilder {
+    let mut cmd = shell_command(shell);
+    if let Some(cwd) = cwd.filter(|cwd| std::path::Path::new(cwd).is_dir()) {
+        cmd.cwd(cwd);
+    }
+    cmd
+}
+
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -37,17 +45,19 @@ impl PtyHandle {
         size: PtySize,
         term: Arc<Mutex<Term>>,
         proxy: EventLoopProxy<UserEvent>,
+        window_id: WindowId,
         session: SessionId,
+        cwd: Option<&str>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
-        let cmd = shell_command(shell);
+        let cmd = shell_command_with_cwd(shell, cwd);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
-        let reader_thread = reader::spawn(reader, term, proxy, session);
+        let reader_thread = reader::spawn(reader, term, proxy, window_id, session);
 
         Ok(Self {
             master: pair.master,
@@ -92,5 +102,20 @@ mod tests {
         assert_eq!(cmd.get_env("TERM").unwrap(), "xterm-256color");
         assert_eq!(cmd.get_env("TERM_PROGRAM").unwrap(), "Apple_Terminal");
         assert_eq!(cmd.get_env("SHELL_SESSIONS_DISABLE").unwrap(), "1");
+    }
+
+    #[test]
+    fn shell_command_with_cwd_sets_existing_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let cmd = shell_command_with_cwd("/bin/zsh", cwd.to_str());
+
+        assert_eq!(cmd.get_cwd().map(|s| s.as_os_str()), Some(cwd.as_os_str()));
+    }
+
+    #[test]
+    fn shell_command_with_cwd_ignores_missing_cwd() {
+        let cmd = shell_command_with_cwd("/bin/zsh", Some("/definitely/missing/pj001/cwd"));
+
+        assert!(cmd.get_cwd().is_none());
     }
 }

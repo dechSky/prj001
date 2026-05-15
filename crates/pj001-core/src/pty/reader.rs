@@ -2,7 +2,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use winit::event_loop::EventLoopProxy;
+use winit::{event_loop::EventLoopProxy, window::WindowId};
 
 use crate::app::event::{SessionId, UserEvent};
 use crate::grid::Term;
@@ -12,6 +12,7 @@ pub fn spawn(
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term>>,
     proxy: EventLoopProxy<UserEvent>,
+    window_id: WindowId,
     session: SessionId,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -23,6 +24,7 @@ pub fn spawn(
                 match reader.read(&mut buf) {
                     Ok(0) => {
                         let _ = proxy.send_event(UserEvent::SessionExited {
+                            window_id,
                             id: session,
                             code: 0,
                         });
@@ -37,10 +39,14 @@ pub fn spawn(
                             let mut perform = TermPerform::new(&mut term);
                             parser.advance(&mut perform, &buf[..n]);
                         }
-                        let _ = proxy.send_event(UserEvent::SessionRepaint(session));
+                        let _ = proxy.send_event(UserEvent::SessionRepaint {
+                            window_id,
+                            session_id: session,
+                        });
                     }
                     Err(e) => {
                         let _ = proxy.send_event(UserEvent::SessionPtyError {
+                            window_id,
                             id: session,
                             message: e.to_string(),
                         });

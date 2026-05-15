@@ -304,9 +304,14 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
             mtm, tr("Close", "닫기"), "w", NSEventModifierFlags::Command, AppMenuCommand::CloseActive,
         ));
         shell_menu.addItem(&make_command_item(
-            mtm, tr("Close Tab", "탭 닫기"), "w",
+            mtm, tr("Close Pane", "분할 닫기"), "w",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            AppMenuCommand::ClosePane,
+        ));
+        shell_menu.addItem(&make_command_item(
+            mtm, tr("Close Window", "윈도우 닫기"), "w",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
-            AppMenuCommand::CloseTab,
+            AppMenuCommand::CloseWindow,
         ));
         attach_submenu(mtm, &main, tr("Shell", "셸"), &shell_menu);
 
