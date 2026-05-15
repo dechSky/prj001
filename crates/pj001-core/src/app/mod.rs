@@ -5,6 +5,8 @@ mod layout;
 mod macos_backdrop;
 #[cfg(target_os = "macos")]
 mod macos_ime;
+#[cfg(target_os = "macos")]
+mod macos_overlay;
 mod session;
 
 use std::collections::HashMap;
@@ -1121,6 +1123,11 @@ struct AppState {
     ids: IdAllocator,
     /// 슬라이스 6.5: Cmd+F find 진행 중 상태. None이면 비활성.
     pending_find: Option<FindState>,
+    /// M-P3-2a: macOS WgpuOverlay attach. Retained NSView/CAMetalLayer 보관 — drop 시
+    /// AppKit 객체 자동 release. AppState가 main thread 전용이라 Send 불필요.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    overlay_attach: Option<macos_overlay::OverlayAttach>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3015,6 +3022,26 @@ impl AppState {
         size: PhysicalSize<u32>,
     ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // M-P3-2a (옵션 F): macOS에선 winit_view의 backing layer를 wgpu가 점유하지 않도록
+        // WgpuOverlay sibling subview를 만들고 그 CAMetalLayer로 surface 직접 생성.
+        // 다른 OS는 기존 path (winit window → wgpu) 그대로.
+        #[cfg(target_os = "macos")]
+        let (surface, overlay_attach) = match macos_overlay::attach_overlay(&window) {
+            Some(attach) => {
+                let surf = unsafe {
+                    instance.create_surface_unsafe(
+                        wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(attach.metal_layer_ptr),
+                    )?
+                };
+                macos_overlay::log_layer_class_after_surface(&window);
+                (surf, Some(attach))
+            }
+            None => {
+                log::warn!("macos_overlay: attach 실패 — fallback create_surface(window)");
+                (instance.create_surface(window.clone())?, None)
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
         let surface = instance.create_surface(window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -3198,6 +3225,8 @@ impl AppState {
             ids,
             pending_find: None,
             mouse_buttons_held: 0,
+            #[cfg(target_os = "macos")]
+            overlay_attach,
         };
         state.update_min_inner_size();
         Ok(state)
