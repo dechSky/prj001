@@ -3687,26 +3687,34 @@ impl AppState {
                 return true;
             }
         }
-        // 2. plain text URL detection — row의 chars 모음. soft-wrap 지원:
-        // 현재 row가 WRAPPED flag면 다음 row까지 이어 붙임. URL이 두 줄에 걸쳐 있어도
-        // 매칭. 단 wrap 정보는 grid.row_flags[row]로 확인.
+        // 2. plain text URL detection — soft-wrap chain head/tail까지 추적 (Codex 3차 권 1).
+        // (a) prev WRAPPED chain head로 거슬러 올라가며 prepend
+        // (b) current부터 tail까지 forward로 append
+        // (c) col 보정은 char count (Codex 3차 권 2 — UTF-8 안전)
         let cols = term.cols();
         let rows = term.rows();
-        let mut row_chars: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
-        let mut wrap_target_col = col;
-        // 현재 행의 끝이 WRAPPED 상태면 (다음 line으로 이어짐) 다음 row 연결.
-        if row + 1 < rows && term.row_flags(row).contains(crate::grid::RowFlags::WRAPPED) {
-            for c in 0..cols {
-                row_chars.push(term.cell(row + 1, c).ch);
-            }
+        let mut head_row = row;
+        while head_row > 0 && term.row_is_wrapped(head_row - 1) {
+            head_row -= 1;
         }
-        // 클릭이 다음 line에 있다면(현재 row가 prev로 WRAPPED) prev에서 시작해야.
-        if row > 0 && term.row_flags(row - 1).contains(crate::grid::RowFlags::WRAPPED) {
-            let mut prev: String = (0..cols).map(|c| term.cell(row - 1, c).ch).collect();
-            wrap_target_col += prev.len();
-            prev.push_str(&row_chars);
-            row_chars = prev;
+        let mut row_chars = String::new();
+        let mut prepended_chars: usize = 0;
+        for r in head_row..row {
+            let row_str: String = (0..cols).map(|c| term.cell(r, c).ch).collect();
+            prepended_chars += row_str.chars().count();
+            row_chars.push_str(&row_str);
         }
+        // 클릭 row
+        let cur_str: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
+        row_chars.push_str(&cur_str);
+        // forward tail
+        let mut tail_row = row;
+        while tail_row + 1 < rows && term.row_is_wrapped(tail_row) {
+            tail_row += 1;
+            let row_str: String = (0..cols).map(|c| term.cell(tail_row, c).ch).collect();
+            row_chars.push_str(&row_str);
+        }
+        let wrap_target_col = prepended_chars + col;
         drop(term);
         if let Some(url) = detect_url_at(&row_chars, wrap_target_col) {
             log::info!("hyperlink open (plain text): {}", url);

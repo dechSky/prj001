@@ -1469,11 +1469,15 @@ impl Term {
     }
 
     pub fn newline(&mut self) {
-        if self.cursor.row + 1 >= self.scroll_bottom {
-            let top = self.scroll_top;
-            let bottom = self.scroll_bottom;
+        // Codex 3차 Critical: margin-outside 동작 fix. xterm/VT 표준:
+        // - cursor가 scroll region 마지막 line(== scroll_bottom - 1)이면 region 안 scroll_up.
+        // - cursor가 scroll region 밖이면 scroll 안 함, 단순 row += 1 (grid 끝이면 no-op).
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        let rows = self.grid().rows;
+        if self.cursor.row + 1 == bottom {
+            // scroll region 마지막 line — scroll up.
             // 풀스크린 + main screen 스크롤일 때만 top row를 scrollback에 push.
-            // 부분 스크롤 영역(vim status bar 등)은 scrollback 오염 방지.
             if !self.use_alt && top == 0 && bottom == self.main.rows {
                 let cols = self.main.cols;
                 let cells: Vec<Cell> = self.main.cells[..cols].to_vec();
@@ -1484,36 +1488,44 @@ impl Term {
                     flags,
                     block_tags,
                 });
-                // Phase 4a: cap 도달 후 매 pop_front마다 oldest_kept_abs 증가 →
-                // 절대 좌표 안정. semantic_*가 보관한 last_*_row가 drift 없이 유효.
                 while self.scrollback.len() > SCROLLBACK_CAP {
                     self.scrollback.pop_front();
                     self.oldest_kept_abs = self.oldest_kept_abs.saturating_add(1);
                 }
-                // prompt_start_abs가 oldest_kept_abs 미만이 된 block은 drop.
                 self.blocks.drop_below(self.oldest_kept_abs);
             }
             self.grid_mut().scroll_up(top, bottom, 1);
-        } else {
+        } else if self.cursor.row + 1 < rows {
+            // scroll region 밖 또는 region 안이지만 마지막 line 아님 — 단순 row += 1.
             self.cursor.row += 1;
         }
+        // cursor.row + 1 == rows && cursor.row + 1 != bottom 경우 — grid 끝이고 region 밖.
+        // VT 표준은 no-op (cursor 그대로). 사용 빈도 매우 낮음.
     }
 
     pub fn carriage_return(&mut self) {
         self.cursor.col = 0;
     }
 
-    /// Reverse Index (`ESC M`) — LF의 반대. cursor를 위 row로, scroll_top이면 scroll_down.
-    /// VT100 표준. ED 1 cleanup 시 등 less/man 같은 pager가 사용.
+    /// Reverse Index (`ESC M`) — LF의 반대. VT100 표준 + Codex 3차 권 적용:
+    /// - cursor == scroll_top → scroll_down (region 안에 빈 행 삽입, 마지막 행 사라짐)
+    /// - cursor > 0 (region 위쪽 포함) → cursor.row -= 1
+    /// - cursor == 0 → no-op
     pub fn reverse_index(&mut self) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
-        if self.cursor.row > top {
-            self.cursor.row -= 1;
-        } else {
-            // top — scroll down (cursor 행 위에 빈 row 삽입, scroll region 마지막 row 사라짐)
+        if self.cursor.row == top {
             self.grid_mut().scroll_down(top, bottom, 1);
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
         }
+        // cursor.row == 0 && top != 0 케이스 — no-op.
+    }
+
+    /// row가 wrapped인지 (다음 row로 이어지는지) 외부에서 검사하는 좁은 helper.
+    /// Codex 3차 권: RowFlags 타입을 외부에 노출하지 말고 의도(`is_wrapped`)만 노출.
+    pub fn row_is_wrapped(&self, row: usize) -> bool {
+        self.row_flags(row).contains(RowFlags::WRAPPED)
     }
 
     /// Next Line (`ESC E`) — CR + LF. cursor를 다음 row의 col 0으로.
@@ -1857,8 +1869,15 @@ impl Term {
         s
     }
 
-    // M17-2: 테스트/디버깅용 row_flags 접근자. soft-wrap URL detection이 사용.
-    pub fn row_flags(&self, row: usize) -> RowFlags {
+    // M17-2: 테스트/디버깅용 row_flags 접근자. Codex 3차 권으로 RowFlags 외부 노출 최소화
+    // 위해 narrow helper `row_is_wrapped`도 제공. 본 메서드는 test/internal 전용 유지.
+    #[cfg(test)]
+    fn row_flags(&self, row: usize) -> RowFlags {
+        self.grid().row_flags[row]
+    }
+
+    #[cfg(not(test))]
+    fn row_flags(&self, row: usize) -> RowFlags {
         self.grid().row_flags[row]
     }
 
