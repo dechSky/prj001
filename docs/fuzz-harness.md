@@ -15,35 +15,53 @@
 - 1-byte-at-a-time 점진 feed로 incremental parser state machine 회귀 검증.
 - 모두 `cargo test --quiet fuzz`로 실행.
 
-## 다음 단계 — cargo-fuzz 본격 도입
+## 2차 cut — cargo-fuzz skeleton 도입 (2026-05-15)
 
-### 환경 준비
-1. nightly toolchain 설치: `rustup install nightly`
-2. cargo-fuzz 설치: `cargo install cargo-fuzz`
-3. pj001/crates/pj001-core 디렉터리에서 `cargo fuzz init`
+### 디렉터리 구조 (commit 추가)
 
-### fuzz target 분리
 ```
-fuzz/
-├── Cargo.toml
-├── fuzz_targets/
-│   ├── vt_parser.rs      # Term::new + vte::Parser advance
-│   ├── osc_parse.rs      # OSC 8/133 specific
-│   └── grid_resize.rs    # rewrap + scroll edge
-└── corpus/
-    ├── vt_parser/        # 위 corpus seeds + vttest 표준 fixture
-    └── osc_parse/
+pj001/
+├── fuzz/
+│   ├── Cargo.toml           # libfuzzer-sys + pj001-core path dep
+│   ├── fuzz_targets/
+│   │   └── vt_parser.rs     # Term + vte::Parser fuzz target
+│   ├── corpus/
+│   │   └── vt_parser/       # 10 seed bytes (clear/SGR/OSC 133/OSC 8/
+│   │                        # DEC line drawing/mouse SGR/utf-8/invalid/
+│   │                        # vim startup/DECSTBM+IND)
+│   └── .gitignore           # target/ artifacts/ coverage/
 ```
 
-### golden corpus
-- `crates/pj001-core/src/vt/perform.rs`의 `fuzz_corpus_known_sequences_no_panic` 안
-  35건을 `fuzz/corpus/vt_parser/seed_<n>.bin`으로 export.
-- vttest 표준 (https://invisible-island.net/vttest/) 시퀀스 추가.
-- xterm-256color terminfo escape 시퀀스 fixture.
+`pj001/Cargo.toml`은 `workspace.exclude = ["fuzz"]`로 stable `cargo build`/`cargo test`
+영향 차단.
+
+### 실행
+```bash
+# 1회 설정
+rustup install nightly
+cargo install cargo-fuzz
+
+# 실행 (60s smoke)
+cd pj001
+cargo +nightly fuzz run vt_parser -- -max_total_time=60
+
+# 또는 무제한
+cargo +nightly fuzz run vt_parser
+```
+
+### crash 발견 시 회귀 방지 path
+1. `fuzz/artifacts/vt_parser/`에 minimized input 자동 저장.
+2. 그 input을 `crates/pj001-core/src/vt/perform.rs::fuzz_corpus_known_sequences_no_panic`
+   corpus 배열에 추가 → stable test로 회귀 잡음.
 
 ### CI 통합
 - nightly만 가능 — CI에 nightly job 별도. 또는 manual periodic run.
-- `cargo fuzz run vt_parser -- -max_total_time=60` 60초 단위 quick smoke.
+- `cargo +nightly fuzz run vt_parser -- -max_total_time=60` 60초 단위 quick smoke.
+
+### 향후 추가 target
+- `osc_parse.rs` — OSC 8/133 specific (현재 vt_parser에 포함)
+- `grid_resize.rs` — rewrap + scroll edge
+- `term_input.rs` — Term::print에 utf-8 + Wide char 시퀀스
 
 ## 발견 시 회귀 방지
 

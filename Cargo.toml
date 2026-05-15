@@ -7,6 +7,10 @@ default-members = [
     "crates/pj001-core",
     "crates/pj001",
 ]
+# fuzz/ 는 cargo-fuzz용 별도 crate (nightly + libfuzzer-sys). workspace에서 제외하여
+# stable `cargo build` / `cargo test`가 영향 받지 않게. 실행:
+#   cargo +nightly fuzz run vt_parser
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]

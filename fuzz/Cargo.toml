@@ -1,0 +1,29 @@
+[package]
+name = "pj001-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# cargo-fuzz는 nightly + libfuzzer-sys 사용. 이 crate는 workspace에서 exclude되어
+# 일반 `cargo build`/`cargo test`로 빌드되지 않는다. 별도 실행:
+#   cd pj001
+#   cargo +nightly fuzz run vt_parser
+#
+# nightly toolchain 설치: rustup install nightly
+# cargo-fuzz 설치: cargo install cargo-fuzz
+# docs/fuzz-harness.md 가이드 참고.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pj001-core = { path = "../crates/pj001-core" }
+vte = "0.15"
+
+[[bin]]
+name = "vt_parser"
+path = "fuzz_targets/vt_parser.rs"
+test = false
+doc = false
+bench = false
