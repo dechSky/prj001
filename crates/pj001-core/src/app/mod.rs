@@ -2,6 +2,8 @@ pub mod event;
 mod input;
 mod layout;
 #[cfg(target_os = "macos")]
+mod macos_backdrop;
+#[cfg(target_os = "macos")]
 mod macos_ime;
 mod session;
 
@@ -1203,6 +1205,16 @@ impl App {
         ))
         .expect("AppState::new");
         state.window.focus_window();
+        // Phase 3 step 2: NSVisualEffectView vibrancy attach (window-vibrancy crate).
+        // **DEFAULT OFF** — 진단 결과 NSVE가 winit_view의 sub-view(Below)로 추가돼도
+        // layer-backed view에서 sub-view는 backing CAMetalLayer **위에** 그려져
+        // wgpu가 그린 텍스트를 가린다 (2026-05-15 검증). 다음 세션에서
+        // wgpu Metal layer를 NSVE의 sibling/위로 옮기는 attach 패턴 재설계 필요.
+        // 그동안 PJ001_BACKDROP=1 env로 실험적 opt-in 가능 (텍스트 가려짐).
+        #[cfg(target_os = "macos")]
+        if std::env::var("PJ001_BACKDROP").is_ok() {
+            macos_backdrop::attach_visual_effect(&state.window);
+        }
         // IME 이벤트 활성화. winit 0.30.13에서 macOS set_ime_purpose는 no-op
         // (window_delegate.rs:1569). Terminal/Normal 둘 다 동일하나 의도 표기.
         state.window.set_ime_allowed(true);
@@ -1267,8 +1279,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.state.is_some() || self.pending_window.is_some() {
             return;
         }
+        // Phase 3 step 1: transparent window 배관. wgpu surface가 alpha=1.0인 동안은
+        // 시각 변화 0. step 2(NSVisualEffectView attach) + step 3(테마별 bg alpha)부터
+        // 윈도우 뒤 데스크톱이 vibrancy로 비침.
         let attrs = Window::default_attributes()
             .with_title("pj001")
+            .with_transparent(true)
             .with_inner_size(LogicalSize::new(960.0, 600.0))
             .with_min_inner_size(LogicalSize::new(
                 MIN_WINDOW_WIDTH as f64,
@@ -3029,13 +3045,31 @@ impl AppState {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        // Phase 3 step 1: alpha_mode 명시 선택. macOS Metal은 PostMultiplied 흔히 지원.
+        // PostMultiplied: compositor가 src.rgb * src.a. PreMultiplied: src.rgb 이미 a 곱해진 가정.
+        // shader가 srgb space에서 일반 RGBA 출력하므로 PostMultiplied가 자연.
+        let preferred_alpha = [
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+        ];
+        let alpha_mode = preferred_alpha
+            .iter()
+            .copied()
+            .find(|m| caps.alpha_modes.contains(m))
+            .unwrap_or(caps.alpha_modes[0]);
+        log::info!(
+            "surface alpha modes available={:?} selected={:?}",
+            caps.alpha_modes,
+            alpha_mode
+        );
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: caps.present_modes[0],
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
