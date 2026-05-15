@@ -24,6 +24,8 @@ pub enum AppMenuCommand {
     /// Cmd+N — 기존 keyboard chain이 split_active(Vertical)로 매핑돼 있음(NewPane).
     /// NSMenu 표시는 "New Pane"로. multi-window milestone 전엔 NewWindow 별도 미구현.
     NewPane = 6,
+    /// M-W-3: macOS 표준 Cmd+N. App level dispatch (event_loop.create_window).
+    NewWindow = 7,
     // Edit
     Copy = 10,
     Paste = 11,
@@ -53,6 +55,7 @@ impl AppMenuCommand {
             4 => Self::SplitHorizontal,
             5 => Self::CloseTab,
             6 => Self::NewPane,
+            7 => Self::NewWindow,
             10 => Self::Copy,
             11 => Self::Paste,
             12 => Self::SelectAll,
@@ -139,6 +142,7 @@ mod tests {
             AppMenuCommand::SplitHorizontal,
             AppMenuCommand::CloseTab,
             AppMenuCommand::NewPane,
+            AppMenuCommand::NewWindow,
             AppMenuCommand::Copy,
             AppMenuCommand::Paste,
             AppMenuCommand::SelectAll,

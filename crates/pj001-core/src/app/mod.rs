@@ -879,6 +879,8 @@ enum CmdShortcut {
     SplitVertical,
     SplitHorizontal,
     NewPane,
+    /// M-W-3: macOS 표준 Cmd+N — App level dispatch (event_loop.create_window).
+    NewWindow,
     NewTab,
     QuickSpawnStart,
     RespawnSession,
@@ -970,10 +972,14 @@ fn cmd_shortcut(
         return Some(CmdShortcut::NewTab);
     }
     if lower == Some("n") || physical_code == Some(KeyCode::KeyN) {
-        return if shift {
+        // M-W-3: macOS 표준 정합 — Cmd+N=NewWindow, Cmd+Shift+N=NewPane(이전 Cmd+N),
+        // Cmd+Option+N=QuickSpawnStart(이전 Cmd+Shift+N).
+        return if alt {
             Some(CmdShortcut::QuickSpawnStart)
-        } else {
+        } else if shift {
             Some(CmdShortcut::NewPane)
+        } else {
+            Some(CmdShortcut::NewWindow)
         };
     }
     if lower == Some("r") || physical_code == Some(KeyCode::KeyR) {
@@ -1362,6 +1368,53 @@ impl App {
             proxy,
             config,
         }
+    }
+
+    /// M-W-3: Cmd+N으로 새 NSWindow 생성. 첫 윈도우와 같은 attrs (transparent, min size),
+    /// WindowState::new_with_size로 wgpu surface + PTY shell + NSVisualEffectView attach.
+    /// macOS Window 메뉴에 자동 추가 (Apple `windowsMenu` setMainMenu 효과).
+    fn create_new_window(&mut self, event_loop: &ActiveEventLoop) {
+        log::info!("M-W-3: creating new window via Cmd+N");
+        let attrs = Window::default_attributes()
+            .with_title("pj001")
+            .with_transparent(true)
+            .with_inner_size(LogicalSize::new(960.0, 600.0))
+            .with_min_inner_size(LogicalSize::new(
+                MIN_WINDOW_WIDTH as f64,
+                MIN_WINDOW_HEIGHT as f64,
+            ));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                log::warn!("create_new_window: winit create_window failed: {e}");
+                return;
+            }
+        };
+        window.set_min_inner_size(Some(LogicalSize::new(
+            MIN_WINDOW_WIDTH as f64,
+            MIN_WINDOW_HEIGHT as f64,
+        )));
+        let size = window.inner_size();
+        let state = match pollster::block_on(WindowState::new_with_size(
+            window.clone(),
+            self.proxy.clone(),
+            self.config.clone(),
+            size,
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("create_new_window: WindowState init failed: {e}");
+                return;
+            }
+        };
+        state.window.focus_window();
+        #[cfg(target_os = "macos")]
+        macos_ime::wake_input_context(&state.window);
+        let window_id = window.id();
+        self.windows.insert(window_id, state);
+        self.active_window = Some(window_id);
+        window.request_redraw();
+        log::info!("M-W-3: new window {window_id:?} created, total windows={}", self.windows.len());
     }
 
     /// M12-5 회귀 fix v3: 첫 winit `Resized` 받은 후 그 size로 PTY spawn.
@@ -1952,7 +2005,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(CmdShortcut::NewPane) => {
                             if let Err(e) = state.split_active(SplitAxis::Vertical) {
-                                log::warn!("cmd+n new pane failed: {e}");
+                                log::warn!("cmd+shift+n new pane failed: {e}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::NewWindow) => {
+                            // M-W-3: keyboard chain의 NewWindow는 EventLoopProxy를 통해
+                            // App.user_event arm으로 indirection (state borrow drop 후 App.
+                            // create_new_window 호출). Cmd+N → NSWindow 추가.
+                            if let Err(e) = self
+                                .proxy
+                                .send_event(UserEvent::MenuCommand(crate::app::event::AppMenuCommand::NewWindow))
+                            {
+                                log::warn!("cmd+n NewWindow proxy send failed: {e:?}");
                             }
                             return;
                         }
@@ -2339,11 +2404,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::MenuCommand(cmd) => {
-                if let Some(state) = self.active_state_mut() {
-                    state.dispatch_menu_command(event_loop, cmd);
-                    state.window.request_redraw();
-                } else {
-                    log::warn!("MenuCommand received before WindowState ready: {cmd:?}");
+                use crate::app::event::AppMenuCommand as M;
+                match cmd {
+                    // M-W-3: NewWindow는 App level dispatch — event_loop 필요 +
+                    // self.windows mutate. WindowState method로 위임 불가.
+                    M::NewWindow => self.create_new_window(event_loop),
+                    other => {
+                        if let Some(state) = self.active_state_mut() {
+                            state.dispatch_menu_command(event_loop, other);
+                            state.window.request_redraw();
+                        } else {
+                            log::warn!("MenuCommand received before WindowState ready: {other:?}");
+                        }
+                    }
                 }
             }
         }
@@ -4172,6 +4245,11 @@ impl WindowState {
             M::ZoomReset => self.set_logical_font_size(DEFAULT_FONT_SIZE),
             M::PrevTab => self.focus_adjacent_tab(false),
             M::NextTab => self.focus_adjacent_tab(true),
+            M::NewWindow => {
+                // M-W-3: App level — user_event arm이 별도로 처리. WindowState method로
+                // 도달하면 unreachable (logic bug). debug log + ignore.
+                log::warn!("dispatch_menu_command: NewWindow는 App level dispatch — 호출 안 와야 함");
+            }
         }
     }
 
@@ -5605,12 +5683,18 @@ mod tests {
             cmd_shortcut(Some("t"), Some(KeyCode::KeyT), false, false),
             Some(CmdShortcut::NewTab)
         );
+        // M-W-3: macOS 표준 정합 — Cmd+N=NewWindow, Cmd+Shift+N=NewPane,
+        // Cmd+Option+N=QuickSpawnStart.
         assert_eq!(
             cmd_shortcut(Some("n"), Some(KeyCode::KeyN), false, false),
-            Some(CmdShortcut::NewPane)
+            Some(CmdShortcut::NewWindow)
         );
         assert_eq!(
             cmd_shortcut(Some("n"), Some(KeyCode::KeyN), true, false),
+            Some(CmdShortcut::NewPane)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("n"), Some(KeyCode::KeyN), false, true),
             Some(CmdShortcut::QuickSpawnStart)
         );
         assert_eq!(

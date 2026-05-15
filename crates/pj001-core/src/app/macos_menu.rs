@@ -278,7 +278,13 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         // ── Shell menu ──────────────────────────────────────────────────────────
         let shell_menu = NSMenu::new(mtm); shell_menu.setAutoenablesItems(false);
         shell_menu.addItem(&make_command_item(
-            mtm, tr("New Pane", "새 분할"), "n", NSEventModifierFlags::Command, AppMenuCommand::NewPane,
+            mtm, tr("New Window", "새 윈도우"), "n",
+            NSEventModifierFlags::Command, AppMenuCommand::NewWindow,
+        ));
+        shell_menu.addItem(&make_command_item(
+            mtm, tr("New Pane", "새 분할"), "n",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::NewPane,
         ));
         shell_menu.addItem(&make_command_item(
             mtm, tr("New Tab", "새 탭"), "t", NSEventModifierFlags::Command, AppMenuCommand::NewTab,
