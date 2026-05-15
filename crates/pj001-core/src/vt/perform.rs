@@ -410,6 +410,120 @@ mod tests {
         parser.advance(&mut perform, bytes);
     }
 
+    /// Phase 3 후속 — Fuzzing harness 1차 cut. cargo-fuzz는 nightly 부담이라 다음 세션에서
+    /// 본격 도입. 이번 cut은 dep 없이 deterministic LCG로 random bytes 1000 iteration +
+    /// known VT sequence corpus 흘려서 panic 없으면 통과.
+    /// 출처: docs/fuzz-harness.md에 cargo-fuzz 전환 가이드.
+    #[test]
+    fn fuzz_random_bytes_no_panic() {
+        // deterministic LCG (no rand crate dep).
+        let mut seed: u64 = 0xDEADBEEF_CAFEBABE;
+        for _ in 0..1000 {
+            let len = ((seed >> 8) % 200 + 1) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let mut term = Term::new(80, 24);
+            run(&mut term, &bytes);
+            // 결과 검증 — panic 없으면 통과. cell rows/cols invariant 확인.
+            assert_eq!(term.rows(), 24);
+            assert_eq!(term.cols(), 80);
+        }
+    }
+
+    /// VT 시퀀스 corpus — vttest replay seed 후보. 각 시퀀스가 panic 없이 처리되는지 확인.
+    /// 신규 케이스 발견 시 corpus에 추가.
+    #[test]
+    fn fuzz_corpus_known_sequences_no_panic() {
+        let corpus: &[&[u8]] = &[
+            // ANSI cursor / erase
+            b"\x1b[2J",
+            b"\x1b[H",
+            b"\x1b[1;1H",
+            b"\x1b[10;20H",
+            b"\x1b[K",
+            b"\x1b[1K",
+            b"\x1b[2K",
+            // SGR
+            b"\x1b[0m",
+            b"\x1b[31m\x1b[1m\x1b[4mtext\x1b[0m",
+            b"\x1b[38;5;196mfg256\x1b[0m",
+            b"\x1b[48;2;255;128;0mbg-truecolor\x1b[0m",
+            // alt screen
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            // DEC modes
+            b"\x1b[?25h",
+            b"\x1b[?25l",
+            b"\x1b[?2004h",
+            b"\x1b[?1000h",
+            // DECSCUSR
+            b"\x1b[5 q",
+            b"\x1b[ q",
+            // soft reset
+            b"\x1b[!p",
+            b"\x1bc",
+            // OSC
+            b"\x1b]2;title\x1b\\",
+            b"\x1b]7;file://localhost/Users/foo\x1b\\",
+            b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+            b"\x1b]133;A\x1b\\",
+            b"\x1b]133;D;0\x1b\\",
+            b"\x1b]133;D;127\x1b\\",
+            // DEC line drawing
+            b"\x1b(0lqqqk\x1b(B",
+            // ICH/DCH/IL/DL
+            b"\x1b[3@",
+            b"\x1b[3P",
+            b"\x1b[3L",
+            b"\x1b[3M",
+            // UTF-8 valid (한글)
+            "\u{c548}\u{b155}".as_bytes(),
+            // invalid utf-8
+            b"\xff\xfe\xfd\xfc",
+            // raw control
+            b"\x00\x01\x02\x03\x04\x05\x06\x07\x08",
+            // long sequence
+            &[b'A'; 1024],
+            // very long CSI parameters (overflow guard)
+            b"\x1b[999999999999;999999999999H",
+            // mouse SGR
+            b"\x1b[<0;10;20M",
+            b"\x1b[<0;10;20m",
+            // DSR / DA
+            b"\x1b[6n",
+            b"\x1b[c",
+            b"\x1b[>c",
+        ];
+        for (i, seq) in corpus.iter().enumerate() {
+            let mut term = Term::new(80, 24);
+            run(&mut term, seq);
+            assert_eq!(term.rows(), 24, "corpus[{i}] altered rows: {seq:?}");
+            assert_eq!(term.cols(), 80, "corpus[{i}] altered cols: {seq:?}");
+        }
+    }
+
+    /// edge: 1-byte-at-a-time feed — incremental parser state machine 검증.
+    #[test]
+    fn fuzz_byte_by_byte_feed_no_panic() {
+        let seqs: &[&[u8]] = &[
+            b"\x1b[31m\x1b[1mhello\x1b[0m world\r\n",
+            b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+            b"\xe1\x84\x80\xe1\x85\xa1", // 한글 자모 NFD
+        ];
+        for seq in seqs {
+            let mut term = Term::new(80, 24);
+            for &b in *seq {
+                run(&mut term, &[b]);
+            }
+        }
+    }
+
     #[test]
     fn decscusr_sets_shape_and_blinking() {
         let mut term = Term::new(80, 24);

@@ -210,6 +210,8 @@ pub struct Config {
     /// None = default ON. env var `PJ001_NO_BACKDROP=1`이 더 우선 (escape hatch).
     /// macOS 외 OS에서는 무의미.
     pub backdrop_enabled: Option<bool>,
+    /// 초기 logical font size (pt). None = `DEFAULT_FONT_SIZE` (14.0). MIN/MAX clamp 적용.
+    pub font_size: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -368,6 +370,7 @@ impl Config {
             theme: None,
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
+            font_size: None,
         }
     }
 
@@ -384,6 +387,7 @@ impl Config {
             theme: None,
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
+            font_size: None,
         }
     }
 
@@ -410,6 +414,12 @@ impl Config {
     /// Phase 3 step 3: macOS backdrop vibrancy 활성/비활성. None = default(ON).
     pub fn with_backdrop_enabled(mut self, enabled: Option<bool>) -> Self {
         self.backdrop_enabled = enabled;
+        self
+    }
+
+    /// 초기 logical font size 지정. None = DEFAULT_FONT_SIZE (14.0). clamp는 init 시점에.
+    pub fn with_font_size(mut self, size: Option<f32>) -> Self {
+        self.font_size = size;
         self
     }
 
@@ -1170,6 +1180,56 @@ struct MouseSelection {
 fn caret_to_abs(term: &Term, viewport_caret: (usize, usize)) -> (usize, usize) {
     let top_abs = term.top_visible_abs() as usize;
     (top_abs.saturating_add(viewport_caret.0), viewport_caret.1)
+}
+
+/// Phase 3 URL detection: row의 text에서 `col` 위치가 http(s):// URL 범위 안에 있으면
+/// 그 URL string 반환. 단순 ASCII 매처 — wide char(EAW=2)는 grid에서 [WIDE, WIDE_CONT]
+/// 두 cell이고 둘째 cell.ch=' '이라 URL 영역이 끊기지만 ASCII URL만 매칭이라 무영향.
+/// macOS 표준 터미널의 Cmd+click URL과 동일 UX.
+fn detect_url_at(row_text: &str, col: usize) -> Option<String> {
+    // char 인덱스 = grid cell 인덱스. UTF-8 byte offset 아님.
+    let chars: Vec<char> = row_text.chars().collect();
+    if col >= chars.len() {
+        return None;
+    }
+    let mut start = 0usize;
+    while start < chars.len() {
+        // http/https prefix 확인.
+        let proto_len = if chars[start..].starts_with(&['h', 't', 't', 'p', 's', ':', '/', '/']) {
+            8
+        } else if chars[start..].starts_with(&['h', 't', 't', 'p', ':', '/', '/']) {
+            7
+        } else {
+            start += 1;
+            continue;
+        };
+        // URL 끝 — whitespace, control, 명시적 종결 문자 만나면 종료.
+        let mut end = start + proto_len;
+        while end < chars.len() {
+            let c = chars[end];
+            if c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '"' | '\'' | '<' | '>' | '`' | '|' | '\\')
+            {
+                break;
+            }
+            end += 1;
+        }
+        // 끝에 붙은 문장 부호(. , ; : ? ! ) ] }) trim — URL 자체엔 거의 안 들어감.
+        while end > start + proto_len {
+            let c = chars[end - 1];
+            if matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '}') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        if col >= start && col < end {
+            return Some(chars[start..end].iter().collect());
+        }
+        start = end.max(start + 1);
+    }
+    None
 }
 
 /// Phase 5: abs caret → viewport caret. abs_row < top_abs면 row=0(viewport 위 clip),
@@ -3137,12 +3197,14 @@ impl AppState {
         };
         surface.configure(&device, &surface_config);
 
+        // Phase 3 step 3: config.font_size가 있으면 사용, 없으면 default. clamp 적용.
+        let logical_font_size_init = clamp_font_size(config.font_size.unwrap_or(DEFAULT_FONT_SIZE));
         let renderer = Renderer::new(
             &device,
             &queue,
             format,
             [size.width as f32, size.height as f32],
-            physical_font_size(DEFAULT_FONT_SIZE, window.scale_factor()),
+            physical_font_size(logical_font_size_init, window.scale_factor()),
             config.theme.unwrap_or_else(ThemePalette::default_theme),
         );
 
@@ -3250,7 +3312,7 @@ impl AppState {
             last_auto_scroll_at: None,
             last_click: None,
             pending_resize: None,
-            logical_font_size: DEFAULT_FONT_SIZE,
+            logical_font_size: logical_font_size_init,
             pending_logical_font_size: None,
             preserve_grid_on_next_resize: false,
             current_scale_factor,
@@ -3567,13 +3629,13 @@ impl AppState {
         true
     }
 
-    /// 슬라이스 6.3c: Cmd+click 시 클릭한 cell의 hyperlink URI를 추출해 macOS `open`으로 실행.
-    /// 반환 true면 caller가 다른 click 처리 skip.
+    /// 슬라이스 6.3c + Phase 3 URL detection: Cmd+click 시 클릭한 cell이 (1) OSC 8 hyperlink
+    /// 면 그 URI, 아니면 (2) plain text http(s):// URL 패턴 scan 후 매칭되면 그 URL을 macOS
+    /// `open`으로 실행. 반환 true면 caller가 다른 click 처리 skip.
     fn try_open_hyperlink_at_mouse(&mut self) -> bool {
         let Some((pane_id, (row, col))) = self.pane_cell_at_mouse() else {
             return false;
         };
-        // pane_id의 session에서 cell의 hyperlink_id 조회.
         let idx_opt = self.active_tab().panes.iter().position(|p| p.id == pane_id);
         let Some(idx) = idx_opt else {
             return false;
@@ -3582,22 +3644,31 @@ impl AppState {
         let Ok(term) = session.term.lock() else {
             return false;
         };
+        // 1. OSC 8 hyperlink_id
         let cell = term.cell(row, col);
         let id = cell.hyperlink_id;
-        if id == 0 {
-            return false;
+        if id != 0 {
+            if let Some(uri) = term.hyperlink_uri_by_id(id).map(|u| u.to_string()) {
+                drop(term);
+                log::info!("hyperlink open (OSC 8): {}", uri);
+                if let Err(e) = std::process::Command::new("open").arg(&uri).spawn() {
+                    log::warn!("hyperlink open failed: {e}");
+                }
+                return true;
+            }
         }
-        let uri = match term.hyperlink_uri_by_id(id) {
-            Some(u) => u.to_string(),
-            None => return false,
-        };
+        // 2. plain text URL detection — row의 chars 모아서 click cell이 http(s):// 범위 안인지
+        let cols = term.cols();
+        let row_chars: String = (0..cols).map(|c| term.cell(row, c).ch).collect();
         drop(term);
-        // macOS `open` 호출.
-        log::info!("hyperlink open: {}", uri);
-        if let Err(e) = std::process::Command::new("open").arg(&uri).spawn() {
-            log::warn!("hyperlink open failed: {e}");
+        if let Some(url) = detect_url_at(&row_chars, col) {
+            log::info!("hyperlink open (plain text): {}", url);
+            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
+                log::warn!("plain url open failed: {e}");
+            }
+            return true;
         }
-        true
+        false
     }
 
     /// 슬라이스 6.6b (Codex B-1): 마우스 버튼 비트마스크 갱신. reporting이 press를
@@ -5416,9 +5487,55 @@ mod tests {
             theme: None,
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
+            font_size: None,
         };
 
         assert!(config.pane_specs().is_err());
+    }
+
+    #[test]
+    fn url_detect_at_simple_https() {
+        let s = "Open https://example.com/path now";
+        let url = super::detect_url_at(s, 10).unwrap();
+        assert_eq!(url, "https://example.com/path");
+    }
+
+    #[test]
+    fn url_detect_at_trim_trailing_punct() {
+        let s = "See https://example.com.";
+        // col 5(s)도 매칭, 끝 . 제거.
+        let url = super::detect_url_at(s, 5).unwrap();
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_detect_at_outside_returns_none() {
+        let s = "no url here";
+        assert!(super::detect_url_at(s, 3).is_none());
+    }
+
+    #[test]
+    fn url_detect_at_http_plain() {
+        let s = "http://localhost:8080/api end";
+        let url = super::detect_url_at(s, 0).unwrap();
+        assert_eq!(url, "http://localhost:8080/api");
+    }
+
+    #[test]
+    fn url_detect_at_quote_terminates() {
+        let s = "anchor href=\"https://a.b/c\" end";
+        let url = super::detect_url_at(s, 15).unwrap();
+        // " 만나면 종료.
+        assert_eq!(url, "https://a.b/c");
+    }
+
+    #[test]
+    fn url_detect_at_col_outside_url_range_returns_none() {
+        let s = "before https://x.y after";
+        // col=0 'b' — URL 밖.
+        assert!(super::detect_url_at(s, 0).is_none());
+        // col=7 'h' — URL 안.
+        assert!(super::detect_url_at(s, 7).is_some());
     }
 
     #[test]
@@ -5438,6 +5555,7 @@ mod tests {
             theme: None,
             block_mode: BlockMode::default(),
             backdrop_enabled: None,
+            font_size: None,
         };
 
         assert!(config.pane_specs().is_err());
