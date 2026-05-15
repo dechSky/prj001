@@ -602,6 +602,25 @@ impl Renderer {
     }
 
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        // Visual Bell full-window flash (Codex 9차 사각지대 1): clear color에도 bell_flash
+        // 적용. cell instance 안 그려진 빈 영역(padding/status row 등)까지 inverted.
+        // bell_flash > 0이면 palette.bg ↔ inverted를 mix + alpha 1.0 강제 (vibrancy 차단).
+        let bg = self.palette.bg;
+        let (clear_r, clear_g, clear_b, clear_a) = if self.bell_flash > 0.0 {
+            let t = self.bell_flash;
+            let inv_r = 1.0 - bg[0];
+            let inv_g = 1.0 - bg[1];
+            let inv_b = 1.0 - bg[2];
+            let normal_a = bg[3] * self.palette.bg_opacity;
+            (
+                bg[0] * (1.0 - t) + inv_r * t,
+                bg[1] * (1.0 - t) + inv_g * t,
+                bg[2] * (1.0 - t) + inv_b * t,
+                normal_a * (1.0 - t) + 1.0 * t,
+            )
+        } else {
+            (bg[0], bg[1], bg[2], bg[3] * self.palette.bg_opacity)
+        };
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("text-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -610,12 +629,10 @@ impl Renderer {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: self.palette.bg[0] as f64,
-                        g: self.palette.bg[1] as f64,
-                        b: self.palette.bg[2] as f64,
-                        // Phase 3 step 3: clear alpha를 테마 bg_opacity와 일치 — cell 미커버
-                        // 영역(padding, status row 등)도 NSVE 비치게.
-                        a: (self.palette.bg[3] * self.palette.bg_opacity) as f64,
+                        r: clear_r as f64,
+                        g: clear_g as f64,
+                        b: clear_b as f64,
+                        a: clear_a as f64,
                     }),
                     store: wgpu::StoreOp::Store,
                 },
