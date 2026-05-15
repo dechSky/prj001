@@ -21,6 +21,49 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::event::{AppMenuCommand, UserEvent};
 
+/// Localization helper — 시스템 언어가 한국어면 ko, 아니면 en 반환.
+/// 우선순위: NSLocale.preferredLanguages 첫 항목 > LANG env > "en" fallback.
+/// Codex 8차 권: OnceLock<bool> 캐시 — menu 구성 시 30+번 ObjC 호출 회피.
+/// 시스템 locale 변경 후 NSMenu 재구성 안 함 (재시작 시 반영).
+static IS_KOREAN: OnceLock<bool> = OnceLock::new();
+
+fn is_korean_locale() -> bool {
+    *IS_KOREAN.get_or_init(detect_korean_locale)
+}
+
+fn detect_korean_locale() -> bool {
+    // 1) NSLocale 우선 — macOS 표준 user preference.
+    unsafe {
+        let cls = objc2::class!(NSLocale);
+        // NSArray<NSString> autoreleased — borrowed, not retained.
+        let langs: *mut NSObject = msg_send![cls, preferredLanguages];
+        if !langs.is_null() {
+            let count: usize = msg_send![langs, count];
+            if count > 0 {
+                let first: *mut NSObject = msg_send![langs, objectAtIndex: 0usize];
+                if !first.is_null() {
+                    let cstr: *const std::ffi::c_char = msg_send![first, UTF8String];
+                    if !cstr.is_null() {
+                        if let Ok(s) = std::ffi::CStr::from_ptr(cstr).to_str() {
+                            return s.starts_with("ko");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2) LANG env fallback.
+    std::env::var("LANG")
+        .ok()
+        .map(|v| v.starts_with("ko"))
+        .unwrap_or(false)
+}
+
+/// menu/UI 문자열 i18n helper. (en, ko) 튜플로 입력 받아 시스템 locale에 맞춰 선택.
+fn tr(en: &'static str, ko: &'static str) -> &'static str {
+    if is_korean_locale() { ko } else { en }
+}
+
 /// menu click → UserEvent::MenuCommand dispatch path. AppState init 시 set.
 /// 외부 module은 `init_menu_proxy`를 통해서만 접근. menu click 발생 시점에 main thread.
 /// EventLoopProxy는 Send + Sync.
@@ -131,7 +174,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &app_menu,
-            "About pj001",
+            tr("About pj001", "pj001 정보"),
             sel!(orderFrontStandardAboutPanel:),
             "",
             NSEventModifierFlags::empty(),
@@ -141,7 +184,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         // Preferences — custom target action. ~/.config/pj001/config.toml을 system editor로 open.
         let prefs = make_item(
             mtm,
-            "Preferences…",
+            tr("Preferences…", "환경설정…"),
             Some(sel!(openPreferences:)),
             ",",
             NSEventModifierFlags::Command,
@@ -156,7 +199,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         // Services submenu — Apple 자동 채움.
         let services_item = make_item(
             mtm,
-            "Services",
+            tr("Services", "서비스"),
             None,
             "",
             NSEventModifierFlags::empty(),
@@ -170,7 +213,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &app_menu,
-            "Hide pj001",
+            tr("Hide pj001", "pj001 가리기"),
             sel!(hide:),
             "h",
             NSEventModifierFlags::Command,
@@ -178,7 +221,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &app_menu,
-            "Hide Others",
+            tr("Hide Others", "기타 가리기"),
             sel!(hideOtherApplications:),
             "h",
             NSEventModifierFlags::Command | NSEventModifierFlags::Option,
@@ -186,7 +229,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &app_menu,
-            "Show All",
+            tr("Show All", "모두 보기"),
             sel!(unhideAllApplications:),
             "",
             NSEventModifierFlags::empty(),
@@ -195,7 +238,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &app_menu,
-            "Quit pj001",
+            tr("Quit pj001", "pj001 종료"),
             sel!(terminate:),
             "q",
             NSEventModifierFlags::Command,
@@ -206,95 +249,95 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         // ── Shell menu ──────────────────────────────────────────────────────────
         let shell_menu = NSMenu::new(mtm); shell_menu.setAutoenablesItems(false);
         shell_menu.addItem(&make_command_item(
-            mtm, "New Pane", "n", NSEventModifierFlags::Command, AppMenuCommand::NewPane,
+            mtm, tr("New Pane", "새 분할"), "n", NSEventModifierFlags::Command, AppMenuCommand::NewPane,
         ));
         shell_menu.addItem(&make_command_item(
-            mtm, "New Tab", "t", NSEventModifierFlags::Command, AppMenuCommand::NewTab,
+            mtm, tr("New Tab", "새 탭"), "t", NSEventModifierFlags::Command, AppMenuCommand::NewTab,
         ));
         shell_menu.addItem(&NSMenuItem::separatorItem(mtm));
         shell_menu.addItem(&make_command_item(
-            mtm, "Split Vertically", "d", NSEventModifierFlags::Command,
+            mtm, tr("Split Vertically", "세로 분할"), "d", NSEventModifierFlags::Command,
             AppMenuCommand::SplitVertical,
         ));
         shell_menu.addItem(&make_command_item(
-            mtm, "Split Horizontally", "d",
+            mtm, tr("Split Horizontally", "가로 분할"), "d",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::SplitHorizontal,
         ));
         shell_menu.addItem(&NSMenuItem::separatorItem(mtm));
         shell_menu.addItem(&make_command_item(
-            mtm, "Close", "w", NSEventModifierFlags::Command, AppMenuCommand::CloseActive,
+            mtm, tr("Close", "닫기"), "w", NSEventModifierFlags::Command, AppMenuCommand::CloseActive,
         ));
         shell_menu.addItem(&make_command_item(
-            mtm, "Close Tab", "w",
+            mtm, tr("Close Tab", "탭 닫기"), "w",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::CloseTab,
         ));
-        attach_submenu(mtm, &main, "Shell", &shell_menu);
+        attach_submenu(mtm, &main, tr("Shell", "셸"), &shell_menu);
 
         // ── Edit menu ───────────────────────────────────────────────────────────
         let edit_menu = NSMenu::new(mtm); edit_menu.setAutoenablesItems(false);
         edit_menu.addItem(&make_command_item(
-            mtm, "Copy", "c", NSEventModifierFlags::Command, AppMenuCommand::Copy,
+            mtm, tr("Copy", "복사"), "c", NSEventModifierFlags::Command, AppMenuCommand::Copy,
         ));
         edit_menu.addItem(&make_command_item(
-            mtm, "Paste", "v", NSEventModifierFlags::Command, AppMenuCommand::Paste,
+            mtm, tr("Paste", "붙여넣기"), "v", NSEventModifierFlags::Command, AppMenuCommand::Paste,
         ));
         edit_menu.addItem(&make_command_item(
-            mtm, "Select All", "a", NSEventModifierFlags::Command, AppMenuCommand::SelectAll,
+            mtm, tr("Select All", "전체 선택"), "a", NSEventModifierFlags::Command, AppMenuCommand::SelectAll,
         ));
         edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
         edit_menu.addItem(&make_command_item(
-            mtm, "Find…", "f", NSEventModifierFlags::Command, AppMenuCommand::Find,
+            mtm, tr("Find…", "찾기…"), "f", NSEventModifierFlags::Command, AppMenuCommand::Find,
         ));
         edit_menu.addItem(&make_command_item(
-            mtm, "Find Next", "g", NSEventModifierFlags::Command, AppMenuCommand::FindNext,
+            mtm, tr("Find Next", "다음 찾기"), "g", NSEventModifierFlags::Command, AppMenuCommand::FindNext,
         ));
         edit_menu.addItem(&make_command_item(
-            mtm, "Find Previous", "g",
+            mtm, tr("Find Previous", "이전 찾기"), "g",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::FindPrev,
         ));
         edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
         edit_menu.addItem(&make_command_item(
-            mtm, "Clear Buffer", "k", NSEventModifierFlags::Command,
+            mtm, tr("Clear Buffer", "버퍼 지우기"), "k", NSEventModifierFlags::Command,
             AppMenuCommand::ClearBuffer,
         ));
         edit_menu.addItem(&make_command_item(
-            mtm, "Clear Scrollback", "k",
+            mtm, tr("Clear Scrollback", "스크롤백 지우기"), "k",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::ClearScrollback,
         ));
-        attach_submenu(mtm, &main, "Edit", &edit_menu);
+        attach_submenu(mtm, &main, tr("Edit", "편집"), &edit_menu);
 
         // ── View menu ───────────────────────────────────────────────────────────
         let view_menu = NSMenu::new(mtm); view_menu.setAutoenablesItems(false);
         view_menu.addItem(&make_command_item(
-            mtm, "Bigger", "=", NSEventModifierFlags::Command, AppMenuCommand::ZoomIn,
+            mtm, tr("Bigger", "확대"), "=", NSEventModifierFlags::Command, AppMenuCommand::ZoomIn,
         ));
         view_menu.addItem(&make_command_item(
-            mtm, "Smaller", "-", NSEventModifierFlags::Command, AppMenuCommand::ZoomOut,
+            mtm, tr("Smaller", "축소"), "-", NSEventModifierFlags::Command, AppMenuCommand::ZoomOut,
         ));
         view_menu.addItem(&make_command_item(
-            mtm, "Actual Size", "0", NSEventModifierFlags::Command, AppMenuCommand::ZoomReset,
+            mtm, tr("Actual Size", "원래 크기"), "0", NSEventModifierFlags::Command, AppMenuCommand::ZoomReset,
         ));
         view_menu.addItem(&NSMenuItem::separatorItem(mtm));
         add_action_item(
             mtm,
             &view_menu,
-            "Toggle Full Screen",
+            tr("Toggle Full Screen", "전체 화면 전환"),
             sel!(toggleFullScreen:),
             "f",
             NSEventModifierFlags::Command | NSEventModifierFlags::Control,
         );
-        attach_submenu(mtm, &main, "View", &view_menu);
+        attach_submenu(mtm, &main, tr("View", "보기"), &view_menu);
 
         // ── Window menu (Apple 표준) ────────────────────────────────────────────
         let window_menu = NSMenu::new(mtm); window_menu.setAutoenablesItems(false);
         add_action_item(
             mtm,
             &window_menu,
-            "Minimize",
+            tr("Minimize", "최소화"),
             sel!(performMiniaturize:),
             "m",
             NSEventModifierFlags::Command,
@@ -302,7 +345,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &window_menu,
-            "Zoom",
+            tr("Zoom", "확대/축소"),
             sel!(performZoom:),
             "",
             NSEventModifierFlags::empty(),
@@ -311,23 +354,23 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         add_action_item(
             mtm,
             &window_menu,
-            "Bring All to Front",
+            tr("Bring All to Front", "모두 앞으로"),
             sel!(arrangeInFront:),
             "",
             NSEventModifierFlags::empty(),
         );
         window_menu.addItem(&NSMenuItem::separatorItem(mtm));
         window_menu.addItem(&make_command_item(
-            mtm, "Previous Tab", "[",
+            mtm, tr("Previous Tab", "이전 탭"), "[",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::PrevTab,
         ));
         window_menu.addItem(&make_command_item(
-            mtm, "Next Tab", "]",
+            mtm, tr("Next Tab", "다음 탭"), "]",
             NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
             AppMenuCommand::NextTab,
         ));
-        attach_submenu(mtm, &main, "Window", &window_menu);
+        attach_submenu(mtm, &main, tr("Window", "윈도우"), &window_menu);
         // Apple이 자동으로 윈도우 목록을 windowsMenu에 채움.
         app.setWindowsMenu(Some(&window_menu));
 
@@ -335,7 +378,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         let help_menu = NSMenu::new(mtm); help_menu.setAutoenablesItems(false);
         let help_item = make_item(
             mtm,
-            "pj001 Help",
+            tr("pj001 Help", "pj001 도움말"),
             Some(sel!(openHelp:)),
             "?",
             NSEventModifierFlags::Command,
@@ -344,7 +387,7 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         let target_obj: &AnyObject = &*(target_ptr as *mut AnyObject);
         help_item.setTarget(Some(target_obj));
         help_menu.addItem(&help_item);
-        attach_submenu(mtm, &main, "Help", &help_menu);
+        attach_submenu(mtm, &main, tr("Help", "도움말"), &help_menu);
         // Apple Help search 활성화.
         app.setHelpMenu(Some(&help_menu));
 
