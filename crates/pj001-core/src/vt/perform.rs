@@ -654,6 +654,128 @@ mod tests {
         assert_eq!(term.cell(1, 1).ch, '0');
     }
 
+    // Codex 3차 사각지대 (thread 019e299f): partial scroll region 밖에서 IND/NEL/RI 동작.
+    // newline/reverse_index margin-outside Critical fix가 들어간 1c7f618 위에서 명시 case 검증.
+
+    #[test]
+    fn semantic_ind_outside_top_of_region() {
+        // DECSTBM 2;4 (idx 1..3). cursor at row 0 (region 위쪽 밖). IND → row += 1 (scroll 없음).
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[2;4r"); // scroll region 2..4 (1-based)
+        run(&mut term, b"\x1b[1;1H"); // top of screen
+        run(&mut term, b"\x1bD"); // IND
+        assert_eq!(term.cursor().row, 1, "outside top → simple row += 1");
+        // 모든 row 콘텐츠 그대로 (scroll 안 함).
+        assert_eq!(term.cell(0, 0).ch, 'r');
+        assert_eq!(term.cell(0, 1).ch, '0');
+        assert_eq!(term.cell(4, 1).ch, '4');
+    }
+
+    #[test]
+    fn semantic_ind_inside_region_bottom_scrolls() {
+        // DECSTBM 2;4 (idx 1..3). cursor at row 3 (region 내 bottom row, scroll_bottom == 4 — idx 3+1).
+        // IND at row == bottom-1 → scroll up region 안.
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[2;4r");
+        run(&mut term, b"\x1b[4;1H"); // row 4 (1-based) = idx 3, region bottom
+        run(&mut term, b"\x1bD"); // IND scroll up
+        // region 1..3 안 scroll. row 1=r2, row 2=r3, row 3=공백. row 0/4 그대로.
+        assert_eq!(term.cell(0, 1).ch, '0');
+        assert_eq!(term.cell(1, 1).ch, '2');
+        assert_eq!(term.cell(2, 1).ch, '3');
+        assert_eq!(term.cell(4, 1).ch, '4');
+    }
+
+    #[test]
+    fn semantic_ind_outside_bottom_of_region_advances() {
+        // DECSTBM 1;2 (idx 0..1). cursor at row 4 (region 밖 아래). IND → row += 1만, scroll 없음.
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[1;2r");
+        run(&mut term, b"\x1b[4;1H"); // row 4 (idx 3)
+        run(&mut term, b"\x1bD"); // IND
+        // cursor.row + 1 == 4 < 5 (rows), region bottom(2)와 무관 — 단순 row += 1.
+        assert_eq!(term.cursor().row, 4);
+        assert_eq!(term.cell(2, 1).ch, '2');
+        assert_eq!(term.cell(4, 1).ch, '4');
+    }
+
+    #[test]
+    fn semantic_ind_at_grid_bottom_outside_region_no_op() {
+        // DECSTBM 1;2. cursor at row 5 (idx 4 = last row), region 밖. IND → no-op (grid 끝).
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[1;2r");
+        run(&mut term, b"\x1b[5;1H"); // row 5 (idx 4)
+        run(&mut term, b"\x1bD"); // IND at last row outside region — no-op
+        assert_eq!(term.cursor().row, 4);
+        assert_eq!(term.cell(4, 1).ch, '4'); // 콘텐츠 변동 없음
+    }
+
+    #[test]
+    fn semantic_ri_at_scroll_top_scrolls_down() {
+        // DECSTBM 2;4 (idx 1..3). cursor at scroll_top (idx 1). RI → scroll_down region 안.
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[2;4r");
+        run(&mut term, b"\x1b[2;1H"); // row 2 (idx 1 = scroll_top)
+        run(&mut term, b"\x1bM"); // RI scroll down
+        // region 1..3 scroll down. row 1=공백, row 2=r1, row 3=r2. r3는 region 밖이라 그대로.
+        // wait — scroll_down은 region 안에서만, row 3 (region 내 last)는 r2가 옴, r3 사라짐.
+        // 검증은 row 1=공백(빈 cell) + r1 → row 2 이동.
+        assert_eq!(term.cell(0, 1).ch, '0'); // outside region top
+        assert_eq!(term.cell(4, 1).ch, '4'); // outside region bottom
+        assert_eq!(term.cell(2, 1).ch, '1'); // r1 → row 2
+        assert_eq!(term.cell(3, 1).ch, '2'); // r2 → row 3
+    }
+
+    #[test]
+    fn semantic_ri_above_scroll_top_simple_decrement() {
+        // DECSTBM 3;5 (idx 2..4). cursor at row 0 (above region). RI → row -= 1만? row == 0이면
+        // no-op (cursor.row == 0).
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[3;5r");
+        run(&mut term, b"\x1b[2;1H"); // row 2 (idx 1, above region)
+        run(&mut term, b"\x1bM"); // RI
+        // cursor.row != scroll_top → row -= 1. idx 1 - 1 = 0.
+        assert_eq!(term.cursor().row, 0);
+        // 콘텐츠 변동 없음.
+        assert_eq!(term.cell(2, 1).ch, '2');
+    }
+
+    #[test]
+    fn semantic_ri_at_row_0_top_region_offset_no_op() {
+        // DECSTBM 3;5. cursor at row 0 (top of screen, but scroll_top == 2 → outside region top).
+        // RI: cursor.row != scroll_top && cursor.row > 0 → row -= 1. But cursor.row == 0 → no-op.
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[3;5r");
+        run(&mut term, b"\x1b[1;1H"); // row 1 (idx 0)
+        run(&mut term, b"\x1bM"); // RI
+        // cursor.row(0) != scroll_top(2), 그러나 row == 0 → no-op.
+        assert_eq!(term.cursor().row, 0);
+        assert_eq!(term.cell(0, 1).ch, '0'); // 콘텐츠 그대로
+    }
+
+    #[test]
+    fn semantic_nel_in_scroll_region_bottom_scrolls() {
+        // NEL = CR + LF. region 안 bottom이면 scroll up.
+        let mut term = Term::new(10, 5);
+        run(&mut term, b"r0\r\nr1\r\nr2\r\nr3\r\nr4");
+        run(&mut term, b"\x1b[2;4r");
+        run(&mut term, b"\x1b[4;5H"); // row 4 col 5 (idx (3, 4))
+        run(&mut term, b"\x1bE"); // NEL
+        // CR — cursor.col = 0. LF at bottom → scroll up. cursor.row = 3 (region bottom).
+        assert_eq!(term.cursor().col, 0);
+        assert_eq!(term.cursor().row, 3);
+        // region 1..3 안 scroll: row 1=r2, row 2=r3, row 3=공백.
+        assert_eq!(term.cell(1, 1).ch, '2');
+        assert_eq!(term.cell(2, 1).ch, '3');
+    }
+
     /// edge: 1-byte-at-a-time feed — incremental parser state machine 검증.
     #[test]
     fn fuzz_byte_by_byte_feed_no_panic() {
