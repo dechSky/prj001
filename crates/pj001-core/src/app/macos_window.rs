@@ -63,6 +63,16 @@ pub fn select_previous_tab(window: &Window) {
     }
 }
 
+pub fn toggle_tab_overview(window: &Window) {
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    unsafe {
+        let nil: *mut AnyObject = std::ptr::null_mut();
+        let _: () = msg_send![ns_window, toggleTabOverview: nil];
+    }
+}
+
 pub fn select_tab_at_index(window: &Window, index: usize) {
     let Some(ns_window) = ns_window(window) else {
         return;

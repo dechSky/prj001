@@ -469,16 +469,23 @@ pub fn attach_menu_bar(mtm: MainThreadMarker) {
         window_menu.addItem(&make_command_item(
             mtm,
             tr("Previous Tab", "이전 탭"),
-            "[",
-            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            "\t",
+            NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
             AppMenuCommand::PrevTab,
         ));
         window_menu.addItem(&make_command_item(
             mtm,
             tr("Next Tab", "다음 탭"),
-            "]",
-            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            "\t",
+            NSEventModifierFlags::Control,
             AppMenuCommand::NextTab,
+        ));
+        window_menu.addItem(&make_command_item(
+            mtm,
+            tr("Show Tab Overview", "탭 개요 보기"),
+            "\\",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            AppMenuCommand::TabOverview,
         ));
         attach_submenu(mtm, &main, tr("Window", "윈도우"), &window_menu);
         // Apple이 자동으로 윈도우 목록을 windowsMenu에 채움.

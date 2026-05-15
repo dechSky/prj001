@@ -910,6 +910,7 @@ enum CmdShortcut {
     PaneOrdinal(usize),
     PrevTab,
     NextTab,
+    TabOverview,
     PrevPane,
     NextPane,
     SplitVertical,
@@ -1030,6 +1031,9 @@ fn cmd_shortcut(
     }
     if shift && (physical_code == Some(KeyCode::BracketRight) || lower == Some("}")) {
         return Some(CmdShortcut::NextTab);
+    }
+    if shift && physical_code == Some(KeyCode::Backslash) {
+        return Some(CmdShortcut::TabOverview);
     }
     if lower == Some("[") {
         return Some(CmdShortcut::PrevPane);
@@ -2052,6 +2056,22 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                 }
+                if event.state == ElementState::Pressed
+                    && state.modifiers.control_key()
+                    && !state.modifiers.super_key()
+                    && !state.modifiers.alt_key()
+                    && matches!(event.logical_key, Key::Named(NamedKey::Tab))
+                {
+                    let command = if state.modifiers.shift_key() {
+                        crate::app::event::AppMenuCommand::PrevTab
+                    } else {
+                        crate::app::event::AppMenuCommand::NextTab
+                    };
+                    if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(command)) {
+                        log::warn!("control-tab dispatch failed: {e:?}");
+                    }
+                    return;
+                }
                 // M8-6: macOS Cmd 단축키 처리 — Cmd+Q/W = 종료, Cmd+V = paste, 그 외 swallow.
                 if event.state == ElementState::Pressed && state.modifiers.super_key() {
                     let physical_code = match event.physical_key {
@@ -2154,6 +2174,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 crate::app::event::AppMenuCommand::NextTab,
                             )) {
                                 log::warn!("cmd+shift+] NextTab proxy send failed: {e:?}");
+                            }
+                            return;
+                        }
+                        Some(CmdShortcut::TabOverview) => {
+                            if let Err(e) = self.proxy.send_event(UserEvent::MenuCommand(
+                                crate::app::event::AppMenuCommand::TabOverview,
+                            )) {
+                                log::warn!(
+                                    "cmd+shift+backslash TabOverview proxy send failed: {e:?}"
+                                );
                             }
                             return;
                         }
@@ -2611,6 +2641,14 @@ impl ApplicationHandler<UserEvent> for App {
                             macos_window::select_next_tab(&state.window);
                             #[cfg(not(target_os = "macos"))]
                             state.focus_adjacent_tab(true);
+                        }
+                    }
+                    M::TabOverview => {
+                        if let Some(state) = self.active_state_mut() {
+                            #[cfg(target_os = "macos")]
+                            macos_window::toggle_tab_overview(&state.window);
+                            #[cfg(not(target_os = "macos"))]
+                            state.window.request_redraw();
                         }
                     }
                     M::CloseWindow => {
@@ -4694,6 +4732,7 @@ impl WindowState {
             M::ZoomReset => self.set_logical_font_size(DEFAULT_FONT_SIZE),
             M::PrevTab => self.focus_adjacent_tab(false),
             M::NextTab => self.focus_adjacent_tab(true),
+            M::TabOverview => log::debug!("tab overview is handled at App level"),
             M::NewWindow => {
                 // M-W-3: App level — user_event arm이 별도로 처리. WindowState method로
                 // 도달하면 unreachable (logic bug). debug log + ignore.
@@ -6275,6 +6314,10 @@ mod tests {
         assert_eq!(
             cmd_shortcut(Some("}"), Some(KeyCode::BracketRight), true, false),
             Some(CmdShortcut::NextTab)
+        );
+        assert_eq!(
+            cmd_shortcut(Some("|"), Some(KeyCode::Backslash), true, false),
+            Some(CmdShortcut::TabOverview)
         );
         assert_eq!(
             cmd_shortcut(Some("w"), Some(KeyCode::KeyW), false, false),

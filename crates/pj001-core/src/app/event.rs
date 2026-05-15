@@ -61,6 +61,7 @@ pub enum AppMenuCommand {
     // Window
     PrevTab = 30,
     NextTab = 31,
+    TabOverview = 32,
 }
 
 impl AppMenuCommand {
@@ -89,6 +90,7 @@ impl AppMenuCommand {
             22 => Self::ZoomReset,
             30 => Self::PrevTab,
             31 => Self::NextTab,
+            32 => Self::TabOverview,
             _ => return None,
         })
     }
@@ -178,6 +180,7 @@ mod tests {
             AppMenuCommand::ZoomReset,
             AppMenuCommand::PrevTab,
             AppMenuCommand::NextTab,
+            AppMenuCommand::TabOverview,
         ];
         for cmd in all {
             let tag = cmd as i64;
