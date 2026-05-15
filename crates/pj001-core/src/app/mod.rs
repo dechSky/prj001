@@ -517,7 +517,11 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 struct App {
-    state: Option<WindowState>,
+    /// M-W-2: HashMap<WindowId, WindowState>로 multi-window 토대. single-window 시점엔
+    /// 한 entry만. M-W-3에서 Cmd+N으로 create_new_window 호출 시 새 entry 추가.
+    windows: std::collections::HashMap<winit::window::WindowId, WindowState>,
+    /// 현재 keyboard focus / NSMenu dispatch 대상 윈도우. None = 윈도우 없음.
+    active_window: Option<winit::window::WindowId>,
     /// M12-5 회귀 fix v3 (Codex thread 019e1659): spawn을 첫 winit `Resized` 후로 미룸.
     /// resumed에서 window만 생성하고 여기 보관 → 첫 Resized에서 그 size로 PTY spawn.
     /// startup SIGWINCH 0회 → wrap된 작은 창에서도 zsh duplicate prompt 회피.
@@ -526,6 +530,23 @@ struct App {
     startup_waited_once: bool,
     proxy: EventLoopProxy<UserEvent>,
     config: Config,
+}
+
+impl App {
+    /// 현재 활성 윈도우의 WindowState mutable ref. 없으면 None.
+    fn active_state_mut(&mut self) -> Option<&mut WindowState> {
+        self.active_window.and_then(|id| self.windows.get_mut(&id))
+    }
+    /// 현재 활성 윈도우의 WindowState immutable ref.
+    fn active_state(&self) -> Option<&WindowState> {
+        self.active_window.and_then(|id| self.windows.get(&id))
+    }
+    /// 모든 윈도우 순회 — bell drain, blink, pending_resize 같은 background 작업용.
+    /// M-W-2b에서 사용 예정 (현재 active_state만으로 single-window OK).
+    #[allow(dead_code)]
+    fn all_states_mut(&mut self) -> impl Iterator<Item = &mut WindowState> {
+        self.windows.values_mut()
+    }
 }
 
 struct Pane {
@@ -1334,7 +1355,8 @@ struct MouseClick {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, config: Config) -> Self {
         Self {
-            state: None,
+            windows: std::collections::HashMap::new(),
+            active_window: None,
             pending_window: None,
             startup_waited_once: false,
             proxy,
@@ -1414,7 +1436,9 @@ impl App {
         #[cfg(target_os = "macos")]
         macos_ime::wake_input_context(&state.window);
         let window = state.window.clone();
-        self.state = Some(state);
+        let window_id = window.id();
+        self.windows.insert(window_id, state);
+        self.active_window = Some(window_id);
         window.request_redraw();
     }
 }
@@ -1464,8 +1488,8 @@ fn compute_viewports(
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // M12-5 회귀 fix v3: state도 pending_window도 없을 때만 새 window 생성.
-        if self.state.is_some() || self.pending_window.is_some() {
+        // M12-5 회귀 fix v3: 첫 윈도우도 pending_window도 없을 때만 새 window 생성.
+        if !self.windows.is_empty() || self.pending_window.is_some() {
             return;
         }
         // Phase 3 step 1: transparent window 배관. wgpu surface가 alpha=1.0인 동안은
@@ -1493,17 +1517,19 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
-        // M12-5 회귀 fix v3: state=None일 때 첫 Resized만 startup trigger로 소비.
-        if self.state.is_none() {
+        // M12-5 회귀 fix v3: 첫 윈도우 없을 때 첫 Resized만 startup trigger로 소비.
+        if self.windows.is_empty() {
             if let WindowEvent::Resized(size) = event {
                 self.finish_startup(size);
             }
             return;
         }
-        let Some(state) = self.state.as_mut() else {
+        // M-W-2: WindowId로 해당 윈도우의 state 찾기. 못 찾으면 무시 (stale event).
+        self.active_window = Some(window_id);
+        let Some(state) = self.windows.get_mut(&window_id) else {
             return;
         };
         match event {
@@ -2090,9 +2116,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // M12-5 회귀 fix v3: state=None일 때 fallback. 첫 cycle은 wait,
+        // M12-5 회귀 fix v3: 첫 윈도우 없을 때 fallback. 첫 cycle은 wait,
         // 두 번째 cycle에도 Resized 안 오면 inner_size로 spawn (앱 안 뜨는 케이스 회피).
-        if self.state.is_none() {
+        if self.windows.is_empty() {
             if let Some(window) = self.pending_window.as_ref() {
                 if self.startup_waited_once {
                     let size = window.inner_size();
@@ -2104,7 +2130,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
-        let Some(state) = self.state.as_mut() else {
+        // M-W-2: about_to_wait은 active window 기준으로 진행. multi-window 도입 후엔
+        // 각 window 별 pending_resize/bell도 처리해야 — 다음 M-W-2b 단계.
+        let Some(state) = self.active_state_mut() else {
             return;
         };
         // Visual Bell — 매 about_to_wait에서 모든 session의 bell_pending drain.
@@ -2196,7 +2224,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::SessionRepaint(session_id) => {
                 log::debug!("repaint requested by session {}", session_id.0);
-                if let Some(state) = &self.state {
+                if let Some(state) = self.active_state() {
                     // M12-4 design §3.3: 방어적 lookup. unknown session은 debug log + ignore.
                     if !state.sessions.contains_key(&session_id) {
                         log::debug!(
@@ -2217,7 +2245,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SessionExited { id, code } => {
                 log::info!("session {} child exited (code={code})", id.0);
-                if let Some(state) = &mut self.state {
+                if let Some(state) = self.active_state_mut() {
                     if !state.sessions.contains_key(&id) {
                         log::debug!("SessionExited for unknown session {:?}, ignore", id);
                         return;
@@ -2267,7 +2295,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SessionPtyError { id, message } => {
                 log::error!("session {} pty error: {message}", id.0);
-                if let Some(state) = &mut self.state {
+                if let Some(state) = self.active_state_mut() {
                     if !state.sessions.contains_key(&id) {
                         log::debug!("SessionPtyError for unknown session {:?}, ignore", id);
                         return;
@@ -2311,7 +2339,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::MenuCommand(cmd) => {
-                if let Some(state) = self.state.as_mut() {
+                if let Some(state) = self.active_state_mut() {
                     state.dispatch_menu_command(event_loop, cmd);
                     state.window.request_redraw();
                 } else {
